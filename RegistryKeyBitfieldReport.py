@@ -275,6 +275,7 @@ class RegistryKeyBitfieldReport(object):
         self.currentProgram = program
         self.monitor = monitor or ConsoleTaskMonitor()
         self.args = self._parse_args(args)
+        self._comparison_ops = self._build_comparison_ops()
 
     def run(self):
         # Defensive guard for execution
@@ -314,6 +315,25 @@ class RegistryKeyBitfieldReport(object):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _build_comparison_ops(self):
+        comparison_names = [
+            "INT_EQUAL",
+            "INT_NOTEQUAL",
+            "INT_LESS",
+            "INT_LESSEQUAL",
+            "INT_SLESS",
+            "INT_SLESSEQUAL",
+            "INT_SGE",
+            "INT_SGREATER",
+            "INT_GE",
+            "INT_GREATER",
+        ]
+        ops = []
+        for name in comparison_names:
+            if hasattr(PcodeOp, name):
+                ops.append(getattr(PcodeOp, name))
+        return tuple(ops)
+
     def _parse_args(self, overrides=None):
         defaults = {
             "depth": self.DEFAULT_DEPTH,
@@ -633,7 +653,7 @@ class RegistryKeyBitfieldReport(object):
                 self._taint_store(op, state)
             elif opc in (PcodeOp.BOOL_AND, PcodeOp.BOOL_OR, PcodeOp.BOOL_XOR, PcodeOp.INT_AND, PcodeOp.INT_OR, PcodeOp.INT_XOR, PcodeOp.INT_LEFT, PcodeOp.INT_RIGHT, PcodeOp.INT_SRIGHT, PcodeOp.INT_NEGATE):
                 self._taint_bitwise(op, state)
-            elif opc in (PcodeOp.INT_EQUAL, PcodeOp.INT_NOTEQUAL, PcodeOp.INT_LESS, PcodeOp.INT_LESSEQUAL, PcodeOp.INT_SLESS, PcodeOp.INT_SLESSEQUAL, PcodeOp.INT_SGE, PcodeOp.INT_SGREATER, PcodeOp.INT_GE, PcodeOp.INT_GREATER):
+            elif opc in self._comparison_ops:
                 self._taint_compare(op, state)
             elif opc in (PcodeOp.CALL, PcodeOp.CALLIND):
                 self._handle_call(op, state, func, depth)
