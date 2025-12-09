@@ -24,6 +24,7 @@ from ghidra.program.flatapi import FlatProgramAPI
 from ghidra.program.model.address import Address
 from ghidra.program.model.block import BasicBlockModel
 from ghidra.program.model.listing import CodeUnit
+from ghidra.program.model.listing import Instruction
 from ghidra.program.model.pcode import PcodeOp
 from ghidra.program.model.symbol import RefType
 
@@ -508,6 +509,12 @@ class RegistryKeyBitfieldReport(GhidraScript):
                         if key_str not in self.registry_infos:
                             self.registry_infos[key_str] = RegistryKeyInfo(key_str)
                         return self.registry_infos[key_str], key_str
+        # Assembly-level operand inspection (helps when p-code is missing or optimized away)
+        key_str = self._extract_string_from_operands(inst)
+        if key_str:
+            if key_str not in self.registry_infos:
+                self.registry_infos[key_str] = RegistryKeyInfo(key_str)
+            return self.registry_infos[key_str], key_str
         return None, None
 
     def _capture_call_arguments(self, inst):
@@ -522,7 +529,29 @@ class RegistryKeyBitfieldReport(GhidraScript):
             if op.getOpcode() in (PcodeOp.CALL, PcodeOp.CALLIND):
                 for i in range(1, op.getNumInputs()):
                     args.append(str(op.getInput(i)))
-        return {"args": args}
+        asm_ops = []
+        try:
+            for i in range(inst.getNumOperands()):
+                asm_ops.append(inst.getDefaultOperandRepresentation(i))
+        except Exception:
+            pass
+        return {"args": args, "asm_operands": asm_ops}
+
+    def _extract_string_from_operands(self, inst):
+        try:
+            for i in range(inst.getNumOperands()):
+                op_obj = inst.getOpObjects(i)
+                if op_obj is None:
+                    continue
+                for obj in op_obj:
+                    try:
+                        if isinstance(obj, Address) and obj in self.string_index:
+                            return self.string_index[obj]
+                    except Exception:
+                        continue
+        except Exception:
+            return None
+        return None
 
     # ------------------------------------------------------------------
     # Taint helpers
@@ -686,10 +715,12 @@ class RegistryKeyBitfieldReport(GhidraScript):
         if addr and addr in self.string_index:
             key_str = self.string_index[addr]
             key_info = self.registry_infos.get(key_str)
-            if key_info:
-                tr = TaintRecord(key_info, width=(dest.getSize() * 8))
-                tr.history.append(("seed", key_str, str(op)))
-                state[self._varnode_key(dest)] = tr
+            if key_info is None:
+                key_info = RegistryKeyInfo(key_str)
+                self.registry_infos[key_str] = key_info
+            tr = TaintRecord(key_info, width=(dest.getSize() * 8))
+            tr.history.append(("seed", key_str, str(op)))
+            state[self._varnode_key(dest)] = tr
 
     def _seed_taint_from_registry_call(self, name, call_op, arg_taints, out_vn):
         mapping = self._registry_api_mapping(name)
@@ -908,42 +939,76 @@ class RegistryKeyBitfieldReport(GhidraScript):
             prev = listing.getInstructionBefore(current.getMinAddress())
             if prev is None:
                 break
+            # Prefer p-code but also inspect assembly when needed
             try:
                 pcode_ops = prev.getPcode()
             except Exception:
-                break
-            if pcode_ops is None:
-                break
-            for op in pcode_ops:
-                if op is None:
-                    continue
-                opc = op.getOpcode()
-                if opc == PcodeOp.INT_AND:
-                    inp1 = op.getInput(1)
-                    if inp1 is not None and inp1.isConstant():
-                        taint.apply_and(inp1.getOffset(), str(op))
-                elif opc in (PcodeOp.INT_RIGHT, PcodeOp.INT_SRIGHT, PcodeOp.INT_LEFT):
-                    inp1 = op.getInput(1)
-                    if inp1 is not None and inp1.isConstant():
-                        direction = "l" if opc == PcodeOp.INT_LEFT else "r"
-                        taint.apply_shift(inp1.getOffset(), direction, str(op))
-                elif opc == PcodeOp.INT_OR:
-                    inp1 = op.getInput(1)
-                    if inp1 is not None and inp1.isConstant():
-                        taint.apply_or(inp1.getOffset(), str(op))
-                elif opc == PcodeOp.INT_XOR:
-                    inp1 = op.getInput(1)
-                    if inp1 is not None and inp1.isConstant():
-                        taint.apply_xor(inp1.getOffset(), str(op))
-                elif opc == PcodeOp.INT_NEGATE:
-                    taint.apply_not(str(op))
-                elif opc in (PcodeOp.INT_EQUAL, PcodeOp.INT_NOTEQUAL, PcodeOp.INT_LESS, PcodeOp.INT_LESSEQUAL, PcodeOp.INT_SLESS, PcodeOp.INT_SLESSEQUAL):
-                    inp0 = op.getInput(0)
-                    inp1 = op.getInput(1)
-                    if inp1 is not None and inp1.isConstant():
-                        taint.mark_compare(inp1.getOffset(), str(op))
-                    elif inp0 is not None and inp0.isConstant():
-                        taint.mark_compare(inp0.getOffset(), str(op))
+                pcode_ops = None
+            if pcode_ops:
+                for op in pcode_ops:
+                    if op is None:
+                        continue
+                    opc = op.getOpcode()
+                    if opc == PcodeOp.INT_AND:
+                        inp1 = op.getInput(1)
+                        if inp1 is not None and inp1.isConstant():
+                            taint.apply_and(inp1.getOffset(), str(op))
+                    elif opc in (PcodeOp.INT_RIGHT, PcodeOp.INT_SRIGHT, PcodeOp.INT_LEFT):
+                        inp1 = op.getInput(1)
+                        if inp1 is not None and inp1.isConstant():
+                            direction = "l" if opc == PcodeOp.INT_LEFT else "r"
+                            taint.apply_shift(inp1.getOffset(), direction, str(op))
+                    elif opc == PcodeOp.INT_OR:
+                        inp1 = op.getInput(1)
+                        if inp1 is not None and inp1.isConstant():
+                            taint.apply_or(inp1.getOffset(), str(op))
+                    elif opc == PcodeOp.INT_XOR:
+                        inp1 = op.getInput(1)
+                        if inp1 is not None and inp1.isConstant():
+                            taint.apply_xor(inp1.getOffset(), str(op))
+                    elif opc == PcodeOp.INT_NEGATE:
+                        taint.apply_not(str(op))
+                    elif opc in (PcodeOp.INT_EQUAL, PcodeOp.INT_NOTEQUAL, PcodeOp.INT_LESS, PcodeOp.INT_LESSEQUAL, PcodeOp.INT_SLESS, PcodeOp.INT_SLESSEQUAL):
+                        inp0 = op.getInput(0)
+                        inp1 = op.getInput(1)
+                        if inp1 is not None and inp1.isConstant():
+                            taint.mark_compare(inp1.getOffset(), str(op))
+                        elif inp0 is not None and inp0.isConstant():
+                            taint.mark_compare(inp0.getOffset(), str(op))
+            # Assembly inspection for masking/compare instructions (x86/x64)
+            try:
+                mnem = prev.getMnemonicString().upper()
+                ops = [prev.getDefaultOperandRepresentation(i) for i in range(prev.getNumOperands())]
+                if mnem in ("TEST", "AND") and len(ops) > 1:
+                    try:
+                        mask = int(str(ops[1]).replace("0x", ""), 16)
+                        taint.apply_and(mask, "asm-%s" % mnem)
+                    except Exception:
+                        pass
+                elif mnem in ("OR", "XOR") and len(ops) > 1:
+                    try:
+                        mask = int(str(ops[1]).replace("0x", ""), 16)
+                        if mnem == "OR":
+                            taint.apply_or(mask, "asm-OR")
+                        else:
+                            taint.apply_xor(mask, "asm-XOR")
+                    except Exception:
+                        pass
+                elif mnem in ("SHL", "SAL", "SHR", "SAR") and len(ops) > 1:
+                    try:
+                        bits = int(str(ops[1]).replace("0x", ""), 16)
+                        direction = "l" if mnem in ("SHL", "SAL") else "r"
+                        taint.apply_shift(bits, direction, "asm-%s" % mnem)
+                    except Exception:
+                        pass
+                elif mnem in ("CMP", "SUB") and len(ops) > 1:
+                    try:
+                        mask = int(str(ops[1]).replace("0x", ""), 16)
+                        taint.mark_compare(mask, "asm-%s" % mnem)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             current = prev
             steps += 1
         taint.history.append(("decision", str(inst), None))
