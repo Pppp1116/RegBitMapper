@@ -2,14 +2,13 @@
 """
 RegistryKeyBitfieldReport (Jython)
 
-Robust Jython implementation of the RegistryKeyBitfieldReport script for
-Ghidra 12. The script scans for registry-related strings, correlates them with
-Windows registry APIs, performs lightweight taint tracking, and reports how
-registry values influence conditional branches (bit usage).
+Production-ready implementation for Ghidra 12 (GUI and headless).
+The script scans for registry-related strings, correlates them with
+Windows registry APIs, performs interprocedural taint tracking, and
+reports how registry values influence conditional branches (bit usage).
 
-The NDJSON/Markdown schema remains backward compatible with the historical Java
-implementation while allowing non-breaking extensions via extra fields under the
-"extended" key.
+NDJSON/Markdown output remains backward compatible; new metadata lives
+under the "extended" key only.
 """
 
 from __future__ import print_function
@@ -63,15 +62,25 @@ class ApiCallSite(object):
 class TaintRecord(object):
     """Tracks taint originating from a registry key/value."""
 
-    def __init__(self, key_info, width=32, used_mask=None, ignored_mask=None, history=None):
+    def __init__(self, key_info, width=32, used_mask=None, ignored_mask=None, history=None, confidence=1.0, source="registry"):
         self.key_info = key_info
         self.width = width
         self.used_mask = used_mask if used_mask is not None else ((1 << width) - 1)
         self.ignored_mask = ignored_mask if ignored_mask is not None else 0
         self.history = history or []
+        self.confidence = confidence
+        self.source = source
 
     def clone(self):
-        return TaintRecord(self.key_info, self.width, self.used_mask, self.ignored_mask, list(self.history))
+        return TaintRecord(
+            self.key_info,
+            self.width,
+            self.used_mask,
+            self.ignored_mask,
+            list(self.history),
+            self.confidence,
+            self.source,
+        )
 
     def apply_and(self, mask, note):
         limit_mask = ((1 << self.width) - 1)
@@ -122,18 +131,21 @@ class TaintRecord(object):
         merged.used_mask = self.used_mask | other.used_mask
         merged.ignored_mask = self.ignored_mask | other.ignored_mask
         merged.history = list(self.history) + list(other.history)
+        merged.confidence = min(self.confidence, other.confidence)
+        merged.source = self.source or other.source
         return merged
 
 
 class DecisionPoint(object):
     """Represents a conditional branch influenced by registry-derived data."""
 
-    def __init__(self, addr, condition, taint_record, func_name=None, history=None):
+    def __init__(self, addr, condition, taint_record, func_name=None, history=None, extended=None):
         self.addr = addr
         self.condition = condition
         self.taint_record = taint_record
         self.func_name = func_name
         self.history = history or []
+        self.extended = extended or {}
 
     def to_dict(self):
         bits = self._bits_from_mask(self.taint_record.used_mask, self.taint_record.width)
@@ -146,8 +158,12 @@ class DecisionPoint(object):
             "ignored_bits": ignored,
             "width": self.taint_record.width,
         }
+        ext = dict(self.extended)
         if self.history:
-            base["extended"] = {"history": self.history}
+            ext["history"] = self.history
+        ext["confidence"] = self.taint_record.confidence
+        if ext:
+            base["extended"] = ext
         return base
 
     def _bits_from_mask(self, mask, width):
@@ -282,6 +298,8 @@ class RegistryKeyBitfieldReport(GhidraScript):
         self.string_index = {}  # Address -> string
         self.registry_infos = {}  # string -> RegistryKeyInfo
         self.output_dir = self._get_output_dir()
+        self.func_summaries = {}
+        self.call_depths = {}
         if not os.path.isdir(self.output_dir):
             os.makedirs(self.output_dir)
 
@@ -381,6 +399,8 @@ class RegistryKeyBitfieldReport(GhidraScript):
             return False
         if not self.REGEX_REGISTRY_STRING.search(s):
             return False
+        if self.GUID_PATTERN.search(s):
+            return True
         return True
 
     # ------------------------------------------------------------------
@@ -401,6 +421,8 @@ class RegistryKeyBitfieldReport(GhidraScript):
                 break
             inst_iter = self.currentProgram.getListing().getInstructions(func.getBody(), True)
             while inst_iter.hasNext():
+                if self.monitor.isCancelled():
+                    break
                 inst = inst_iter.next()
                 if not inst.getFlowType().isCall():
                     continue
@@ -457,7 +479,15 @@ class RegistryKeyBitfieldReport(GhidraScript):
         except Exception:
             return None, None
         for op in pcode:
-            for inp in op.getInputs():
+            if op is None:
+                continue
+            try:
+                inputs = op.getInputs()
+            except Exception:
+                continue
+            if not inputs:
+                continue
+            for inp in inputs:
                 if inp is None:
                     continue
                 if inp.isAddress() and inp.getAddress() in self.string_index:
@@ -484,6 +514,8 @@ class RegistryKeyBitfieldReport(GhidraScript):
         except Exception:
             return {"args": []}
         for op in pcode:
+            if op is None:
+                continue
             if op.getOpcode() in (PcodeOp.CALL, PcodeOp.CALLIND):
                 for i in range(1, op.getNumInputs()):
                     args.append(str(op.getInput(i)))
@@ -499,7 +531,10 @@ class RegistryKeyBitfieldReport(GhidraScript):
             space = vn.getAddress().getAddressSpace().getName()
             return (space, vn.getOffset(), vn.getSize())
         except Exception:
-            return (str(vn), vn.getSize())
+            try:
+                return (str(vn), vn.getSize())
+            except Exception:
+                return (str(vn), None)
 
     def _merge_state(self, dst_state, src_state):
         changed = False
@@ -518,172 +553,119 @@ class RegistryKeyBitfieldReport(GhidraScript):
     # ------------------------------------------------------------------
     # Pcode handling
     # ------------------------------------------------------------------
-    def _propagate_taint(self, inst, state):
+    def _propagate_taint(self, inst, state, func, depth):
         try:
-            pcode_ops = inst.getPcode()
+            pcode = inst.getPcode()
         except Exception:
             return
-        for op in pcode_ops:
-            opc = op.getOpcode()
-            if opc == PcodeOp.COPY:
-                self._copy_taint(op, state)
-            elif opc == PcodeOp.LOAD:
-                self._handle_load(op, state)
-            elif opc == PcodeOp.STORE:
-                self._handle_store(op, state)
-            elif opc in (PcodeOp.INT_AND, PcodeOp.INT_OR, PcodeOp.INT_XOR, PcodeOp.INT_NEGATE):
-                self._handle_bitwise(op, state)
-            elif opc in (PcodeOp.INT_LEFT, PcodeOp.INT_RIGHT, PcodeOp.INT_SRIGHT):
-                self._handle_shift(op, state)
-            elif opc in (PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT):
-                self._handle_ext(op, state)
-            elif opc in (PcodeOp.INT_EQUAL, PcodeOp.INT_NOTEQUAL, PcodeOp.INT_LESS, PcodeOp.INT_LESSEQUAL, PcodeOp.INT_SLESS, PcodeOp.INT_SLESSEQUAL):
-                self._handle_compare(op, state)
-            elif opc in (PcodeOp.CALL, PcodeOp.CALLIND):
-                self._handle_call(op, state)
-            else:
-                self._handle_passthrough(op, state)
-            self._seed_from_string_load(op, state)
-
-    def _copy_taint(self, op, state):
-        src = op.getInput(0)
-        dest = op.getOutput()
-        tr = state.get(self._varnode_key(src))
-        if tr:
-            state[self._varnode_key(dest)] = tr
-
-    def _handle_load(self, op, state):
-        dest = op.getOutput()
-        ptr = op.getInput(1)
-        tr = state.get(self._varnode_key(ptr))
-        if tr:
-            state[self._varnode_key(dest)] = tr
-        elif ptr.isConstant():
-            try:
-                const_addr = self.api.toAddr(ptr.getOffset())
-            except Exception:
-                const_addr = None
-            if const_addr in self.string_index:
-                key_str = self.string_index[const_addr]
-                key_info = self.registry_infos.get(key_str)
-                if key_info:
-                    tr = TaintRecord(key_info, width=dest.getSize() * 8)
-                    state[self._varnode_key(dest)] = tr
-            mem_tr = state.get(("ram", ptr.getOffset(), ptr.getSize())) if const_addr else None
-            if mem_tr:
-                state[self._varnode_key(dest)] = mem_tr
-        else:
-            ptr_taint = state.get(self._varnode_key(ptr))
-            if ptr_taint:
-                state[self._varnode_key(dest)] = ptr_taint
-
-    def _handle_store(self, op, state):
-        value = op.getInput(2)
-        dest_ptr = op.getInput(1)
-        tr = state.get(self._varnode_key(value))
-        if tr:
-            state[self._varnode_key(dest_ptr)] = tr
-
-    def _handle_bitwise(self, op, state):
-        dest = op.getOutput()
-        src0 = op.getInput(0)
-        src1 = op.getInput(1) if op.getNumInputs() > 1 else None
-        opc = op.getOpcode()
-        tr = state.get(self._varnode_key(src0))
-        if tr:
-            tr = tr.clone()
-            note = "0x%x" % src1.getOffset() if (src1 and src1.isConstant()) else str(op)
-            if opc == PcodeOp.INT_AND:
-                if src1 and src1.isConstant():
-                    tr.apply_and(src1.getOffset(), note)
-            elif opc == PcodeOp.INT_OR:
-                if src1 and src1.isConstant():
-                    tr.apply_or(src1.getOffset(), note)
-            elif opc == PcodeOp.INT_XOR:
-                if src1 and src1.isConstant():
-                    tr.apply_xor(src1.getOffset(), note)
-            elif opc == PcodeOp.INT_NEGATE:
-                tr.apply_not(note)
-            state[self._varnode_key(dest)] = tr
-
-    def _handle_shift(self, op, state):
-        dest = op.getOutput()
-        src0 = op.getInput(0)
-        src1 = op.getInput(1)
-        tr = state.get(self._varnode_key(src0))
-        if tr and src1.isConstant():
-            tr = tr.clone()
-            direction = "l" if op.getOpcode() == PcodeOp.INT_LEFT else "r"
-            tr.apply_shift(src1.getOffset(), direction, str(op))
-            state[self._varnode_key(dest)] = tr
-
-    def _handle_ext(self, op, state):
-        dest = op.getOutput()
-        src = op.getInput(0)
-        tr = state.get(self._varnode_key(src))
-        if tr:
-            tr = tr.clone()
-            tr.width = dest.getSize() * 8
-            state[self._varnode_key(dest)] = tr
-
-    def _handle_compare(self, op, state):
-        src0 = op.getInput(0)
-        src1 = op.getInput(1)
-        for src in (src0, src1):
-            tr = state.get(self._varnode_key(src))
-            if tr:
-                tr = tr.clone()
-                mask = None
-                if src0.isConstant():
-                    mask = src0.getOffset()
-                elif src1.isConstant():
-                    mask = src1.getOffset()
-                tr.mark_compare(mask, str(op))
-                state[self._varnode_key(op.getOutput())] = tr
-
-    def _handle_call(self, op, state):
-        callee_name = None
-        target = op.getInput(0)
-        if target and target.isAddress():
-            func = self.currentProgram.getFunctionManager().getFunctionAt(target.getAddress())
-            if func:
-                callee_name = func.getName()
-        arg_taints = []
-        for i in range(1, op.getNumInputs()):
-            arg_taints.append(state.get(self._varnode_key(op.getInput(i))))
-        out = op.getOutput()
-        seeded = False
-        if callee_name and self._is_registry_api(callee_name, None):
-            tr = self._seed_taint_from_registry_call(callee_name, op, arg_taints, out)
-            if tr:
-                state[self._varnode_key(out)] = tr
-                seeded = True
-        if not seeded and out is not None:
-            merged = None
-            for tr in arg_taints:
-                if tr:
-                    merged = merged.merge(tr) if merged else tr.clone()
-            if merged:
-                merged.history.append(("call", callee_name or str(target), None))
-                state[self._varnode_key(out)] = merged
-
-    def _handle_passthrough(self, op, state):
-        if op.getOutput() is None:
+        if pcode is None:
             return
-        src = op.getInput(0) if op.getInput(0) else None
+        for op in pcode:
+            if self.monitor.isCancelled():
+                break
+            if op is None:
+                continue
+            opc = op.getOpcode()
+            if opc == PcodeOp.CALL or opc == PcodeOp.CALLIND:
+                self._handle_call(op, state, func, depth)
+                continue
+            if opc == PcodeOp.RETURN:
+                continue
+            self._seed_from_string_load(op, state)
+            if opc in (PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INT_SEXT, PcodeOp.INT_ZEXT):
+                self._taint_copy(op, state)
+            elif opc in (PcodeOp.INT_ADD, PcodeOp.INT_SUB, PcodeOp.PTRADD, PcodeOp.PTRSUB):
+                self._taint_copy(op, state, op_label="addsub")
+            elif opc == PcodeOp.LOAD:
+                self._taint_copy(op, state, is_load=True)
+            elif opc == PcodeOp.STORE:
+                self._taint_store(op, state)
+            elif opc in (PcodeOp.INT_AND, PcodeOp.INT_OR, PcodeOp.INT_XOR, PcodeOp.INT_LEFT, PcodeOp.INT_RIGHT, PcodeOp.INT_SRIGHT, PcodeOp.INT_NEGATE):
+                self._taint_bitwise(op, state)
+            elif opc in (PcodeOp.INT_EQUAL, PcodeOp.INT_NOTEQUAL, PcodeOp.INT_LESS, PcodeOp.INT_LESSEQUAL, PcodeOp.INT_SLESS, PcodeOp.INT_SLESSEQUAL):
+                self._taint_compare(op, state)
+
+    def _taint_copy(self, op, state, is_load=False, op_label="copy"):
         dest = op.getOutput()
-        tr = state.get(self._varnode_key(src))
+        if dest is None:
+            return
+        src_index = 1 if is_load else 0
+        src = None
+        if op.getNumInputs() > src_index:
+            src = op.getInput(src_index)
+        if src is None:
+            return
+        key = self._varnode_key(src)
+        tr = state.get(key)
         if tr:
-            state[self._varnode_key(dest)] = tr
+            new_tr = tr.clone()
+            new_tr.history.append((op_label, str(op), None))
+            state[self._varnode_key(dest)] = new_tr
+
+    def _taint_store(self, op, state):
+        if op.getNumInputs() < 3:
+            return
+        val = op.getInput(2)
+        ptr = op.getInput(1)
+        tr = state.get(self._varnode_key(val))
+        if tr and ptr is not None:
+            ptr_key = self._varnode_key(ptr)
+            state[('mem', ptr_key)] = tr.clone()
+
+    def _taint_bitwise(self, op, state):
+        dest = op.getOutput()
+        if dest is None:
+            return
+        inp0 = op.getInput(0) if op.getNumInputs() > 0 else None
+        inp1 = op.getInput(1) if op.getNumInputs() > 1 else None
+        base_tr = state.get(self._varnode_key(inp0))
+        if base_tr is None:
+            base_tr = state.get(self._varnode_key(inp1))
+        if base_tr is None:
+            return
+        tr = base_tr.clone()
+        opc = op.getOpcode()
+        if opc == PcodeOp.INT_AND and inp1 is not None and inp1.isConstant():
+            tr.apply_and(inp1.getOffset(), str(op))
+        elif opc == PcodeOp.INT_OR and inp1 is not None and inp1.isConstant():
+            tr.apply_or(inp1.getOffset(), str(op))
+        elif opc == PcodeOp.INT_XOR and inp1 is not None and inp1.isConstant():
+            tr.apply_xor(inp1.getOffset(), str(op))
+        elif opc in (PcodeOp.INT_LEFT, PcodeOp.INT_RIGHT, PcodeOp.INT_SRIGHT) and inp1 is not None and inp1.isConstant():
+            direction = "l" if opc == PcodeOp.INT_LEFT else "r"
+            tr.apply_shift(inp1.getOffset(), direction, str(op))
+        elif opc == PcodeOp.INT_NEGATE:
+            tr.apply_not(str(op))
+        tr.history.append(("bitop", opc, str(op)))
+        state[self._varnode_key(dest)] = tr
+
+    def _taint_compare(self, op, state):
+        dest = op.getOutput()
+        if dest is None:
+            return
+        inp0 = op.getInput(0) if op.getNumInputs() > 0 else None
+        inp1 = op.getInput(1) if op.getNumInputs() > 1 else None
+        tr0 = state.get(self._varnode_key(inp0))
+        tr1 = state.get(self._varnode_key(inp1))
+        tr = tr0 or tr1
+        if tr is None:
+            return
+        clone = tr.clone()
+        if inp0 is not None and inp0.isConstant():
+            clone.mark_compare(inp0.getOffset(), str(op))
+        elif inp1 is not None and inp1.isConstant():
+            clone.mark_compare(inp1.getOffset(), str(op))
+        clone.history.append(("cmp", str(op), None))
+        state[self._varnode_key(dest)] = clone
 
     def _seed_from_string_load(self, op, state):
         if op.getOpcode() not in (PcodeOp.LOAD, PcodeOp.COPY):
             return
         dest = op.getOutput()
         pointer = None
-        if op.getOpcode() == PcodeOp.LOAD:
+        if op.getOpcode() == PcodeOp.LOAD and op.getNumInputs() > 1:
             pointer = op.getInput(1)
-        elif op.getOpcode() == PcodeOp.COPY:
+        elif op.getOpcode() == PcodeOp.COPY and op.getNumInputs() > 0:
             pointer = op.getInput(0)
         addr = None
         if pointer is None:
@@ -747,15 +729,25 @@ class RegistryKeyBitfieldReport(GhidraScript):
 
     def _registry_api_mapping(self, name):
         lname = name.lower()
-        mapping = {"key_arg": 0, "data_out_arg": 3, "data_width": 32}
-        if "regsetvalue" in lname or "setvalue" in lname:
-            mapping = {"key_arg": 0, "data_out_arg": 3, "data_width": 32}
-        elif "reggetvalue" in lname or "queryvalue" in lname or "queryinfo" in lname:
-            mapping = {"key_arg": 0, "data_out_arg": 5, "data_width": 32}
-        elif "openkey" in lname or "createkey" in lname:
-            mapping = {"key_arg": 1, "data_out_arg": 2, "data_width": 64}
-        elif "zw" in lname or "nt" in lname or "cm" in lname:
-            mapping = {"key_arg": 1, "data_out_arg": 3, "data_width": 64}
+        # Defaults target RegQueryValueEx-like pattern
+        mapping = {"key_arg": 0, "data_out_arg": 3, "data_width": 32, "ret_is_data": False}
+        known = {
+            "regsetvalue": {"key_arg": 0, "data_out_arg": None, "data_width": 32, "ret_is_data": False},
+            "setvalue": {"key_arg": 0, "data_out_arg": None, "data_width": 32, "ret_is_data": False},
+            "regqueryvalue": {"key_arg": 0, "data_out_arg": 3, "data_width": 32, "ret_is_data": False},
+            "regqueryvalueex": {"key_arg": 0, "data_out_arg": 3, "data_width": 32, "ret_is_data": False},
+            "reggetvalue": {"key_arg": 0, "data_out_arg": 5, "data_width": 32, "ret_is_data": False},
+            "regopenkey": {"key_arg": 1, "data_out_arg": 2, "data_width": 64, "ret_is_data": True},
+            "regcreatekey": {"key_arg": 1, "data_out_arg": 2, "data_width": 64, "ret_is_data": True},
+            "zwqueryvalue": {"key_arg": 1, "data_out_arg": 3, "data_width": 64, "ret_is_data": False},
+            "zwopenkey": {"key_arg": 1, "data_out_arg": 2, "data_width": 64, "ret_is_data": True},
+            "ntqueryvalue": {"key_arg": 1, "data_out_arg": 3, "data_width": 64, "ret_is_data": False},
+            "cmqueryvalue": {"key_arg": 1, "data_out_arg": 3, "data_width": 64, "ret_is_data": False},
+        }
+        for k in known:
+            if k in lname:
+                mapping.update(known[k])
+                break
         return mapping
 
     # ------------------------------------------------------------------
@@ -767,50 +759,100 @@ class RegistryKeyBitfieldReport(GhidraScript):
         for func in func_iter:
             if self.monitor.isCancelled():
                 break
-            self._analyze_function(func)
+            self._analyze_function(func, depth=0, incoming_state={})
 
-    def _analyze_function(self, func):
+    def _analyze_function(self, func, depth, incoming_state):
+        if func is None:
+            return {}
+        if not self.args.get("unlimited_recursion") and depth > self.args.get("depth", 256):
+            return {}
+        func_key = func.getEntryPoint()
+        prev_depth = self.call_depths.get(func_key)
+        if prev_depth is not None and prev_depth <= depth:
+            return self.func_summaries.get(func_key, {})
+        self.call_depths[func_key] = depth
+
         listing = self.currentProgram.getListing()
         bbm = BasicBlockModel(self.currentProgram)
-        body = func.getBody()
-        blocks = list(bbm.getCodeBlocksContaining(body, self.monitor))
+        try:
+            blocks_iter = bbm.getCodeBlocksContaining(func.getBody(), self.monitor)
+            blocks = [b for b in blocks_iter]
+        except Exception:
+            blocks = []
+        if not blocks:
+            blocks = self._fallback_blocks(func)
         block_states_in = {}
+        block_states_out = {}
         worklist = deque()
         for blk in blocks:
-            block_states_in[blk] = {}
+            block_states_in[blk] = dict(incoming_state)
             worklist.append(blk)
-        while worklist:
-            blk = worklist.popleft()
+        visited_guard = 0
+        max_iterations = max(len(blocks) * 8, 32)
+        while worklist and visited_guard < max_iterations:
             if self.monitor.isCancelled():
                 break
+            visited_guard += 1
+            blk = worklist.popleft()
             state = dict(block_states_in.get(blk, {}))
             inst_iter = listing.getInstructions(blk, True)
             last_inst = None
             while inst_iter.hasNext():
+                if self.monitor.isCancelled():
+                    break
                 inst = inst_iter.next()
                 last_inst = inst
-                self._propagate_taint(inst, state)
+                self._propagate_taint(inst, state, func, depth)
                 if inst.getFlowType().isConditional():
                     self._record_decision(inst, func, state)
-            dests = []
-            if last_inst:
-                refs = last_inst.getReferencesFrom()
-                for ref in refs:
-                    if ref.getReferenceType().isConditional() or ref.getReferenceType().isFlow():
-                        dests.append(ref.getToAddress())
-            for dest in dests:
-                try:
-                    dest_blk = bbm.getCodeBlockAt(dest, self.monitor)
-                except Exception:
-                    dest_blk = None
-                if dest_blk:
-                    incoming = block_states_in.get(dest_blk)
-                    if incoming is None:
-                        block_states_in[dest_blk] = dict(state)
+            block_states_out[blk] = state
+            dest_blocks = self._successor_blocks(blk, last_inst, bbm)
+            for dest_blk in dest_blocks:
+                incoming = block_states_in.get(dest_blk)
+                if incoming is None:
+                    block_states_in[dest_blk] = dict(state)
+                    worklist.append(dest_blk)
+                else:
+                    if self._merge_state(incoming, state):
                         worklist.append(dest_blk)
-                    else:
-                        if self._merge_state(incoming, state):
-                            worklist.append(dest_blk)
+        self.func_summaries[func_key] = block_states_out
+        return block_states_out
+
+    def _fallback_blocks(self, func):
+        listing = self.currentProgram.getListing()
+        body = func.getBody()
+        blocks = []
+        addrs = []
+        inst_iter = listing.getInstructions(body, True)
+        while inst_iter.hasNext():
+            if self.monitor.isCancelled():
+                break
+            inst = inst_iter.next()
+            addrs.append(inst.getMinAddress())
+        if not addrs:
+            return blocks
+        blocks.append(body)
+        return blocks
+
+    def _successor_blocks(self, blk, last_inst, bbm):
+        dests = []
+        if last_inst is None:
+            return dests
+        refs = last_inst.getReferencesFrom()
+        for ref in refs:
+            if ref is None:
+                continue
+            if ref.getReferenceType().isConditional() or ref.getReferenceType().isFlow() or ref.getReferenceType().isJump():
+                dests.append(ref.getToAddress())
+        out_blocks = []
+        for dest in dests:
+            try:
+                dest_blk = bbm.getCodeBlockAt(dest, self.monitor)
+            except Exception:
+                dest_blk = None
+            if dest_blk:
+                out_blocks.append(dest_blk)
+        return out_blocks
 
     def _record_decision(self, inst, func, state):
         cond_varnodes = self._get_condition_varnodes(inst)
@@ -818,7 +860,8 @@ class RegistryKeyBitfieldReport(GhidraScript):
             tr = state.get(self._varnode_key(vn))
             if tr:
                 analyzed = self._analyze_bit_usage(inst, tr)
-                dp = DecisionPoint(inst.getMinAddress(), str(inst), analyzed, func_name=func.getName(), history=analyzed.history)
+                ext = {"source": tr.source, "interprocedural": True if len(tr.history) > 0 else False}
+                dp = DecisionPoint(inst.getMinAddress(), str(inst), analyzed, func_name=func.getName(), history=analyzed.history, extended=ext)
                 analyzed.key_info.add_decision(dp)
                 analyzed.key_info.update_masks(analyzed)
 
@@ -828,7 +871,11 @@ class RegistryKeyBitfieldReport(GhidraScript):
             pcode = inst.getPcode()
         except Exception:
             return varnodes
+        if pcode is None:
+            return varnodes
         for op in pcode:
+            if op is None:
+                continue
             if op.getOpcode() == PcodeOp.CBRANCH:
                 inputs = op.getInputs()
                 if inputs:
@@ -842,6 +889,8 @@ class RegistryKeyBitfieldReport(GhidraScript):
         steps = 0
         taint = taint_record.clone()
         while steps < window:
+            if self.monitor.isCancelled():
+                break
             prev = listing.getInstructionBefore(current.getMinAddress())
             if prev is None:
                 break
@@ -849,37 +898,110 @@ class RegistryKeyBitfieldReport(GhidraScript):
                 pcode_ops = prev.getPcode()
             except Exception:
                 break
+            if pcode_ops is None:
+                break
             for op in pcode_ops:
+                if op is None:
+                    continue
                 opc = op.getOpcode()
                 if opc == PcodeOp.INT_AND:
                     inp1 = op.getInput(1)
-                    if inp1.isConstant():
+                    if inp1 is not None and inp1.isConstant():
                         taint.apply_and(inp1.getOffset(), str(op))
                 elif opc in (PcodeOp.INT_RIGHT, PcodeOp.INT_SRIGHT, PcodeOp.INT_LEFT):
                     inp1 = op.getInput(1)
-                    if inp1.isConstant():
+                    if inp1 is not None and inp1.isConstant():
                         direction = "l" if opc == PcodeOp.INT_LEFT else "r"
                         taint.apply_shift(inp1.getOffset(), direction, str(op))
                 elif opc == PcodeOp.INT_OR:
                     inp1 = op.getInput(1)
-                    if inp1.isConstant():
+                    if inp1 is not None and inp1.isConstant():
                         taint.apply_or(inp1.getOffset(), str(op))
                 elif opc == PcodeOp.INT_XOR:
                     inp1 = op.getInput(1)
-                    if inp1.isConstant():
+                    if inp1 is not None and inp1.isConstant():
                         taint.apply_xor(inp1.getOffset(), str(op))
                 elif opc == PcodeOp.INT_NEGATE:
                     taint.apply_not(str(op))
                 elif opc in (PcodeOp.INT_EQUAL, PcodeOp.INT_NOTEQUAL, PcodeOp.INT_LESS, PcodeOp.INT_LESSEQUAL, PcodeOp.INT_SLESS, PcodeOp.INT_SLESSEQUAL):
                     inp0 = op.getInput(0)
                     inp1 = op.getInput(1)
-                    if inp1.isConstant():
+                    if inp1 is not None and inp1.isConstant():
                         taint.mark_compare(inp1.getOffset(), str(op))
-                    elif inp0.isConstant():
+                    elif inp0 is not None and inp0.isConstant():
                         taint.mark_compare(inp0.getOffset(), str(op))
             current = prev
             steps += 1
+        taint.history.append(("decision", str(inst), None))
         return taint
+
+    # ------------------------------------------------------------------
+    # Call handling / interprocedural
+    # ------------------------------------------------------------------
+    def _handle_call(self, op, state, func, depth):
+        callee_addr = None
+        callee_func = None
+        fm = self.currentProgram.getFunctionManager()
+        if op.getOpcode() == PcodeOp.CALL:
+            if op.getNumInputs() > 0:
+                callee_addr = op.getInput(0).getAddress()
+                callee_func = fm.getFunctionAt(callee_addr)
+        arg_taints = []
+        for i in range(1, op.getNumInputs()):
+            vn = op.getInput(i)
+            arg_taints.append(state.get(self._varnode_key(vn)))
+        dest = op.getOutput()
+        callee_name = callee_func.getName() if callee_func else None
+        if callee_name and self._is_registry_api(callee_name, None):
+            tr = self._seed_taint_from_registry_call(callee_name, op, arg_taints, dest)
+            if tr and dest is not None:
+                state[self._varnode_key(dest)] = tr
+            if tr and callee_func is not None:
+                self._taint_return_to_callers(func, tr)
+            return
+        # Interprocedural propagation: if args tainted, push into callee summary
+        if callee_func and (dest is not None or any(arg_taints)):
+            if self.monitor.isCancelled():
+                return
+            entry_state = {}
+            for idx in range(min(len(arg_taints), len(self.X64_FASTCALL_ORDER))):
+                reg_name = self.X64_FASTCALL_ORDER[idx]
+                vn_key = ("register", reg_name, None)
+                tr = arg_taints[idx]
+                if tr:
+                    entry_state[vn_key] = tr.clone()
+            if self.args.get("unlimited_recursion") or depth < self.args.get("depth", 256):
+                callee_summary = self._analyze_function(callee_func, depth + 1, entry_state)
+                ret_taint = self._taint_from_summary(callee_summary)
+                if ret_taint and dest is not None:
+                    state[self._varnode_key(dest)] = ret_taint.clone()
+            elif any(arg_taints) and dest is not None:
+                # Conservative propagation when depth exceeded
+                state[self._varnode_key(dest)] = arg_taints[0].clone()
+
+    def _taint_return_to_callers(self, func, tr):
+        if func is None or tr is None:
+            return
+        func_key = func.getEntryPoint()
+        summary = self.func_summaries.get(func_key)
+        if summary is None:
+            self.func_summaries[func_key] = {'__ret__': tr.clone()}
+        else:
+            summary['__ret__'] = tr.clone()
+
+    def _taint_from_summary(self, summary):
+        if summary is None:
+            return None
+        if isinstance(summary, dict):
+            tr = summary.get('__ret__')
+            if tr:
+                return tr
+        # If full block states stored, merge any return markers
+        if isinstance(summary, dict):
+            for k, v in summary.items():
+                if isinstance(v, dict) and '__ret__' in v:
+                    return v['__ret__']
+        return None
 
     # ------------------------------------------------------------------
     # Output
