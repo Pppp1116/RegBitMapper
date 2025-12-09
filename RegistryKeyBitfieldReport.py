@@ -1024,9 +1024,17 @@ class RegistryKeyBitfieldReport(object):
         last_ret = None
         while inst_iter.hasNext():
             inst = inst_iter.next()
-            if inst.getFlowType().isReturn():
-                last_ret = inst
-                break
+            try:
+                flow_type = inst.getFlowType()
+            except Exception:
+                flow_type = None
+            if flow_type is not None:
+                try:
+                    if flow_type.isReturn():
+                        last_ret = inst
+                        break
+                except Exception:
+                    pass
         if last_ret is None:
             return None
         try:
