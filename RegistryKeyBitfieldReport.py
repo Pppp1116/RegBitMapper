@@ -998,7 +998,7 @@ class RegistryKeyBitfieldReport(object):
 
 def parse_cli_args():
     parser = argparse.ArgumentParser(description="Registry key bitfield analysis (PyGhidra)")
-    parser.add_argument("binary", help="Path to the binary to analyze")
+    parser.add_argument("binary", nargs="?", help="Path to the binary to analyze")
     parser.add_argument("--depth", type=int, default=RegistryKeyBitfieldReport.DEFAULT_DEPTH, help="Maximum call depth")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--debug-trace", action="store_true", dest="debug_trace", help="Enable trace logging")
@@ -1009,17 +1009,29 @@ def parse_cli_args():
 
 # Entry point for Ghidra headless compatibility
 if __name__ == "__main__":
-    cli_args = parse_cli_args()
-    arg_dict = {
-        "depth": cli_args.depth,
-        "debug": cli_args.debug,
-        "debug_trace": cli_args.debug_trace,
-        "output_dir": cli_args.output_dir,
-        "additional_apis": cli_args.additional_apis,
-    }
-
-    with open_program(cli_args.binary) as program:
+    # When running inside the Ghidra Script Manager, the environment provides
+    # a global "currentProgram". In that case we should skip CLI parsing to
+    # avoid argparse failures and operate directly on the active program.
+    if "currentProgram" in globals() and globals().get("currentProgram") is not None:
         monitor = ConsoleTaskMonitor()
         monitor.setMessage("RegistryKeyBitfieldReport initializing…")
-        script = RegistryKeyBitfieldReport(program, monitor=monitor, args=arg_dict)
+        script = RegistryKeyBitfieldReport(currentProgram, monitor=monitor)
         script.run()
+    else:
+        cli_args = parse_cli_args()
+        if not cli_args.binary:
+            raise SystemExit("binary path is required when running outside Ghidra")
+
+        arg_dict = {
+            "depth": cli_args.depth,
+            "debug": cli_args.debug,
+            "debug_trace": cli_args.debug_trace,
+            "output_dir": cli_args.output_dir,
+            "additional_apis": cli_args.additional_apis,
+        }
+
+        with open_program(cli_args.binary) as program:
+            monitor = ConsoleTaskMonitor()
+            monitor.setMessage("RegistryKeyBitfieldReport initializing…")
+            script = RegistryKeyBitfieldReport(program, monitor=monitor, args=arg_dict)
+            script.run()
