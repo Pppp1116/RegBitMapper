@@ -600,15 +600,23 @@ class RegistryKeyBitfieldReport(object):
                 inst = inst_iter.next()
                 last_inst = inst
                 self._propagate_taint(inst, state, func, depth)
-            for succ in blk.getDestinations(self.monitor):
-                succ_block = succ.getDestinationBlock()
-                if succ_block is None:
-                    continue
-                prev_state = block_states_in.get(succ_block)
-                merged = self._merge_states(prev_state, state)
-                if merged != prev_state:
-                    block_states_in[succ_block] = merged
-                    worklist.append(succ_block)
+            dest_iter = None
+            try:
+                dest_iter = blk.getDestinations(self.monitor)
+            except Exception:
+                dest_iter = None
+
+            if dest_iter is not None:
+                while dest_iter.hasNext():
+                    succ = dest_iter.next()
+                    succ_block = succ.getDestinationBlock()
+                    if succ_block is None:
+                        continue
+                    prev_state = block_states_in.get(succ_block)
+                    merged = self._merge_states(prev_state, state)
+                    if merged != prev_state:
+                        block_states_in[succ_block] = merged
+                        worklist.append(succ_block)
             if last_inst is not None:
                 self._capture_decision(last_inst, state, func)
 
