@@ -292,6 +292,31 @@ class RegistryKeyBitfieldReport(GhidraScript):
     GUID_PATTERN = re.compile(r"\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}")
     URL_PATTERN = re.compile(r"^[a-zA-Z]+://")
     X64_FASTCALL_ORDER = ["RCX", "RDX", "R8", "R9"]
+    REGISTRY_API_TABLE = {
+        "regqueryvalueexa": {"key_arg": 1, "data_out_arg": 4, "value_arg": 1, "data_width": 32, "ret_is_data": False},
+        "regqueryvalueexw": {"key_arg": 1, "data_out_arg": 4, "value_arg": 1, "data_width": 32, "ret_is_data": False},
+        "regqueryvalueex": {"key_arg": 1, "data_out_arg": 4, "value_arg": 1, "data_width": 32, "ret_is_data": False},
+        "reggetvaluea": {"key_arg": 1, "subkey_arg": 2, "value_arg": 3, "data_out_arg": 5, "data_width": 32, "ret_is_data": False},
+        "reggetvaluew": {"key_arg": 1, "subkey_arg": 2, "value_arg": 3, "data_out_arg": 5, "data_width": 32, "ret_is_data": False},
+        "regsetvalueexa": {"key_arg": 1, "value_arg": 2, "data_out_arg": 4, "data_width": 32, "ret_is_data": False},
+        "regsetvalueexw": {"key_arg": 1, "value_arg": 2, "data_out_arg": 4, "data_width": 32, "ret_is_data": False},
+        "regsetvalueex": {"key_arg": 1, "value_arg": 2, "data_out_arg": 4, "data_width": 32, "ret_is_data": False},
+        "regopenkeyexa": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "ret_is_data": True, "data_width": 64},
+        "regopenkeyexw": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "ret_is_data": True, "data_width": 64},
+        "regopenkey": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "ret_is_data": True, "data_width": 64},
+        "regcreatekeyexa": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "ret_is_data": True, "data_width": 64},
+        "regcreatekeyexw": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "ret_is_data": True, "data_width": 64},
+        "regcreatekeyex": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "ret_is_data": True, "data_width": 64},
+        "regcreatekey": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "ret_is_data": True, "data_width": 64},
+        "zwqueryvaluekey": {"key_arg": 1, "value_arg": 2, "data_out_arg": 3, "data_width": 64, "ret_is_data": False},
+        "zwqueryvalue": {"key_arg": 1, "value_arg": 2, "data_out_arg": 3, "data_width": 64, "ret_is_data": False},
+        "zwopenkey": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "data_width": 64, "ret_is_data": True},
+        "zwcreatekey": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "data_width": 64, "ret_is_data": True},
+        "ntopenkey": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "data_width": 64, "ret_is_data": True},
+        "ntcreatekey": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "data_width": 64, "ret_is_data": True},
+        "ntqueryvaluekey": {"key_arg": 1, "value_arg": 2, "data_out_arg": 3, "data_width": 64, "ret_is_data": False},
+        "cmregistercallback": {"key_arg": 1, "data_out_arg": None, "ret_is_data": True, "data_width": 64},
+    }
 
     def run(self):
         self.api = FlatProgramAPI(self.currentProgram, self.monitor)
@@ -303,7 +328,10 @@ class RegistryKeyBitfieldReport(GhidraScript):
         self.func_summaries = {}
         self.call_depths = {}
         if not os.path.isdir(self.output_dir):
-            os.makedirs(self.output_dir)
+            try:
+                os.makedirs(self.output_dir)
+            except Exception:
+                pass
 
         self._log("Arguments: %s" % self.args)
         self._log("Collecting registry-like strings...")
@@ -367,10 +395,10 @@ class RegistryKeyBitfieldReport(GhidraScript):
     def _get_output_dir(self):
         custom = self.args.get("output_dir")
         if custom:
-            return custom
+            return os.path.abspath(custom)
         home = os.path.expanduser("~")
         program_name = self.currentProgram.getName() if self.currentProgram else "program"
-        return os.path.join(home, "regkeys", program_name)
+        return os.path.abspath(os.path.join(home, "regkeys", program_name))
 
     # ------------------------------------------------------------------
     # String collection
@@ -568,6 +596,16 @@ class RegistryKeyBitfieldReport(GhidraScript):
             except Exception:
                 return (str(vn), None)
 
+    def _pointer_slot(self, vn):
+        if vn is None:
+            return None
+        key = self._varnode_key(vn)
+        if key is None:
+            return None
+        if isinstance(key, tuple) and len(key) >= 2:
+            return ('mem', key)
+        return None
+
     def _merge_state(self, dst_state, src_state):
         changed = False
         for k, v in src_state.items():
@@ -630,8 +668,9 @@ class RegistryKeyBitfieldReport(GhidraScript):
         key = self._varnode_key(src)
         tr = state.get(key)
         if tr is None and is_load:
-            ptr_key = self._varnode_key(src)
-            tr = state.get(('mem', ptr_key))
+            ptr_slot = self._pointer_slot(src)
+            if ptr_slot:
+                tr = state.get(ptr_slot)
         if tr:
             new_tr = tr.clone()
             new_tr.history.append((op_label, str(op), None))
@@ -644,8 +683,9 @@ class RegistryKeyBitfieldReport(GhidraScript):
         ptr = op.getInput(1)
         tr = state.get(self._varnode_key(val))
         if tr and ptr is not None:
-            ptr_key = self._varnode_key(ptr)
-            state[('mem', ptr_key)] = tr.clone()
+            ptr_slot = self._pointer_slot(ptr)
+            if ptr_slot:
+                state[ptr_slot] = tr.clone()
 
     def _taint_bitwise(self, op, state):
         dest = op.getOutput()
@@ -722,31 +762,47 @@ class RegistryKeyBitfieldReport(GhidraScript):
             tr.history.append(("seed", key_str, str(op)))
             state[self._varnode_key(dest)] = tr
 
-    def _seed_taint_from_registry_call(self, name, call_op, arg_taints, out_vn):
+    def _seed_taint_from_registry_call(self, name, call_op, arg_taints, out_vn, state):
         mapping = self._registry_api_mapping(name)
         key_arg = mapping.get("key_arg")
+        subkey_arg = mapping.get("subkey_arg")
+        value_arg = mapping.get("value_arg")
         data_arg = mapping.get("data_out_arg")
         buf_width = mapping.get("data_width", 32)
         ret_is_data = mapping.get("ret_is_data", False)
-        key_tr = None
-        if key_arg is not None and key_arg < len(arg_taints):
-            key_tr = arg_taints[key_arg]
-        if key_tr is None:
-            resolved_key = self._resolve_constant_string(call_op, key_arg)
-            if resolved_key:
-                if resolved_key not in self.registry_infos:
-                    self.registry_infos[resolved_key] = RegistryKeyInfo(resolved_key)
-                key_tr = TaintRecord(self.registry_infos[resolved_key], width=buf_width)
-                key_tr.history.append(("api-key", name, resolved_key))
-        if key_tr and data_arg is not None and data_arg < len(arg_taints):
-            tr = key_tr.clone()
-            tr.width = buf_width
-            tr.history.append(("api-read", name, data_arg))
-            return tr
-        if key_tr and ret_is_data and out_vn is not None:
-            tr = key_tr.clone()
-            tr.history.append(("api-ret", name, None))
-            return tr
+        key_info = None
+        resolved_key = None
+        arg_candidates = [key_arg, subkey_arg, value_arg]
+        for idx in arg_candidates:
+            if idx is not None and idx < len(arg_taints):
+                tr = arg_taints[idx]
+                if tr:
+                    key_info = tr.key_info
+                    break
+        if key_info is None:
+            for idx in arg_candidates:
+                resolved_key = self._resolve_constant_string(call_op, idx)
+                if resolved_key:
+                    break
+        if resolved_key:
+            key_info = self.registry_infos.get(resolved_key)
+            if key_info is None:
+                key_info = RegistryKeyInfo(resolved_key)
+                self.registry_infos[resolved_key] = key_info
+        if key_info is None:
+            return None
+        base_tr = TaintRecord(key_info, width=buf_width)
+        base_tr.history.append(("api-seed", name, resolved_key))
+        if data_arg is not None and data_arg < call_op.getNumInputs():
+            data_vn = call_op.getInput(data_arg)
+            if data_vn is not None:
+                tr = base_tr.clone()
+                tr.history.append(("api-read", name, data_arg))
+                state[self._varnode_key(data_vn)] = tr
+        if ret_is_data and out_vn is not None:
+            tr_ret = base_tr.clone()
+            tr_ret.history.append(("api-ret", name, None))
+            return tr_ret
         return None
 
     def _resolve_constant_string(self, call_op, arg_index):
@@ -769,24 +825,10 @@ class RegistryKeyBitfieldReport(GhidraScript):
 
     def _registry_api_mapping(self, name):
         lname = name.lower()
-        # Defaults target RegQueryValueEx-like pattern
-        mapping = {"key_arg": 1, "data_out_arg": 5, "data_width": 32, "ret_is_data": False}
-        known = {
-            "regsetvalue": {"key_arg": 1, "data_out_arg": None, "data_width": 32, "ret_is_data": False},
-            "setvalue": {"key_arg": 1, "data_out_arg": None, "data_width": 32, "ret_is_data": False},
-            "regqueryvalue": {"key_arg": 1, "data_out_arg": 3, "data_width": 32, "ret_is_data": False},
-            "regqueryvalueex": {"key_arg": 1, "data_out_arg": 5, "data_width": 32, "ret_is_data": False},
-            "reggetvalue": {"key_arg": 2, "data_out_arg": 5, "data_width": 32, "ret_is_data": False},
-            "regopenkey": {"key_arg": 1, "data_out_arg": 4, "data_width": 64, "ret_is_data": True},
-            "regcreatekey": {"key_arg": 1, "data_out_arg": 4, "data_width": 64, "ret_is_data": True},
-            "zwqueryvalue": {"key_arg": 1, "data_out_arg": 4, "data_width": 64, "ret_is_data": False},
-            "zwopenkey": {"key_arg": 1, "data_out_arg": 2, "data_width": 64, "ret_is_data": True},
-            "ntqueryvalue": {"key_arg": 1, "data_out_arg": 4, "data_width": 64, "ret_is_data": False},
-            "cmqueryvalue": {"key_arg": 1, "data_out_arg": 4, "data_width": 64, "ret_is_data": False},
-        }
-        for k in known:
-            if k in lname:
-                mapping.update(known[k])
+        mapping = {"key_arg": 1, "data_out_arg": 4, "data_width": 32, "ret_is_data": False}
+        for api_name, info in self.REGISTRY_API_TABLE.items():
+            if api_name in lname:
+                mapping.update(info)
                 break
         return mapping
 
@@ -828,11 +870,15 @@ class RegistryKeyBitfieldReport(GhidraScript):
             block_states_in[blk] = dict(incoming_state)
             worklist.append(blk)
         visited_guard = 0
-        max_iterations = max(len(blocks) * 8, 32)
-        while worklist and visited_guard < max_iterations:
+        max_iterations = max(len(blocks) * 32, 128)
+        guard_hit = False
+        while worklist:
             if self.monitor.isCancelled():
                 break
             visited_guard += 1
+            if visited_guard > max_iterations and not guard_hit:
+                guard_hit = True
+                self._log("Iteration cap exceeded in %s; continuing conservatively" % func.getName())
             blk = worklist.popleft()
             state = dict(block_states_in.get(blk, {}))
             inst_iter = listing.getInstructions(blk, True)
@@ -855,8 +901,6 @@ class RegistryKeyBitfieldReport(GhidraScript):
                 else:
                     if self._merge_state(incoming, state):
                         worklist.append(dest_blk)
-        if worklist:
-            self._log("Iteration cap hit in function %s; results may be incomplete" % func.getName())
         self.func_summaries[func_key] = block_states_out
         return block_states_out
 
@@ -905,7 +949,13 @@ class RegistryKeyBitfieldReport(GhidraScript):
             tr = state.get(self._varnode_key(vn))
             if tr:
                 analyzed = self._analyze_bit_usage(inst, tr)
-                ext = {"source": tr.source, "interprocedural": True if len(tr.history) > 0 else False}
+                ext = {
+                    "source": tr.source,
+                    "interprocedural": True if len(tr.history) > 0 else False,
+                    "from_handle": True if "api-ret" in [h[0] for h in tr.history] else False,
+                    "operation_history": list(tr.history),
+                    "compare_mnemonic": inst.getMnemonicString() if inst else None,
+                }
                 dp = DecisionPoint(inst.getMinAddress(), str(inst), analyzed, func_name=func.getName(), history=analyzed.history, extended=ext)
                 analyzed.key_info.add_decision(dp)
                 analyzed.key_info.update_masks(analyzed)
@@ -1035,7 +1085,7 @@ class RegistryKeyBitfieldReport(GhidraScript):
             arg_taints.append(state.get(self._varnode_key(vn)))
         dest = op.getOutput()
         if callee_name and self._is_registry_api(callee_name, self.addl_pattern):
-            tr = self._seed_taint_from_registry_call(callee_name, op, arg_taints, dest)
+            tr = self._seed_taint_from_registry_call(callee_name, op, arg_taints, dest, state)
             if tr and dest is not None:
                 state[self._varnode_key(dest)] = tr
             if tr and callee_func is not None:
@@ -1088,6 +1138,15 @@ class RegistryKeyBitfieldReport(GhidraScript):
                         callee_name = func.getName()
                 except Exception:
                     return None, callee_name
+            else:
+                slot = self._pointer_slot(target_vn)
+                if slot:
+                    refs = self.api.getReferencesTo(self.api.toAddr(slot[1][1])) if len(slot) > 1 else []
+                    for ref in refs:
+                        if ref.getReferenceType() and ref.getReferenceType().isData():
+                            tgt_func = fm.getFunctionAt(ref.getFromAddress())
+                            if tgt_func and callee_name is None:
+                                callee_name = tgt_func.getName()
         return func, callee_name
 
     def _taint_return_to_callers(self, func, tr):
@@ -1121,17 +1180,23 @@ class RegistryKeyBitfieldReport(GhidraScript):
         program_name = self.currentProgram.getName() if self.currentProgram else "program"
         ndjson_path = os.path.join(self.output_dir, "%s.registry_bitfields.ndjson" % program_name)
         md_path = os.path.join(self.output_dir, "%s.registry_bitfields.md" % program_name)
-        with open(ndjson_path, "w") as f:
-            for key in sorted(self.registry_infos.keys()):
-                info = self.registry_infos[key]
-                f.write(json.dumps(info.to_ndjson()))
-                f.write("\n")
-        with open(md_path, "w") as f:
-            f.write("# Registry Bitfield Report\n\n")
-            for key in sorted(self.registry_infos.keys()):
-                info = self.registry_infos[key]
-                f.write(info.to_markdown())
-                f.write("\n")
+        try:
+            with open(ndjson_path, "w") as f:
+                for key in sorted(self.registry_infos.keys()):
+                    info = self.registry_infos[key]
+                    f.write(json.dumps(info.to_ndjson()))
+                    f.write("\n")
+        except Exception as e:
+            self._log("Failed to write NDJSON: %s" % e)
+        try:
+            with open(md_path, "w") as f:
+                f.write("# Registry Bitfield Report\n\n")
+                for key in sorted(self.registry_infos.keys()):
+                    info = self.registry_infos[key]
+                    f.write(info.to_markdown())
+                    f.write("\n")
+        except Exception as e:
+            self._log("Failed to write Markdown: %s" % e)
 
 
 # Instantiate script entry point
