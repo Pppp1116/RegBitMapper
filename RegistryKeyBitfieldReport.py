@@ -858,11 +858,29 @@ class RegistryKeyBitfieldReport(object):
             return summary.get("__ret__")
         return None
 
+    def _collect_operand_objects(self, inst):
+        objs = []
+        if not hasattr(inst, "getNumOperands") or not hasattr(inst, "getOpObjects"):
+            return objs
+        try:
+            count = inst.getNumOperands()
+        except Exception:
+            count = 0
+        for idx in range(count):
+            try:
+                objs.extend(inst.getOpObjects(idx) or [])
+            except TypeError:
+                # Some instruction adapters require a concrete operand index; skip invalid requests.
+                continue
+            except Exception:
+                continue
+        return objs
+
     def _assembly_fallback(self, inst, state):
         if not isinstance(inst, Instruction):
             return
         mnem = inst.getMnemonicString().upper()
-        ops = [str(op) for op in inst.getOpObjects(None)] if hasattr(inst, "getOpObjects") else []
+        ops = [str(op) for op in self._collect_operand_objects(inst)]
         if mnem in ("TEST", "CMP") and len(ops) >= 2:
             try:
                 mask = int(str(ops[1]).replace("0x", ""), 16)
