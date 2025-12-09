@@ -1,28 +1,30 @@
 # coding: utf-8
 """
-RegistryKeyBitfieldReport (Ghidra GUI friendly)
+RegistryKeyBitfieldReport (PyGhidra friendly)
 
-This script performs program-wide analysis to discover registry usage. It is
-built to run directly from the Ghidra Script Manager (double-click execution)
-and does not require any configuration. It keeps backward-compatible NDJSON
-output while adding optional "extended" metadata.
+This script performs program-wide analysis to discover registry usage. It can
+run directly from the Ghidra Script Manager or headlessly via PyGhidra. It
+keeps backward-compatible NDJSON output while adding optional "extended"
+metadata.
 """
 
 from __future__ import print_function
 
+import argparse
 import json
 import os
 import re
 import time
 from collections import defaultdict, deque
 
-from ghidra.app.script import GhidraScript
 from ghidra.program.flatapi import FlatProgramAPI
 from ghidra.program.model.address import Address
 from ghidra.program.model.block import BasicBlockModel
 from ghidra.program.model.listing import Instruction
 from ghidra.program.model.pcode import PcodeOp
 from ghidra.program.model.symbol import RefType
+from ghidra.util.task import ConsoleTaskMonitor
+from pyghidra import open_program
 
 # ---------------------------------------------------------------------------
 # Utility data containers
@@ -258,7 +260,7 @@ class RegistryKeyInfo(object):
 # Main script implementation
 # ---------------------------------------------------------------------------
 
-class RegistryKeyBitfieldReport(GhidraScript):
+class RegistryKeyBitfieldReport(object):
     REGEX_REGISTRY_STRING = re.compile(
         r"(HKLM|HKEY_LOCAL_MACHINE|HKCU|HKEY_CURRENT_USER|HKCR|HKEY_CLASSES_ROOT|HKU|HKCC|HKEY_CURRENT_CONFIG)",
         re.IGNORECASE,
@@ -268,15 +270,19 @@ class RegistryKeyBitfieldReport(GhidraScript):
     DEFAULT_DEPTH = 256
     X64_FASTCALL_ORDER = ["RCX", "RDX", "R8", "R9"]
 
+    def __init__(self, program, monitor=None, args=None):
+        self.currentProgram = program
+        self.monitor = monitor or ConsoleTaskMonitor()
+        self.args = self._parse_args(args)
+
     def run(self):
-        # Defensive guard for GUI execution
+        # Defensive guard for execution
         if self.currentProgram is None:
             print("No active program; aborting.")
             return
 
         self.monitor.setMessage("RegistryKeyBitfieldReport running…")
         self.api = FlatProgramAPI(self.currentProgram, self.monitor)
-        self.args = self._parse_args()
         self.string_index = {}
         self.registry_infos = {}
         self.func_summaries = {}
@@ -307,7 +313,7 @@ class RegistryKeyBitfieldReport(GhidraScript):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _parse_args(self):
+    def _parse_args(self, overrides=None):
         defaults = {
             "depth": self.DEFAULT_DEPTH,
             "debug": False,
@@ -316,21 +322,19 @@ class RegistryKeyBitfieldReport(GhidraScript):
             "additional_apis": "",
         }
         args = defaults.copy()
-        raw_args = self.getScriptArgs()
-        if raw_args:
-            for arg in raw_args:
-                if "=" not in arg:
+        if overrides:
+            for key, value in overrides.items():
+                if key not in args or value is None:
                     continue
-                k, v = arg.split("=", 1)
-                if k == "depth":
+                if key == "depth":
                     try:
-                        args[k] = int(v)
+                        args[key] = int(value)
                     except Exception:
                         pass
-                elif k in ("debug", "debug_trace"):
-                    args[k] = v.lower() in ("1", "true", "yes", "on")
-                elif k in ("output_dir", "additional_apis"):
-                    args[k] = v
+                elif key in ("debug", "debug_trace"):
+                    args[key] = bool(value)
+                elif key in ("output_dir", "additional_apis"):
+                    args[key] = value
         return args
 
     def _get_output_dir(self):
@@ -992,7 +996,30 @@ class RegistryKeyBitfieldReport(GhidraScript):
         return ret_tr
 
 
+def parse_cli_args():
+    parser = argparse.ArgumentParser(description="Registry key bitfield analysis (PyGhidra)")
+    parser.add_argument("binary", help="Path to the binary to analyze")
+    parser.add_argument("--depth", type=int, default=RegistryKeyBitfieldReport.DEFAULT_DEPTH, help="Maximum call depth")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--debug-trace", action="store_true", dest="debug_trace", help="Enable trace logging")
+    parser.add_argument("--output-dir", dest="output_dir", help="Output directory for reports")
+    parser.add_argument("--additional-apis", dest="additional_apis", default="", help="Additional API name regex pattern")
+    return parser.parse_args()
+
+
 # Entry point for Ghidra headless compatibility
 if __name__ == "__main__":
-    script = RegistryKeyBitfieldReport()
-    script.run()
+    cli_args = parse_cli_args()
+    arg_dict = {
+        "depth": cli_args.depth,
+        "debug": cli_args.debug,
+        "debug_trace": cli_args.debug_trace,
+        "output_dir": cli_args.output_dir,
+        "additional_apis": cli_args.additional_apis,
+    }
+
+    with open_program(cli_args.binary) as program:
+        monitor = ConsoleTaskMonitor()
+        monitor.setMessage("RegistryKeyBitfieldReport initializing…")
+        script = RegistryKeyBitfieldReport(program, monitor=monitor, args=arg_dict)
+        script.run()
