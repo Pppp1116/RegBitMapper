@@ -600,7 +600,9 @@ class RegistryKeyBitfieldReport(object):
                 inst = inst_iter.next()
                 last_inst = inst
                 self._propagate_taint(inst, state, func, depth)
-            for succ in blk.getDestinations(self.monitor):
+            succ_iter = blk.getDestinations(self.monitor)
+            while getattr(succ_iter, "hasNext", None) and succ_iter.hasNext():
+                succ = succ_iter.next()
                 succ_block = succ.getDestinationBlock()
                 if succ_block is None:
                     continue
