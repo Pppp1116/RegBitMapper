@@ -295,6 +295,7 @@ class RegistryKeyBitfieldReport(GhidraScript):
     def run(self):
         self.api = FlatProgramAPI(self.currentProgram, self.monitor)
         self.args = self._parse_args()
+        self.addl_pattern = self._compile_additional_apis(self.args.get("additional_apis"))
         self.string_index = {}  # Address -> string
         self.registry_infos = {}  # string -> RegistryKeyInfo
         self.output_dir = self._get_output_dir()
@@ -345,6 +346,14 @@ class RegistryKeyBitfieldReport(GhidraScript):
                     elif k == "output_dir":
                         args[k] = v
         return args
+
+    def _compile_additional_apis(self, pattern):
+        if not pattern:
+            return None
+        try:
+            return re.compile(pattern)
+        except Exception:
+            return None
 
     def _log(self, msg):
         if self.args.get("debug"):
@@ -407,13 +416,7 @@ class RegistryKeyBitfieldReport(GhidraScript):
     # API call scanning
     # ------------------------------------------------------------------
     def _scan_registry_calls(self):
-        addl = self.args.get("additional_apis") or ""
-        addl_pattern = None
-        if addl:
-            try:
-                addl_pattern = re.compile(addl)
-            except Exception:
-                addl_pattern = None
+        addl_pattern = self.addl_pattern
         fm = self.currentProgram.getFunctionManager()
         functions = fm.getFunctions(True)
         for func in functions:
@@ -597,6 +600,9 @@ class RegistryKeyBitfieldReport(GhidraScript):
             return
         key = self._varnode_key(src)
         tr = state.get(key)
+        if tr is None and is_load:
+            ptr_key = self._varnode_key(src)
+            tr = state.get(('mem', ptr_key))
         if tr:
             new_tr = tr.clone()
             new_tr.history.append((op_label, str(op), None))
@@ -690,12 +696,15 @@ class RegistryKeyBitfieldReport(GhidraScript):
         key_arg = mapping.get("key_arg")
         data_arg = mapping.get("data_out_arg")
         buf_width = mapping.get("data_width", 32)
+        ret_is_data = mapping.get("ret_is_data", False)
         key_tr = None
         if key_arg is not None and key_arg < len(arg_taints):
             key_tr = arg_taints[key_arg]
         if key_tr is None:
             resolved_key = self._resolve_constant_string(call_op, key_arg)
-            if resolved_key and resolved_key in self.registry_infos:
+            if resolved_key:
+                if resolved_key not in self.registry_infos:
+                    self.registry_infos[resolved_key] = RegistryKeyInfo(resolved_key)
                 key_tr = TaintRecord(self.registry_infos[resolved_key], width=buf_width)
                 key_tr.history.append(("api-key", name, resolved_key))
         if key_tr and data_arg is not None and data_arg < len(arg_taints):
@@ -703,7 +712,7 @@ class RegistryKeyBitfieldReport(GhidraScript):
             tr.width = buf_width
             tr.history.append(("api-read", name, data_arg))
             return tr
-        if key_tr and out_vn is not None:
+        if key_tr and ret_is_data and out_vn is not None:
             tr = key_tr.clone()
             tr.history.append(("api-ret", name, None))
             return tr
@@ -730,19 +739,19 @@ class RegistryKeyBitfieldReport(GhidraScript):
     def _registry_api_mapping(self, name):
         lname = name.lower()
         # Defaults target RegQueryValueEx-like pattern
-        mapping = {"key_arg": 0, "data_out_arg": 3, "data_width": 32, "ret_is_data": False}
+        mapping = {"key_arg": 1, "data_out_arg": 5, "data_width": 32, "ret_is_data": False}
         known = {
-            "regsetvalue": {"key_arg": 0, "data_out_arg": None, "data_width": 32, "ret_is_data": False},
-            "setvalue": {"key_arg": 0, "data_out_arg": None, "data_width": 32, "ret_is_data": False},
-            "regqueryvalue": {"key_arg": 0, "data_out_arg": 3, "data_width": 32, "ret_is_data": False},
-            "regqueryvalueex": {"key_arg": 0, "data_out_arg": 3, "data_width": 32, "ret_is_data": False},
-            "reggetvalue": {"key_arg": 0, "data_out_arg": 5, "data_width": 32, "ret_is_data": False},
-            "regopenkey": {"key_arg": 1, "data_out_arg": 2, "data_width": 64, "ret_is_data": True},
-            "regcreatekey": {"key_arg": 1, "data_out_arg": 2, "data_width": 64, "ret_is_data": True},
-            "zwqueryvalue": {"key_arg": 1, "data_out_arg": 3, "data_width": 64, "ret_is_data": False},
+            "regsetvalue": {"key_arg": 1, "data_out_arg": None, "data_width": 32, "ret_is_data": False},
+            "setvalue": {"key_arg": 1, "data_out_arg": None, "data_width": 32, "ret_is_data": False},
+            "regqueryvalue": {"key_arg": 1, "data_out_arg": 3, "data_width": 32, "ret_is_data": False},
+            "regqueryvalueex": {"key_arg": 1, "data_out_arg": 5, "data_width": 32, "ret_is_data": False},
+            "reggetvalue": {"key_arg": 2, "data_out_arg": 5, "data_width": 32, "ret_is_data": False},
+            "regopenkey": {"key_arg": 1, "data_out_arg": 4, "data_width": 64, "ret_is_data": True},
+            "regcreatekey": {"key_arg": 1, "data_out_arg": 4, "data_width": 64, "ret_is_data": True},
+            "zwqueryvalue": {"key_arg": 1, "data_out_arg": 4, "data_width": 64, "ret_is_data": False},
             "zwopenkey": {"key_arg": 1, "data_out_arg": 2, "data_width": 64, "ret_is_data": True},
-            "ntqueryvalue": {"key_arg": 1, "data_out_arg": 3, "data_width": 64, "ret_is_data": False},
-            "cmqueryvalue": {"key_arg": 1, "data_out_arg": 3, "data_width": 64, "ret_is_data": False},
+            "ntqueryvalue": {"key_arg": 1, "data_out_arg": 4, "data_width": 64, "ret_is_data": False},
+            "cmqueryvalue": {"key_arg": 1, "data_out_arg": 4, "data_width": 64, "ret_is_data": False},
         }
         for k in known:
             if k in lname:
@@ -815,6 +824,8 @@ class RegistryKeyBitfieldReport(GhidraScript):
                 else:
                     if self._merge_state(incoming, state):
                         worklist.append(dest_blk)
+        if worklist:
+            self._log("Iteration cap hit in function %s; results may be incomplete" % func.getName())
         self.func_summaries[func_key] = block_states_out
         return block_states_out
 
@@ -844,6 +855,9 @@ class RegistryKeyBitfieldReport(GhidraScript):
                 continue
             if ref.getReferenceType().isConditional() or ref.getReferenceType().isFlow() or ref.getReferenceType().isJump():
                 dests.append(ref.getToAddress())
+        fallthrough = last_inst.getFallThrough()
+        if fallthrough:
+            dests.append(fallthrough)
         out_blocks = []
         for dest in dests:
             try:
@@ -941,18 +955,21 @@ class RegistryKeyBitfieldReport(GhidraScript):
     def _handle_call(self, op, state, func, depth):
         callee_addr = None
         callee_func = None
+        callee_name = None
         fm = self.currentProgram.getFunctionManager()
         if op.getOpcode() == PcodeOp.CALL:
             if op.getNumInputs() > 0:
                 callee_addr = op.getInput(0).getAddress()
                 callee_func = fm.getFunctionAt(callee_addr)
+                callee_name = callee_func.getName() if callee_func else None
+        elif op.getOpcode() == PcodeOp.CALLIND:
+            callee_func, callee_name = self._resolve_indirect_callee(op, fm)
         arg_taints = []
         for i in range(1, op.getNumInputs()):
             vn = op.getInput(i)
             arg_taints.append(state.get(self._varnode_key(vn)))
         dest = op.getOutput()
-        callee_name = callee_func.getName() if callee_func else None
-        if callee_name and self._is_registry_api(callee_name, None):
+        if callee_name and self._is_registry_api(callee_name, self.addl_pattern):
             tr = self._seed_taint_from_registry_call(callee_name, op, arg_taints, dest)
             if tr and dest is not None:
                 state[self._varnode_key(dest)] = tr
@@ -978,6 +995,35 @@ class RegistryKeyBitfieldReport(GhidraScript):
             elif any(arg_taints) and dest is not None:
                 # Conservative propagation when depth exceeded
                 state[self._varnode_key(dest)] = arg_taints[0].clone()
+
+    def _resolve_indirect_callee(self, call_op, fm):
+        inst_addr = call_op.getSeqnum().getTarget()
+        inst = self.api.getInstructionAt(inst_addr)
+        callee_name = None
+        func = None
+        if inst:
+            refs = inst.getReferencesFrom()
+            for ref in refs:
+                if ref.getReferenceType().isCall():
+                    func = fm.getFunctionAt(ref.getToAddress())
+                    if func:
+                        callee_name = func.getName()
+                    else:
+                        sym = self.api.getSymbolAt(ref.getToAddress())
+                        if sym:
+                            callee_name = sym.getName()
+                    break
+        if call_op.getNumInputs() > 0:
+            target_vn = call_op.getInput(0)
+            if target_vn.isConstant():
+                try:
+                    callee_addr = self.api.toAddr(target_vn.getOffset())
+                    func = fm.getFunctionAt(callee_addr)
+                    if func and callee_name is None:
+                        callee_name = func.getName()
+                except Exception:
+                    return None, callee_name
+        return func, callee_name
 
     def _taint_return_to_callers(self, func, tr):
         if func is None or tr is None:
