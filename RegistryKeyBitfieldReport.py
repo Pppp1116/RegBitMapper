@@ -1,4 +1,6 @@
 # coding: utf-8
+#@category RegBitMapper
+#@runtime Jython
 """
 RegistryKeyBitfieldReport (PyGhidra friendly)
 
@@ -24,7 +26,6 @@ from ghidra.program.model.listing import Instruction
 from ghidra.program.model.pcode import PcodeOp
 from ghidra.program.model.symbol import RefType
 from ghidra.util.task import ConsoleTaskMonitor
-from pyghidra import open_program
 
 # ---------------------------------------------------------------------------
 # Utility data containers
@@ -281,7 +282,7 @@ class RegistryKeyBitfieldReport(object):
             print("No active program; aborting.")
             return
 
-        self.monitor.setMessage("RegistryKeyBitfieldReport running…")
+        self.monitor.setMessage("RegistryKeyBitfieldReport running...")
         self.api = FlatProgramAPI(self.currentProgram, self.monitor)
         self.string_index = {}
         self.registry_infos = {}
@@ -296,17 +297,17 @@ class RegistryKeyBitfieldReport(object):
         except Exception:
             pass
 
-        self._log("Collecting registry strings…")
+        self._log("Collecting registry strings...")
         self._collect_registry_strings()
-        self._log("Building API pattern registry…")
+        self._log("Building API pattern registry...")
         self._build_api_pattern_registry()
-        self._log("Scanning registry APIs…")
+        self._log("Scanning registry APIs...")
         self._scan_registry_calls()
-        self._log("Running program-wide analysis…")
+        self._log("Running program-wide analysis...")
         self._analyze_program()
-        self._log("Verifying seed coverage…")
+        self._log("Verifying seed coverage...")
         self._mark_unreferenced_seeds()
-        self._log("Writing outputs…")
+        self._log("Writing outputs...")
         self._write_outputs()
         self._log("Done.")
 
@@ -332,7 +333,10 @@ class RegistryKeyBitfieldReport(object):
                     except Exception:
                         pass
                 elif key in ("debug", "debug_trace"):
-                    args[key] = bool(value)
+                    if isinstance(value, str):
+                        args[key] = value.strip().lower() in ("1", "true", "yes", "on")
+                    else:
+                        args[key] = bool(value)
                 elif key in ("output_dir", "additional_apis"):
                     args[key] = value
         return args
@@ -1007,20 +1011,83 @@ def parse_cli_args():
     return parser.parse_args()
 
 
+def parse_script_args():
+    """Parse key/value arguments provided by Ghidra's Script Manager or analyzeHeadless."""
+
+    raw_args = []
+    getter = globals().get("getScriptArgs")
+    if callable(getter):
+        try:
+            raw_args = getter() or []
+        except Exception:
+            raw_args = []
+    elif "scriptArgs" in globals():
+        try:
+            raw_args = globals().get("scriptArgs") or []
+        except Exception:
+            raw_args = []
+
+    parsed = {}
+    for entry in raw_args:
+        if entry is None:
+            continue
+        text = str(entry)
+        if "=" in text:
+            key, value = text.split("=", 1)
+        else:
+            key, value = text, "true"
+        key = key.strip().replace("-", "_")
+        parsed[key] = value.strip()
+    return parsed
+
+
+def get_active_program():
+    """Return the current Ghidra program when running inside the UI."""
+
+    program = globals().get("currentProgram")
+    if program is not None:
+        return program
+
+    state = globals().get("state")
+    try:
+        if state is not None:
+            program = state.getCurrentProgram()
+            if program is not None:
+                globals()["currentProgram"] = program
+                return program
+    except Exception:
+        pass
+
+    try:
+        get_state = globals().get("getState")
+        if callable(get_state):
+            program = get_state().getCurrentProgram()
+            if program is not None:
+                globals()["currentProgram"] = program
+                return program
+    except Exception:
+        pass
+
+    return None
+
+
 # Entry point for Ghidra headless compatibility
 if __name__ == "__main__":
-    # When running inside the Ghidra Script Manager, the environment provides
-    # a global "currentProgram". In that case we should skip CLI parsing to
-    # avoid argparse failures and operate directly on the active program.
-    if "currentProgram" in globals() and globals().get("currentProgram") is not None:
+    # When running inside the Ghidra Script Manager, attempt to locate the
+    # active program through common bindings before falling back to CLI args.
+    active_program = get_active_program()
+    if active_program is not None:
         monitor = ConsoleTaskMonitor()
-        monitor.setMessage("RegistryKeyBitfieldReport initializing…")
-        script = RegistryKeyBitfieldReport(currentProgram, monitor=monitor)
+        monitor.setMessage("RegistryKeyBitfieldReport initializing...")
+        script_args = parse_script_args()
+        script = RegistryKeyBitfieldReport(active_program, monitor=monitor, args=script_args)
         script.run()
     else:
         cli_args = parse_cli_args()
         if not cli_args.binary:
             raise SystemExit("binary path is required when running outside Ghidra")
+
+        from pyghidra import open_program
 
         arg_dict = {
             "depth": cli_args.depth,
@@ -1032,6 +1099,6 @@ if __name__ == "__main__":
 
         with open_program(cli_args.binary) as program:
             monitor = ConsoleTaskMonitor()
-            monitor.setMessage("RegistryKeyBitfieldReport initializing…")
+            monitor.setMessage("RegistryKeyBitfieldReport initializing...")
             script = RegistryKeyBitfieldReport(program, monitor=monitor, args=arg_dict)
             script.run()
