@@ -24,7 +24,7 @@ from ghidra.program.model.address import Address
 from ghidra.program.model.block import BasicBlockModel
 from ghidra.program.model.listing import Instruction
 from ghidra.program.model.pcode import PcodeOp
-from ghidra.program.model.symbol import RefType
+from ghidra.program.model.symbol import FlowType, RefType
 from ghidra.util.task import ConsoleTaskMonitor
 
 # ---------------------------------------------------------------------------
@@ -1015,6 +1015,25 @@ class RegistryKeyBitfieldReport(object):
             pass
         return None
 
+    def _is_return_flow(self, flow_type):
+        if flow_type is None:
+            return False
+        try:
+            checker = getattr(flow_type, "isReturn", None)
+            if checker is not None:
+                return checker()
+        except Exception:
+            pass
+        try:
+            if flow_type == FlowType.RETURN:
+                return True
+        except Exception:
+            pass
+        try:
+            return flow_type.isTerminal() and not flow_type.isCall()
+        except Exception:
+            return False
+
     def _summarize_return(self, func, block_states):
         # Try to find a tainted register used at RET
         ret_tr = None
@@ -1028,13 +1047,9 @@ class RegistryKeyBitfieldReport(object):
                 flow_type = inst.getFlowType()
             except Exception:
                 flow_type = None
-            if flow_type is not None:
-                try:
-                    if flow_type.isReturn():
-                        last_ret = inst
-                        break
-                except Exception:
-                    pass
+            if self._is_return_flow(flow_type):
+                last_ret = inst
+                break
         if last_ret is None:
             return None
         try:
