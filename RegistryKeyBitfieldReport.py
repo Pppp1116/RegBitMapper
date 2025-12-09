@@ -293,28 +293,31 @@ class RegistryKeyBitfieldReport(GhidraScript):
     URL_PATTERN = re.compile(r"^[a-zA-Z]+://")
     X64_FASTCALL_ORDER = ["RCX", "RDX", "R8", "R9"]
     REGISTRY_API_TABLE = {
-        "regqueryvalueexa": {"key_arg": 1, "data_out_arg": 4, "value_arg": 1, "data_width": 32, "ret_is_data": False},
-        "regqueryvalueexw": {"key_arg": 1, "data_out_arg": 4, "value_arg": 1, "data_width": 32, "ret_is_data": False},
-        "regqueryvalueex": {"key_arg": 1, "data_out_arg": 4, "value_arg": 1, "data_width": 32, "ret_is_data": False},
-        "reggetvaluea": {"key_arg": 1, "subkey_arg": 2, "value_arg": 3, "data_out_arg": 5, "data_width": 32, "ret_is_data": False},
-        "reggetvaluew": {"key_arg": 1, "subkey_arg": 2, "value_arg": 3, "data_out_arg": 5, "data_width": 32, "ret_is_data": False},
-        "regsetvalueexa": {"key_arg": 1, "value_arg": 2, "data_out_arg": 4, "data_width": 32, "ret_is_data": False},
-        "regsetvalueexw": {"key_arg": 1, "value_arg": 2, "data_out_arg": 4, "data_width": 32, "ret_is_data": False},
-        "regsetvalueex": {"key_arg": 1, "value_arg": 2, "data_out_arg": 4, "data_width": 32, "ret_is_data": False},
-        "regopenkeyexa": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "ret_is_data": True, "data_width": 64},
-        "regopenkeyexw": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "ret_is_data": True, "data_width": 64},
-        "regopenkey": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "ret_is_data": True, "data_width": 64},
-        "regcreatekeyexa": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "ret_is_data": True, "data_width": 64},
-        "regcreatekeyexw": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "ret_is_data": True, "data_width": 64},
-        "regcreatekeyex": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "ret_is_data": True, "data_width": 64},
-        "regcreatekey": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "ret_is_data": True, "data_width": 64},
-        "zwqueryvaluekey": {"key_arg": 1, "value_arg": 2, "data_out_arg": 3, "data_width": 64, "ret_is_data": False},
-        "zwqueryvalue": {"key_arg": 1, "value_arg": 2, "data_out_arg": 3, "data_width": 64, "ret_is_data": False},
-        "zwopenkey": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "data_width": 64, "ret_is_data": True},
-        "zwcreatekey": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "data_width": 64, "ret_is_data": True},
-        "ntopenkey": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "data_width": 64, "ret_is_data": True},
-        "ntcreatekey": {"key_arg": 1, "subkey_arg": 2, "data_out_arg": None, "data_width": 64, "ret_is_data": True},
-        "ntqueryvaluekey": {"key_arg": 1, "value_arg": 2, "data_out_arg": 3, "data_width": 64, "ret_is_data": False},
+        # Win32
+        "regqueryvalueexa": {"key_arg": 1, "value_arg": 2, "data_out_arg": 5, "data_width": 32, "ret_is_data": False},
+        "regqueryvalueexw": {"key_arg": 1, "value_arg": 2, "data_out_arg": 5, "data_width": 32, "ret_is_data": False},
+        "regqueryvalueex": {"key_arg": 1, "value_arg": 2, "data_out_arg": 5, "data_width": 32, "ret_is_data": False},
+        "reggetvaluea": {"key_arg": 1, "subkey_arg": 2, "value_arg": 3, "data_out_arg": 6, "data_width": 32, "ret_is_data": False},
+        "reggetvaluew": {"key_arg": 1, "subkey_arg": 2, "value_arg": 3, "data_out_arg": 6, "data_width": 32, "ret_is_data": False},
+        "regsetvalueexa": {"key_arg": 1, "value_arg": 2, "data_out_arg": 5, "data_width": 32, "ret_is_data": False, "ret_is_handle": False},
+        "regsetvalueexw": {"key_arg": 1, "value_arg": 2, "data_out_arg": 5, "data_width": 32, "ret_is_data": False, "ret_is_handle": False},
+        "regsetvalueex": {"key_arg": 1, "value_arg": 2, "data_out_arg": 5, "data_width": 32, "ret_is_data": False, "ret_is_handle": False},
+        "regopenkeyexa": {"key_arg": 1, "subkey_arg": 2, "handle_out_arg": 5, "data_width": 64, "ret_is_data": False, "ret_is_handle": True},
+        "regopenkeyexw": {"key_arg": 1, "subkey_arg": 2, "handle_out_arg": 5, "data_width": 64, "ret_is_data": False, "ret_is_handle": True},
+        "regopenkey": {"key_arg": 1, "subkey_arg": 2, "handle_out_arg": 3, "data_width": 64, "ret_is_data": False, "ret_is_handle": True},
+        "regcreatekeyexa": {"key_arg": 1, "subkey_arg": 2, "handle_out_arg": 8, "data_width": 64, "ret_is_data": False, "ret_is_handle": True},
+        "regcreatekeyexw": {"key_arg": 1, "subkey_arg": 2, "handle_out_arg": 8, "data_width": 64, "ret_is_data": False, "ret_is_handle": True},
+        "regcreatekeyex": {"key_arg": 1, "subkey_arg": 2, "handle_out_arg": 8, "data_width": 64, "ret_is_data": False, "ret_is_handle": True},
+        "regcreatekey": {"key_arg": 1, "subkey_arg": 2, "handle_out_arg": 3, "data_width": 64, "ret_is_data": False, "ret_is_handle": True},
+        # Native
+        "zwqueryvaluekey": {"key_arg": 1, "value_arg": 2, "data_out_arg": 4, "data_width": 64, "ret_is_data": False},
+        "zwqueryvalue": {"key_arg": 1, "value_arg": 2, "data_out_arg": 4, "data_width": 64, "ret_is_data": False},
+        "ntqueryvaluekey": {"key_arg": 1, "value_arg": 2, "data_out_arg": 4, "data_width": 64, "ret_is_data": False},
+        "regqueryvalue": {"key_arg": 1, "value_arg": 2, "data_out_arg": 4, "data_width": 64, "ret_is_data": False},
+        "zwopenkey": {"key_arg": 1, "subkey_arg": 2, "handle_out_arg": 1, "data_width": 64, "ret_is_data": False, "ret_is_handle": True},
+        "zwcreatekey": {"key_arg": 1, "subkey_arg": 2, "handle_out_arg": 1, "data_width": 64, "ret_is_data": False, "ret_is_handle": True},
+        "ntopenkey": {"key_arg": 1, "subkey_arg": 2, "handle_out_arg": 1, "data_width": 64, "ret_is_data": False, "ret_is_handle": True},
+        "ntcreatekey": {"key_arg": 1, "subkey_arg": 2, "handle_out_arg": 1, "data_width": 64, "ret_is_data": False, "ret_is_handle": True},
         "cmregistercallback": {"key_arg": 1, "data_out_arg": None, "ret_is_data": True, "data_width": 64},
     }
 
@@ -759,7 +762,7 @@ class RegistryKeyBitfieldReport(GhidraScript):
                 key_info = RegistryKeyInfo(key_str)
                 self.registry_infos[key_str] = key_info
             tr = TaintRecord(key_info, width=(dest.getSize() * 8))
-            tr.history.append(("seed", key_str, str(op)))
+            tr.history.append(("seed-string", key_str, str(op)))
             state[self._varnode_key(dest)] = tr
 
     def _seed_taint_from_registry_call(self, name, call_op, arg_taints, out_vn, state):
@@ -768,8 +771,11 @@ class RegistryKeyBitfieldReport(GhidraScript):
         subkey_arg = mapping.get("subkey_arg")
         value_arg = mapping.get("value_arg")
         data_arg = mapping.get("data_out_arg")
+        handle_out_arg = mapping.get("handle_out_arg")
         buf_width = mapping.get("data_width", 32)
         ret_is_data = mapping.get("ret_is_data", False)
+        ret_is_handle = mapping.get("ret_is_handle", False)
+
         key_info = None
         resolved_key = None
         arg_candidates = [key_arg, subkey_arg, value_arg]
@@ -790,18 +796,42 @@ class RegistryKeyBitfieldReport(GhidraScript):
                 key_info = RegistryKeyInfo(resolved_key)
                 self.registry_infos[resolved_key] = key_info
         if key_info is None:
-            return None
-        base_tr = TaintRecord(key_info, width=buf_width)
+            # Create a synthetic bucket so taint is not lost
+            syn_key = "unknown:%s@%s" % (name, call_op.getSeqnum().getTarget())
+            key_info = self.registry_infos.get(syn_key)
+            if key_info is None:
+                key_info = RegistryKeyInfo(syn_key)
+                self.registry_infos[syn_key] = key_info
+        base_tr = TaintRecord(key_info, width=buf_width, source="registry-api")
         base_tr.history.append(("api-seed", name, resolved_key))
+
         if data_arg is not None and data_arg < call_op.getNumInputs():
             data_vn = call_op.getInput(data_arg)
             if data_vn is not None:
                 tr = base_tr.clone()
                 tr.history.append(("api-read", name, data_arg))
                 state[self._varnode_key(data_vn)] = tr
+                slot = self._pointer_slot(data_vn)
+                if slot:
+                    state[slot] = tr.clone()
+
+        if handle_out_arg is not None and handle_out_arg < call_op.getNumInputs():
+            handle_vn = call_op.getInput(handle_out_arg)
+            if handle_vn is not None:
+                tr_handle = base_tr.clone()
+                tr_handle.history.append(("api-handle", name, handle_out_arg))
+                state[self._varnode_key(handle_vn)] = tr_handle
+                slot = self._pointer_slot(handle_vn)
+                if slot:
+                    state[slot] = tr_handle.clone()
+
         if ret_is_data and out_vn is not None:
             tr_ret = base_tr.clone()
             tr_ret.history.append(("api-ret", name, None))
+            return tr_ret
+        if ret_is_handle and out_vn is not None:
+            tr_ret = base_tr.clone()
+            tr_ret.history.append(("api-ret-handle", name, None))
             return tr_ret
         return None
 
@@ -825,7 +855,7 @@ class RegistryKeyBitfieldReport(GhidraScript):
 
     def _registry_api_mapping(self, name):
         lname = name.lower()
-        mapping = {"key_arg": 1, "data_out_arg": 4, "data_width": 32, "ret_is_data": False}
+        mapping = {"key_arg": 1, "data_out_arg": 4, "handle_out_arg": None, "data_width": 32, "ret_is_data": False, "ret_is_handle": False}
         for api_name, info in self.REGISTRY_API_TABLE.items():
             if api_name in lname:
                 mapping.update(info)
