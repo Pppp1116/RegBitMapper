@@ -299,6 +299,7 @@ class AbstractValue:
     used_bits: Set[int] = field(default_factory=set)
     candidate_bits: Set[int] = field(default_factory=set)
     pointer_pattern: Optional[PointerPattern] = None
+    pointer_targets: Set[int] = field(default_factory=set)
 
     def clone(self) -> "AbstractValue":
         return AbstractValue(
@@ -308,6 +309,7 @@ class AbstractValue:
             used_bits=set(self.used_bits),
             candidate_bits=set(self.candidate_bits),
             pointer_pattern=self.pointer_pattern.clone() if self.pointer_pattern else None,
+            pointer_targets=set(self.pointer_targets),
         )
 
     def mark_bits_used(self, mask: int) -> None:
@@ -330,6 +332,7 @@ class AbstractValue:
         merged.bit_width = max(self.bit_width, other.bit_width)
         merged.used_bits = set(self.used_bits | other.used_bits)
         merged.candidate_bits = set(self.candidate_bits | other.candidate_bits)
+        merged.pointer_targets = set(self.pointer_targets | other.pointer_targets)
         if self.pointer_pattern and other.pointer_pattern:
             merged.pointer_pattern = self.pointer_pattern.merge(other.pointer_pattern)
         elif self.pointer_pattern:
@@ -357,6 +360,7 @@ class AbstractValue:
             frozenset(self.used_bits),
             frozenset(self.candidate_bits),
             pointer_sig,
+            frozenset(self.pointer_targets),
         )
 
 
@@ -504,6 +508,16 @@ def new_value_from_varnode(vn) -> AbstractValue:
     val = AbstractValue(bit_width=width)
     if vn and vn.isConstant():
         val.tainted = False
+        off = vn_get_offset(vn)
+        if off is not None:
+            val.pointer_targets.add(off)
+    try:
+        if vn and (hasattr(vn, "isAddress") and vn.isAddress() or hasattr(vn, "isAddrTied") and vn.isAddrTied()):
+            addr = vn.getAddress()
+            if addr is not None:
+                val.pointer_targets.add(int(addr.getOffset()))
+    except Exception:
+        pass
     return val
 
 
@@ -709,36 +723,51 @@ class FunctionAnalyzer:
         except Exception:
             return None
 
-    def _resolve_string_from_vn(self, vn) -> Optional[Dict[str, Any]]:
+    def _resolve_string_at_address(self, addr, addr_str: str) -> Optional[Dict[str, Any]]:
+        if addr_str in self.global_state.registry_strings:
+            return self.global_state.registry_strings[addr_str]
+        data = self.program.getListing().getDataContaining(addr)
+        if data and data.hasStringValue():
+            try:
+                val_obj = data.getValue()
+                sval = val_obj.getString() if hasattr(val_obj, "getString") else str(val_obj)
+                meta = parse_registry_string(sval)
+                if meta:
+                    self.global_state.registry_strings[addr_str] = meta
+                    return meta
+            except Exception:
+                decoded = self._decode_string_at_address(addr, addr_str)
+                if decoded:
+                    return decoded
+        return self._decode_string_at_address(addr, addr_str)
+
+    def _resolve_string_from_vn(self, vn, states: Optional[Dict[Tuple, AbstractValue]] = None) -> Optional[Dict[str, Any]]:
         try:
-            addr = None
+            addr_candidates: List[Any] = []
             if vn is None:
                 return None
             if hasattr(vn, "isAddress") and vn.isAddress():
-                addr = vn.getAddress()
+                addr_candidates.append(vn.getAddress())
             elif hasattr(vn, "isAddrTied") and vn.isAddrTied():
-                addr = vn.getAddress()
+                addr_candidates.append(vn.getAddress())
             elif vn_is_constant(vn):
                 off = vn_get_offset(vn)
                 if off is not None:
-                    addr = self.api.toAddr(off)
-            if addr is None:
-                return None
-            addr_str = str(addr)
-            if addr_str in self.global_state.registry_strings:
-                return self.global_state.registry_strings[addr_str]
-            data = self.program.getListing().getDataContaining(addr)
-            if data and data.hasStringValue():
-                try:
-                    val_obj = data.getValue()
-                    sval = val_obj.getString() if hasattr(val_obj, "getString") else str(val_obj)
-                    meta = parse_registry_string(sval)
-                    if meta:
-                        self.global_state.registry_strings[addr_str] = meta
-                        return meta
-                except Exception:
-                    return self._decode_string_at_address(addr, addr_str)
-            return self._decode_string_at_address(addr, addr_str)
+                    addr_candidates.append(self.api.toAddr(off))
+            if states is not None:
+                val = self._get_val(vn, states)
+                for off in sorted(val.pointer_targets):
+                    try:
+                        addr_candidates.append(self.api.toAddr(off))
+                    except Exception:
+                        continue
+            for addr in addr_candidates:
+                if addr is None:
+                    continue
+                meta = self._resolve_string_at_address(addr, str(addr))
+                if meta:
+                    return meta
+            return None
         except Exception:
             return None
         return None
@@ -909,10 +938,14 @@ class FunctionAnalyzer:
             self._handle_store(inst, inputs, states)
         elif opname == "PTRADD":
             self._handle_ptradd(func, out, inputs, states)
+        elif opname == "PTRSUB":
+            self._handle_ptrsub(func, out, inputs, states)
         elif opname == "CBRANCH":  # unconditional BRANCH has no condition operand
             self._handle_branch(func, inst, opname, inputs, states, summary)
         elif opname == "MULTIEQUAL":
             self._handle_multiequal(out, inputs, states)
+        elif opname == "INDIRECT":
+            self._handle_indirect(out, inputs, states)
         elif opname in {"CALL", "CALLIND"}:
             # Treat both direct (CALL) and indirect (CALLIND) calls as call sites.
             # For CALLIND, callee_name may be None, but we still seed roots based
@@ -943,18 +976,32 @@ class FunctionAnalyzer:
         val.bit_width = out.getSize() * 8
         val.used_bits = set(a.used_bits | b.used_bits)
         val.candidate_bits = set(a.candidate_bits | b.candidate_bits)
+        val.pointer_targets = set(a.pointer_targets | b.pointer_targets)
         if a.pointer_pattern and vn_is_constant(inputs[1]):
             pp = a.pointer_pattern.clone()
             delta = vn_get_offset(inputs[1]) or 0
             pp.adjust_offset(delta if opname == "INT_ADD" else -delta)
             val.pointer_pattern = pp
+            if a.pointer_targets:
+                adj = vn_get_offset(inputs[1]) or 0
+                val.pointer_targets = {p + (adj if opname == "INT_ADD" else -adj) for p in a.pointer_targets}
         elif b.pointer_pattern and vn_is_constant(inputs[0]):
             pp = b.pointer_pattern.clone()
             delta = vn_get_offset(inputs[0]) or 0
             pp.adjust_offset(delta if opname == "INT_ADD" else -delta)
             val.pointer_pattern = pp
+            if b.pointer_targets:
+                adj = vn_get_offset(inputs[0]) or 0
+                val.pointer_targets = {p + (adj if opname == "INT_ADD" else -adj) for p in b.pointer_targets}
         elif a.pointer_pattern and b.pointer_pattern:
             val.pointer_pattern = a.pointer_pattern.merge(b.pointer_pattern)
+        if not val.pointer_pattern:
+            if vn_is_constant(inputs[1]) and a.pointer_targets:
+                adj = vn_get_offset(inputs[1]) or 0
+                val.pointer_targets = {p + (adj if opname == "INT_ADD" else -adj) for p in a.pointer_targets}
+            elif vn_is_constant(inputs[0]) and b.pointer_targets:
+                adj = vn_get_offset(inputs[0]) or 0
+                val.pointer_targets = {p + (adj if opname == "INT_ADD" else -adj) for p in b.pointer_targets}
         self._set_val(out, val, states)
 
     def _handle_multdiv(self, out, inputs, states):
@@ -969,6 +1016,7 @@ class FunctionAnalyzer:
         val.used_bits = set(a.used_bits | b.used_bits)
         val.candidate_bits = set(a.candidate_bits | b.candidate_bits)
         val.pointer_pattern = PointerPattern(unknown=True) if (a.pointer_pattern or b.pointer_pattern) else None
+        val.pointer_targets = set()
         self._set_val(out, val, states)
 
     def _handle_and(self, out, inputs, states):
@@ -982,6 +1030,7 @@ class FunctionAnalyzer:
         val.bit_width = out.getSize() * 8
         val.used_bits = set(a.used_bits | b.used_bits)
         val.candidate_bits = set(a.candidate_bits | b.candidate_bits)
+        val.pointer_targets = set(a.pointer_targets | b.pointer_targets)
         mask_src = None
         other = None
         if vn_is_constant(inputs[0]):
@@ -1009,6 +1058,7 @@ class FunctionAnalyzer:
         val.bit_width = out.getSize() * 8
         val.used_bits = set(a.used_bits | b.used_bits)
         val.candidate_bits = set(a.candidate_bits | b.candidate_bits)
+        val.pointer_targets = set(a.pointer_targets | b.pointer_targets)
         self._set_val(out, val, states)
 
     def _handle_shift(self, out, inputs, states, opname):
@@ -1020,6 +1070,7 @@ class FunctionAnalyzer:
         val.tainted = base.tainted or self._get_val(amt, states).tainted
         val.origins = set(base.origins | self._get_val(amt, states).origins)
         val.bit_width = out.getSize() * 8
+        val.pointer_targets = set(base.pointer_targets)
         shift = vn_get_offset(amt)
         if shift is None:
             val.mark_all_bits_used()
@@ -1033,6 +1084,8 @@ class FunctionAnalyzer:
                         new_b = 0
                     val.candidate_bits.add(new_b)
             val.used_bits |= set(val.candidate_bits)
+            if shift != 0:
+                val.pointer_targets = set()
         self._set_val(out, val, states)
 
     def _handle_load(self, out, inputs, states):
@@ -1100,6 +1153,28 @@ class FunctionAnalyzer:
         else:
             val.pointer_pattern.index_var = varnode_key(offset) if offset is not None else None
             val.pointer_pattern.unknown = True
+        if vn_is_constant(offset) and val.pointer_targets:
+            delta = vn_get_offset(offset) or 0
+            val.pointer_targets = {p + delta for p in val.pointer_targets}
+        self._set_val(out, val, states)
+
+    def _handle_ptrsub(self, func, out, inputs, states):
+        if out is None or len(inputs) < 2:
+            return
+        base = self._get_val(inputs[0], states)
+        offset = inputs[1]
+        val = base.clone()
+        if val.pointer_pattern is None:
+            val.pointer_pattern = PointerPattern(base_id=pointer_base_identifier(func, inputs[0]))
+        if vn_is_constant(offset):
+            delta = vn_get_offset(offset) or 0
+            val.pointer_pattern.adjust_offset(-delta)
+            if val.pointer_targets:
+                val.pointer_targets = {p - delta for p in val.pointer_targets}
+        else:
+            val.pointer_pattern.index_var = varnode_key(offset) if offset is not None else None
+            val.pointer_pattern.unknown = True
+            val.pointer_targets = set()
         self._set_val(out, val, states)
 
     def _handle_branch(self, func, inst, opname, inputs, states, summary: FunctionSummary):
@@ -1135,11 +1210,19 @@ class FunctionAnalyzer:
         merged.bit_width = out.getSize() * 8
         self._set_val(out, merged, states)
 
+    def _handle_indirect(self, out, inputs, states):
+        if out is None or not inputs:
+            return
+        val = AbstractValue(bit_width=out.getSize() * 8)
+        for inp in inputs:
+            val = val.merge(self._get_val(inp, states))
+        self._set_val(out, val, states)
+
     def _handle_call(self, func, inst, op: PcodeOp, inputs, states, summary: FunctionSummary):
         call_args = inputs[1:] if inputs else []
         string_args: List[Dict[str, Any]] = []
         for inp in call_args:
-            meta = self._resolve_string_from_vn(inp)
+            meta = self._resolve_string_from_vn(inp, states)
             if meta:
                 string_args.append(meta)
 
