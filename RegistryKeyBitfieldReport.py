@@ -847,7 +847,10 @@ class FunctionAnalyzer:
             self._handle_branch(func, inst, opname, inputs, states, summary)
         elif opname == "MULTIEQUAL":
             self._handle_multiequal(out, inputs, states)
-        elif opname == "CALL":
+        elif opname in {"CALL", "CALLIND"}:
+            # Treat both direct (CALL) and indirect (CALLIND) calls as call sites.
+            # For CALLIND, callee_name may be None, but we still seed roots based
+            # on registry-like string arguments.
             self._handle_call(func, inst, op, inputs, states, summary)
         elif opname == "RETURN":
             self._handle_return(inputs, states, summary)
