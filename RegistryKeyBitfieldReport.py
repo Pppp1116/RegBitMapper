@@ -42,6 +42,7 @@ try:  # pragma: no cover - executed inside Ghidra
     from ghidra.program.flatapi import FlatProgramAPI
     from ghidra.program.model.block import BasicBlockModel
     from ghidra.program.model.listing import Instruction
+    from ghidra.program.model.address import AddressSet
     from ghidra.program.model.pcode import PcodeOp
     from ghidra.program.model.symbol import RefType
     from ghidra.util.task import TaskMonitor
@@ -53,6 +54,7 @@ except Exception:  # pragma: no cover
     PcodeOp = None
     RefType = None
     TaskMonitor = None
+    AddressSet = None
 
 # ---------------------------------------------------------------------------
 # Argument parsing and logging
@@ -81,8 +83,9 @@ def parse_args(raw_args: List[str]) -> Dict[str, Any]:
     return parsed
 
 
-if len(sys.argv) > 1:
-    args = parse_args(sys.argv[1:])
+raw_args = [a for a in sys.argv[1:] if "=" in a]
+if raw_args:
+    args = parse_args(raw_args)
     INVOCATION_CONTEXT = "headless"
 else:
     args = {"mode": "taint", "debug": False, "trace": False}
@@ -350,19 +353,33 @@ def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
         return None
     raw = raw.strip("\x00")
     m = REGISTRY_STRING_PREFIX_RE.match(raw)
-    if not m:
-        return None
-    prefix = m.group(1)
     hive_key = None
-    for short, aliases in REGISTRY_HIVE_ALIASES.items():
-        for alias in aliases:
-            if prefix.lower().startswith(alias.lower()):
-                hive_key = short
+    path = None
+    value_name = None
+    if m:
+        prefix = m.group(1)
+        for short, aliases in REGISTRY_HIVE_ALIASES.items():
+            for alias in aliases:
+                if prefix.lower().startswith(alias.lower()):
+                    hive_key = short
+                    break
+            if hive_key:
                 break
-        if hive_key:
-            break
-    hive_key = hive_key or prefix
-    path = raw[len(prefix) :].lstrip("\\/")
+        hive_key = hive_key or prefix
+        path = raw[len(prefix) :].lstrip("\\/")
+    else:
+        lowered = raw.lower()
+        partial_prefixes = [
+            "system\\currentcontrolset\\",
+            "system\\controlset",
+            "software\\",
+            "control\\",
+        ]
+        partial_tuple = tuple(partial_prefixes)
+        if any(pref in lowered for pref in partial_prefixes) or lowered.startswith(partial_tuple):
+            path = raw.lstrip("\\/")
+    if path is None:
+        return None
     value_name = None
     if path and "\\" in path:
         parts = path.split("\\")
@@ -466,7 +483,36 @@ class FunctionAnalyzer:
                         self.global_state.registry_strings[addr_str] = meta
                         return meta
                 except Exception:
-                    return None
+                    return self._decode_string_at_address(addr, addr_str)
+            return self._decode_string_at_address(addr, addr_str)
+        except Exception:
+            return None
+        return None
+
+    def _decode_string_at_address(self, addr, addr_str: str) -> Optional[Dict[str, Any]]:
+        try:
+            mem = self.program.getMemory()
+            buf = bytearray(512)
+            read = mem.getBytes(addr, buf)
+            if read is None:
+                return None
+            trimmed = bytes(buf[: int(read) if isinstance(read, (int, float)) else len(buf)])
+            candidates: List[str] = []
+            for codec, terminator in (("utf-16-le", b"\x00\x00"), ("utf-8", b"\x00"), ("latin-1", b"\x00")):
+                try:
+                    segment = trimmed.split(terminator)[0]
+                    if not segment:
+                        continue
+                    sval = segment.decode(codec, errors="ignore")
+                    if sval:
+                        candidates.append(sval)
+                except Exception:
+                    continue
+            for sval in candidates:
+                meta = parse_registry_string(sval)
+                if meta:
+                    self.global_state.registry_strings[addr_str] = meta
+                    return meta
         except Exception:
             return None
         return None
@@ -475,6 +521,8 @@ class FunctionAnalyzer:
         fm = self.program.getFunctionManager()
         worklist = deque(fm.getFunctions(True))
         iteration_guard = 0
+        # NOTE: call-depth limiting is not currently implemented; the call_depth_limit
+        # flag in analysis_stats remains a placeholder for future enhancements.
         while worklist and iteration_guard < 1_000_000:
             func = worklist.popleft()
             iteration_guard += 1
@@ -552,7 +600,12 @@ class FunctionAnalyzer:
 
     def _run_block(self, func, blk, state: Dict[Tuple, AbstractValue], listing, summary: FunctionSummary) -> Dict[Tuple, AbstractValue]:
         states = {k: v.clone() for k, v in state.items()}
-        it = listing.getInstructions(blk, True)
+        addr_set = AddressSet()
+        try:
+            addr_set.addRange(blk.getFirstStartAddress(), blk.getMaxAddress())
+        except Exception:
+            return states
+        it = listing.getInstructions(addr_set, True)
         while it.hasNext():
             inst = it.next()
             pcode_ops = inst.getPcode()
@@ -826,12 +879,13 @@ class FunctionAnalyzer:
             if arg_val.origins:
                 summary.param_influence[idx] |= set(arg_val.origins)
         callee_name = None
+        callee_func = None
         callee_refs = [r for r in inst.getReferencesFrom() if r.getReferenceType().isCall()]
         if callee_refs:
             to_addr = callee_refs[0].getToAddress()
-            func = self.program.getFunctionManager().getFunctionAt(to_addr)
-            if func:
-                callee_name = func.getName()
+            callee_func = self.program.getFunctionManager().getFunctionAt(to_addr)
+            if callee_func:
+                callee_name = callee_func.getName()
         if callee_name:
             callee_summary = self.global_state.function_summaries.get(callee_name)
             if callee_summary:
@@ -870,7 +924,7 @@ class FunctionAnalyzer:
                         "type": "registry",
                         "api_name": callee_name,
                         "address": str(inst.getAddress()),
-                        "entry": str(func.getEntryPoint()) if func else None,
+                        "entry": str(callee_func.getEntryPoint()) if callee_func else None,
                         "hive": hive,
                         "path": path,
                         "value_name": value_name,
