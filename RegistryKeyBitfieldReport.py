@@ -79,7 +79,12 @@ def parse_args(raw_args: List[str]) -> Dict[str, Any]:
     return parsed
 
 
-args = parse_args(sys.argv[1:]) if len(sys.argv) > 1 else {}
+if len(sys.argv) > 1:
+    args = parse_args(sys.argv[1:])
+    INVOCATION_CONTEXT = "headless"
+else:
+    args = {"mode": "taint", "debug": False, "trace": False}
+    INVOCATION_CONTEXT = "script_manager"
 DEBUG_ENABLED = args.get("debug", False)
 TRACE_ENABLED = args.get("trace", False)
 
@@ -389,7 +394,7 @@ def collect_registry_string_candidates(api: FlatProgramAPI) -> Dict[str, Dict[st
 def discover_registry_roots(api: FlatProgramAPI) -> Dict[str, Dict[str, Any]]:
     roots: Dict[str, Dict[str, Any]] = {}
     root_counter = 0
-    fm = api.getFunctionManager()
+    fm = api.getCurrentProgram().getFunctionManager()
     for func in fm.getFunctions(True):
         name = func.getName()
         if not is_registry_api(name):
@@ -461,7 +466,7 @@ class FunctionAnalyzer:
         return None
 
     def analyze_all(self) -> None:
-        fm = self.api.getFunctionManager()
+        fm = self.program.getFunctionManager()
         worklist = deque(fm.getFunctions(True))
         iteration_guard = 0
         while worklist and iteration_guard < 1_000_000:
@@ -485,6 +490,7 @@ class FunctionAnalyzer:
     # ------------------------------------------------------------------
 
     def analyze_function(self, func) -> FunctionSummary:
+        log_trace(f"[trace] analyzing function {func.getName()} at {func.getEntryPoint()}")
         summary = FunctionSummary(func.getName(), str(func.getEntryPoint()))
         body = func.getBody()
         listing = self.program.getListing()
@@ -721,10 +727,10 @@ class FunctionAnalyzer:
         self._set_val(out, val, states)
 
     def _handle_store(self, inst, inputs, states):
-        if len(inputs) < 2:
+        if len(inputs) < 3:
             return
         addr_val = self._get_val(inputs[1], states)
-        src_val = self._get_val(inputs[0], states)
+        src_val = self._get_val(inputs[2], states)
         if addr_val.pointer_pattern and addr_val.pointer_pattern.base_id and addr_val.pointer_pattern.offset is not None:
             key = (addr_val.pointer_pattern.base_id, addr_val.pointer_pattern.offset)
             slot = self.global_state.struct_slots.get(key)
@@ -803,12 +809,13 @@ class FunctionAnalyzer:
         self._set_val(out, merged, states)
 
     def _handle_call(self, func, inst, op: PcodeOp, inputs, states, summary: FunctionSummary):
+        call_args = inputs[1:] if inputs else []
         string_args: List[Dict[str, Any]] = []
-        for inp in inputs:
+        for inp in call_args:
             meta = self._resolve_string_from_vn(inp)
             if meta:
                 string_args.append(meta)
-        for idx, inp in enumerate(inputs):
+        for idx, inp in enumerate(call_args):
             arg_val = self._get_val(inp, states)
             if arg_val.origins:
                 summary.param_influence[idx] |= set(arg_val.origins)
@@ -816,15 +823,15 @@ class FunctionAnalyzer:
         callee_refs = [r for r in inst.getReferencesFrom() if r.getReferenceType().isCall()]
         if callee_refs:
             to_addr = callee_refs[0].getToAddress()
-            func = self.api.getFunctionManager().getFunctionAt(to_addr)
+            func = self.program.getFunctionManager().getFunctionAt(to_addr)
             if func:
                 callee_name = func.getName()
         if callee_name:
             callee_summary = self.global_state.function_summaries.get(callee_name)
             if callee_summary:
                 for idx, roots in callee_summary.param_influence.items():
-                    if idx < len(inputs):
-                        val = self._get_val(inputs[idx], states)
+                    if idx < len(call_args):
+                        val = self._get_val(call_args[idx], states)
                         val.origins |= roots
                         val.tainted = val.tainted or bool(roots)
                 if callee_summary.return_influence and op.getOutput() is not None:
@@ -877,7 +884,7 @@ class FunctionAnalyzer:
         else:
             if op.getOutput() is not None:
                 out_val = AbstractValue(bit_width=op.getOutput().getSize() * 8)
-                for inp in inputs:
+                for inp in call_args:
                     src = self._get_val(inp, states)
                     out_val = out_val.merge(src)
                 self._set_val(op.getOutput(), out_val, states)
@@ -885,7 +892,8 @@ class FunctionAnalyzer:
     def _handle_return(self, inputs, states, summary: FunctionSummary):
         if not inputs:
             return
-        ret_val = self._get_val(inputs[0], states)
+        ret_source = inputs[-1] if len(inputs) > 1 else inputs[0]
+        ret_val = self._get_val(ret_source, states)
         summary.return_influence |= set(ret_val.origins)
 
     def _handle_unknown(self, out, inputs, states):
@@ -1002,11 +1010,18 @@ def emit_improvement_suggestions(global_state: GlobalState) -> None:
 
 def main():
     api = FlatProgramAPI(currentProgram)
-    mode = args.get("mode")
-    log_info(f"[info] RegistryKeyBitfieldReport starting (mode={mode}, debug={DEBUG_ENABLED}, trace={TRACE_ENABLED})")
+    mode = args.get("mode") or "taint"
+    log_info(
+        f"[info] RegistryKeyBitfieldReport starting (mode={mode}, debug={DEBUG_ENABLED}, trace={TRACE_ENABLED}, context={INVOCATION_CONTEXT})"
+    )
+    if INVOCATION_CONTEXT == "script_manager":
+        log_info("[info] Script Manager detected; NDJSON output will appear in the Ghidra console.")
     global_state = GlobalState()
     global_state.roots = discover_registry_roots(api)
     global_state.registry_strings = collect_registry_string_candidates(api)
+    log_debug(
+        f"[debug] discovered {len(global_state.roots)} registry roots; {len(global_state.registry_strings)} registry-like strings"
+    )
     if mode == "full" and not global_state.roots:
         global_state.roots["root_synthetic"] = {
             "id": "root_synthetic",
