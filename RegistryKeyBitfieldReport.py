@@ -519,6 +519,32 @@ REGISTRY_STRING_PREFIX_RE = re.compile(
 )
 
 
+def normalize_registry_label(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    cleaned = re.sub(r"(?i)^(?:__imp__?|imp_)", "", cleaned)
+    # Treat common separators as boundaries while preserving the most
+    # registry-looking suffix (e.g., ADVAPI32.dll::RegOpenKeyExA@16 ->
+    # RegOpenKeyExA@16).
+    tokens: List[str] = []
+    for part in re.split(r"[.:@!_]", cleaned):
+        for sub in part.split("::"):
+            for seg in sub.split("_"):
+                if seg:
+                    tokens.append(seg)
+    tokens = tokens or [cleaned]
+    registry_re = re.compile(r"(?i)(reg|zw|nt|cm|rtl)[a-z0-9_@]*")
+    for tok in tokens[::-1]:
+        m = registry_re.search(tok)
+        if m:
+            return m.group(0)
+    m = registry_re.search(cleaned)
+    return m.group(0) if m else None
+
+
 def is_registry_api(name: str) -> bool:
     """
     Return True if the given function name looks like a Windows registry API.
@@ -530,21 +556,10 @@ def is_registry_api(name: str) -> bool:
     if not name:
         return False
 
-    lowered = name.lower()
-    for pref in REGISTRY_PREFIXES:
-        if lowered.startswith(pref.lower()):
-            return True
-
-    # Allow module-prefixed import names by checking each segment separated by
-    # common delimiters such as '::', '.', ':', '@', '!', or '_'.
-    parts = re.split(r"[.:@!_]", name)
-    for part in parts:
-        if not part:
-            continue
-        pl = part.lower()
-        for pref in REGISTRY_PREFIXES:
-            if pl.startswith(pref.lower()):
-                return True
+    normalized = normalize_registry_label(name)
+    if normalized:
+        lowered = normalized.lower()
+        return any(lowered.startswith(pref.lower()) for pref in REGISTRY_PREFIXES)
 
     return False
 
@@ -1161,7 +1176,25 @@ class FunctionAnalyzer:
             to_addr = callee_refs[0].getToAddress()
             callee_func = self.program.getFunctionManager().getFunctionAt(to_addr)
             if callee_func:
+                if getattr(callee_func, "isThunk", lambda: False)():
+                    thunk_target = getattr(callee_func, "getThunkedFunction", lambda: None)()
+                    if thunk_target:
+                        callee_func = thunk_target
                 callee_name = callee_func.getName()
+            if not callee_name:
+                for ref in callee_refs:
+                    try:
+                        if hasattr(ref, "isExternalReference") and ref.isExternalReference():
+                            ext_loc = ref.getExternalLocation()
+                            if ext_loc:
+                                callee_name = ext_loc.getLabel() or ext_loc.getOriginalImportedName()
+                                if callee_name:
+                                    break
+                    except Exception:
+                        continue
+        normalized_api_label = normalize_registry_label(callee_name) if callee_name else None
+        label_fragment = normalized_api_label or callee_name or "<indirect>"
+        safe_label = re.sub(r"[^A-Za-z0-9_]+", "_", label_fragment)
         if callee_name:
             callee_summary = self.global_state.function_summaries.get(callee_name)
             if callee_summary:
@@ -1189,14 +1222,15 @@ class FunctionAnalyzer:
                             self.global_state.struct_slots[key] = StructSlot(
                                 key[0], key[1], value=AbstractValue(origins=origins, tainted=bool(origins))
                             )
+            api_label = normalized_api_label or callee_name
             if is_registry_api(callee_name):
-                root_id = f"api_{callee_name}_{inst.getAddress()}"
+                root_id = f"api_{safe_label}_{inst.getAddress()}"
                 entry_point = str(callee_func.getEntryPoint()) if callee_func else None
-                _seed_root(root_id, callee_name, entry_point)
+                _seed_root(root_id, api_label, entry_point)
             elif string_args:
-                root_id = f"api_like_{callee_name}_{inst.getAddress()}"
+                root_id = f"api_like_{safe_label}_{inst.getAddress()}"
                 entry_point = str(callee_func.getEntryPoint()) if callee_func else None
-                _seed_root(root_id, callee_name, entry_point)
+                _seed_root(root_id, api_label or "<unknown>", entry_point)
         else:
             if string_args:
                 root_id = f"indirect_{inst.getAddress()}"
