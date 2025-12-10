@@ -45,6 +45,10 @@ try:  # pragma: no cover - executed inside Ghidra
     from ghidra.program.model.pcode import PcodeOp
     from ghidra.program.model.symbol import RefType
     from ghidra.util.task import TaskMonitor
+    try:
+        from ghidra.util.task import TaskMonitorAdapter
+    except Exception:
+        TaskMonitorAdapter = None
 except Exception:  # pragma: no cover
     FlatProgramAPI = None
     BasicBlockModel = None
@@ -52,6 +56,7 @@ except Exception:  # pragma: no cover
     PcodeOp = None
     RefType = None
     TaskMonitor = None
+    TaskMonitorAdapter = None
     AddressSet = None
 
 try:  # pragma: no cover - ensure currentProgram exists in PyGhidra
@@ -71,36 +76,97 @@ def _parse_bool(val: str) -> bool:
     return val in {"1", "true", "yes", "on"}
 
 
-def parse_args(raw_args: List[str]) -> Dict[str, Any]:
+def _get_script_args() -> List[str]:
+    try:
+        getter = globals().get("getScriptArgs")
+        if getter:
+            return list(getter() or [])
+    except Exception:
+        return []
+    return []
+
+
+def parse_args(raw_args: List[str], context_hint: str) -> Dict[str, Any]:
     parsed: Dict[str, Any] = {}
     for arg in raw_args:
         if "=" not in arg:
             continue
         k, v = arg.split("=", 1)
         parsed[k.strip().lower()] = v
-    if "mode" not in parsed or parsed["mode"] not in {"taint", "full"}:
-        print("[error] mode argument missing or invalid (expected mode=taint|full)")
-        sys.exit(1)
+    mode = parsed.get("mode")
+    if mode not in {"taint", "full"}:
+        if context_hint == "headless" and raw_args:
+            print("[error] mode argument missing or invalid (expected mode=taint|full)")
+            sys.exit(1)
+        parsed["mode"] = "taint"
     parsed["debug"] = _parse_bool(parsed.get("debug", "false"))
     parsed["trace"] = _parse_bool(parsed.get("trace", "false"))
     return parsed
 
 
-if currentProgram is None or FlatProgramAPI is None or BasicBlockModel is None or TaskMonitor is None:
-    print(
-        "RegistryKeyBitfieldReport must be run inside Ghidra 12 with the PyGhidra CPython bridge (currentProgram and core APIs required)."
-    )
-    sys.exit(1)
+def _ensure_environment(context_hint: str) -> bool:
+    if FlatProgramAPI is None or BasicBlockModel is None or TaskMonitor is None:
+        print(
+            "RegistryKeyBitfieldReport must be run inside Ghidra 12 with the PyGhidra CPython bridge (core APIs required)."
+        )
+        if context_hint == "headless":
+            sys.exit(1)
+        return False
+    if currentProgram is None:
+        print("[error] currentProgram is not available; open a program before running the script.")
+        if context_hint == "headless":
+            sys.exit(1)
+        return False
+    return True
 
-raw_args = [a for a in sys.argv[1:] if "=" in a]
-if raw_args:
-    args = parse_args(raw_args)
+
+try:
+    _SYS_RAW_ARGS = list(sys.argv[1:])
+except Exception:
+    _SYS_RAW_ARGS = []
+
+
+def _filter_kv_args(arg_list: List[str]) -> List[str]:
+    return [a for a in arg_list if isinstance(a, str) and "=" in a]
+
+
+def _has_mode(arg_list: List[str]) -> bool:
+    return any(a.strip().lower().startswith("mode=") for a in arg_list)
+
+
+script_manager_args = _filter_kv_args(_get_script_args())
+cli_args = _filter_kv_args(_SYS_RAW_ARGS)
+if _has_mode(cli_args):
     INVOCATION_CONTEXT = "headless"
-else:
-    args = {"mode": "taint", "debug": False, "trace": False}
+    args = parse_args(cli_args, INVOCATION_CONTEXT)
+elif _has_mode(script_manager_args):
     INVOCATION_CONTEXT = "script_manager"
+    args = parse_args(script_manager_args, INVOCATION_CONTEXT)
+elif script_manager_args:
+    INVOCATION_CONTEXT = "script_manager"
+    args = parse_args(script_manager_args, INVOCATION_CONTEXT)
+elif cli_args:
+    INVOCATION_CONTEXT = "script_manager"
+    args = parse_args(cli_args, INVOCATION_CONTEXT)
+else:
+    INVOCATION_CONTEXT = "script_manager"
+    args = {"mode": "taint", "debug": False, "trace": False}
 DEBUG_ENABLED = args.get("debug", False)
 TRACE_ENABLED = args.get("trace", False)
+
+
+def _resolve_dummy_monitor():
+    if TaskMonitor is None:
+        return None
+    candidate = getattr(TaskMonitor, "DUMMY", None)
+    if candidate is not None:
+        return candidate
+    if TaskMonitorAdapter is not None:
+        return getattr(TaskMonitorAdapter, "DUMMY", None)
+    return None
+
+
+DUMMY_MONITOR = _resolve_dummy_monitor()
 
 
 def log_info(msg: str) -> None:
@@ -554,10 +620,10 @@ class FunctionAnalyzer:
             existing = self.global_state.function_summaries.get(func.getName())
             if existing is None:
                 self.global_state.function_summaries[func.getName()] = summary
-                worklist.extend(func.getCalledFunctions(None))
+                worklist.extend(func.getCalledFunctions(DUMMY_MONITOR))
             else:
                 if existing.merge_from(summary):
-                    worklist.extend(func.getCalledFunctions(None))
+                    worklist.extend(func.getCalledFunctions(DUMMY_MONITOR))
         if iteration_guard >= 1_000_000:
             log_debug("[warn] function iteration limit hit")
             self.global_state.analysis_stats["function_iterations_limit"] = True
@@ -572,11 +638,11 @@ class FunctionAnalyzer:
         body = func.getBody()
         listing = self.program.getListing()
         block_model = BasicBlockModel(self.program)
-        blocks = list(block_model.getCodeBlocksContaining(body, TaskMonitor.DUMMY))
+        blocks = list(block_model.getCodeBlocksContaining(body, DUMMY_MONITOR))
         preds: Dict[Any, List[Any]] = defaultdict(list)
         succs: Dict[Any, List[Any]] = defaultdict(list)
         for blk in blocks:
-            it = blk.getDestinations(TaskMonitor.DUMMY)
+            it = blk.getDestinations(DUMMY_MONITOR)
             while it.hasNext():
                 dest = it.next()
                 succs[blk].append(dest.getDestinationBlock())
@@ -1113,6 +1179,13 @@ def emit_improvement_suggestions(global_state: GlobalState) -> None:
 
 
 def main():
+    if not _ensure_environment(INVOCATION_CONTEXT):
+        return
+    if DUMMY_MONITOR is None:
+        print("[error] TaskMonitor.DUMMY is unavailable; cannot proceed with control-flow analysis.")
+        if INVOCATION_CONTEXT == "headless":
+            sys.exit(1)
+        return
     program = currentProgram
     api = FlatProgramAPI(program)
     mode = args.get("mode") or "taint"
