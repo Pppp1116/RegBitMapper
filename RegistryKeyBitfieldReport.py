@@ -120,6 +120,18 @@ def parse_args(raw_args: List[str], context_hint: str) -> Dict[str, Any]:
         except Exception:
             print("[warn] max_function_iterations is not an integer; using default", file=sys.stderr)
             parsed.pop("max_function_iterations", None)
+    if "max_call_depth" in parsed:
+        try:
+            parsed["max_call_depth"] = int(parsed.get("max_call_depth", "0"))
+        except Exception:
+            print("[warn] max_call_depth is not an integer; using default", file=sys.stderr)
+            parsed.pop("max_call_depth", None)
+    if "registry_scan_limit" in parsed:
+        try:
+            parsed["registry_scan_limit"] = int(parsed.get("registry_scan_limit", "0"))
+        except Exception:
+            print("[warn] registry_scan_limit is not an integer; using default", file=sys.stderr)
+            parsed.pop("registry_scan_limit", None)
     return parsed
 
 
@@ -171,6 +183,22 @@ else:
     args = {"mode": "taint", "debug": False, "trace": False}
 DEBUG_ENABLED = args.get("debug", False)
 TRACE_ENABLED = args.get("trace", False)
+
+
+DEFAULT_POINTER_BIT_WIDTH = 32
+
+
+def _detect_pointer_bit_width(program) -> int:
+    try:
+        lang = program.getLanguage()
+        space = lang.getDefaultSpace() if hasattr(lang, "getDefaultSpace") else None
+        if space:
+            size_bytes = space.getPointerSize()
+            if size_bytes:
+                return int(size_bytes) * 8
+    except Exception:
+        return DEFAULT_POINTER_BIT_WIDTH
+    return DEFAULT_POINTER_BIT_WIDTH
 
 
 def _resolve_dummy_monitor():
@@ -454,7 +482,9 @@ def pointer_base_identifier(func, vn) -> str:
 
 
 def new_value_from_varnode(vn) -> AbstractValue:
-    width = vn.getSize() * 8 if vn else 32
+    width = vn.getSize() * 8 if vn else DEFAULT_POINTER_BIT_WIDTH
+    if not width:
+        width = DEFAULT_POINTER_BIT_WIDTH
     val = AbstractValue(bit_width=width)
     if vn and vn.isConstant():
         val.tainted = False
@@ -574,11 +604,11 @@ def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
     return {"hive": hive_key, "path": path, "value_name": value_name, "raw": raw}
 
 
-def collect_registry_string_candidates(program) -> Dict[str, Dict[str, Any]]:
+def collect_registry_string_candidates(program, scan_limit: Optional[int] = None) -> Dict[str, Dict[str, Any]]:
     listing = program.getListing()
     candidates: Dict[str, Dict[str, Any]] = {}
     it = listing.getDefinedData(True)
-    max_scan = 100_000
+    max_scan = scan_limit if scan_limit is not None else 100_000
     scanned = 0
     while it.hasNext():
         scanned += 1
@@ -629,12 +659,13 @@ def collect_registry_string_candidates(program) -> Dict[str, Dict[str, Any]]:
 
 
 class FunctionAnalyzer:
-    def __init__(self, api: FlatProgramAPI, program, global_state: GlobalState, mode: str):
+    def __init__(self, api: FlatProgramAPI, program, global_state: GlobalState, mode: str, max_call_depth: Optional[int] = None):
         self.api = api
         self.global_state = global_state
         self.mode = mode
         self.max_steps = 10_000_000
         self.max_function_iterations = 1_000_000
+        self.max_call_depth = max_call_depth
         self.program = program
         # Reuse a single BasicBlockModel for the program (safe for Ghidra 12).
         self.block_model = BasicBlockModel(self.program)
@@ -708,22 +739,23 @@ class FunctionAnalyzer:
 
     def analyze_all(self) -> None:
         fm = self.program.getFunctionManager()
-        worklist = deque(fm.getFunctions(True))
+        worklist = deque((func, 0) for func in fm.getFunctions(True))
         iteration_guard = 0
-        # NOTE: call-depth limiting is not currently implemented; the call_depth_limit
-        # flag in analysis_stats remains a placeholder for future enhancements.
         while worklist and iteration_guard < self.max_function_iterations:
-            func = worklist.popleft()
+            func, depth = worklist.popleft()
             iteration_guard += 1
+            if self.max_call_depth is not None and depth > self.max_call_depth:
+                self.global_state.analysis_stats["call_depth_limit"] = True
+                continue
             summary = self.analyze_function(func)
             self.global_state.analysis_stats["functions_analyzed"] += 1
             existing = self.global_state.function_summaries.get(func.getName())
             if existing is None:
                 self.global_state.function_summaries[func.getName()] = summary
-                worklist.extend(func.getCalledFunctions(DUMMY_MONITOR))
+                worklist.extend((callee, depth + 1) for callee in func.getCalledFunctions(DUMMY_MONITOR))
             else:
                 if existing.merge_from(summary):
-                    worklist.extend(func.getCalledFunctions(DUMMY_MONITOR))
+                    worklist.extend((callee, depth + 1) for callee in func.getCalledFunctions(DUMMY_MONITOR))
         if iteration_guard >= self.max_function_iterations:
             log_debug("[warn] function iteration limit hit")
             self.global_state.analysis_stats["function_iterations_limit"] = True
@@ -1239,7 +1271,7 @@ def build_root_records(global_state: GlobalState) -> List[Dict[str, Any]]:
             "entry": meta.get("entry"),
             "struct_slots": slot_entries,
             "bit_usage": {
-                "bit_width": max([32] + slot_bit_widths),
+                "bit_width": max([DEFAULT_POINTER_BIT_WIDTH] + slot_bit_widths),
                 "used_bits": sorted(used_bits),
                 "candidate_bits": sorted(candidate_bits),
             },
@@ -1311,6 +1343,8 @@ def main():
         return
     program = currentProgram
     api = FlatProgramAPI(program)
+    global DEFAULT_POINTER_BIT_WIDTH
+    DEFAULT_POINTER_BIT_WIDTH = _detect_pointer_bit_width(program)
     mode = args.get("mode") or "taint"
     log_info(
         f"[info] RegistryKeyBitfieldReport starting (mode={mode}, debug={DEBUG_ENABLED}, trace={TRACE_ENABLED}, context={INVOCATION_CONTEXT})"
@@ -1320,11 +1354,17 @@ def main():
     global_state = GlobalState()
     # ensure call_depth_limit is explicitly initialized (future use)
     global_state.analysis_stats["call_depth_limit"] = False
-    global_state.registry_strings = collect_registry_string_candidates(program)
+    scan_limit = args.get("registry_scan_limit")
+    if scan_limit is not None and scan_limit < 0:
+        scan_limit = None
+    global_state.registry_strings = collect_registry_string_candidates(program, scan_limit)
     log_debug(
         f"[debug] initial registry roots={len(global_state.roots)} registry-like strings={len(global_state.registry_strings)}"
     )
-    analyzer = FunctionAnalyzer(api, program, global_state, mode)
+    max_call_depth = args.get("max_call_depth")
+    if max_call_depth is not None and max_call_depth <= 0:
+        max_call_depth = None
+    analyzer = FunctionAnalyzer(api, program, global_state, mode, max_call_depth=max_call_depth)
     if args.get("max_steps"):
         analyzer.max_steps = max(1, int(args.get("max_steps")))
     if args.get("max_function_iterations"):
