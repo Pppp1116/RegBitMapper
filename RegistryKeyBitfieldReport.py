@@ -344,6 +344,7 @@ class FunctionAnalyzer:
             func = worklist.popleft()
             iteration_guard += 1
             summary = self.analyze_function(func)
+            self.global_state.analysis_stats["functions_analyzed"] += 1
             existing = self.global_state.function_summaries.get(func.getName())
             if existing is None:
                 self.global_state.function_summaries[func.getName()] = summary
@@ -563,6 +564,17 @@ class FunctionAnalyzer:
                 self.global_state.struct_slots[key] = slot
             else:
                 slot.value = slot.value.merge(src_val)
+            self.global_state.function_summaries.setdefault(
+                inst.getFunction().getName() if inst.getFunction() else "unknown", FunctionSummary(
+                    inst.getFunction().getName() if inst.getFunction() else "unknown", str(inst.getAddress())
+                )
+            ).slot_writes.append(
+                {
+                    "base_id": slot.base_id,
+                    "offset": slot.offset,
+                    "origins": sorted(slot.value.origins),
+                }
+            )
             if slot.value.tainted and not src_val.tainted:
                 self.global_state.overrides.append({
                     "address": str(inst.getAddress()),
@@ -738,6 +750,34 @@ def emit_ndjson(global_state: GlobalState) -> None:
     print(json.dumps(summary))
 
 
+def emit_improvement_suggestions(global_state: GlobalState) -> None:
+    """Print actionable suggestions to guide analysts toward better coverage."""
+    suggestions: List[str] = []
+    if not global_state.roots:
+        suggestions.append(
+            "No registry/config roots were detected; consider extending REGISTRY_PREFIXES or adding custom root seeding."
+        )
+    if not global_state.decisions:
+        suggestions.append(
+            "No branch decisions were attributed to roots; enable trace logging to confirm taint propagation and broaden bit tracking."
+        )
+    if global_state.analysis_stats.get("worklist_limit"):
+        suggestions.append(
+            "Worklist iteration hit its safety limit; raise max_steps or refine CFG traversal to reach a fixpoint."
+        )
+    if global_state.analysis_stats.get("function_iterations_limit"):
+        suggestions.append(
+            "Function summary convergence stopped early; increase iteration budget or add call-depth pruning heuristics."
+        )
+    if global_state.analysis_stats.get("call_depth_limit"):
+        suggestions.append("Call depth limit reached; review recursive or deeply nested call chains.")
+    if not suggestions:
+        suggestions.append(
+            "Analysis completed without hitting safety limits; consider enabling full mode to broaden coverage if needed."
+        )
+    log_info("[suggestions] " + " | ".join(suggestions))
+
+
 # ---------------------------------------------------------------------------
 # Main driver
 # ---------------------------------------------------------------------------
@@ -755,6 +795,7 @@ def main():
     analyzer = FunctionAnalyzer(api, global_state, mode)
     analyzer.analyze_all()
     emit_ndjson(global_state)
+    emit_improvement_suggestions(global_state)
     log_debug(
         f"[debug] analyzed {len(global_state.function_summaries)} functions, "
         f"roots={len(global_state.roots)} decisions={len(global_state.decisions)} "
