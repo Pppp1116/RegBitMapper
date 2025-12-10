@@ -2,9 +2,8 @@
 """
 RegistryKeyBitfieldReport (PyGhidra / Python 3.x)
 
-This script is intended for Ghidra 12 with the PyGhidra CPython bridge. It is
-not a Jython script and must not subclass ``GhidraScript``. Run it using a
-command like:
+This script targets **Ghidra 12** using the **PyGhidra CPython bridge**. It is
+not a Jython script and must not subclass ``GhidraScript``. Example invocation:
 
 py -3.11 -m pyghidra ^
   --project-path "C:\\GhidraProjects\\RegMap" ^
@@ -18,8 +17,10 @@ Arguments (key=value):
   debug : verbose summaries (true/false/1/0/yes/no/on/off).
   trace : per-step traces (true/false/1/0/yes/no/on/off).
 
-The analysis treats assembly as authoritative for reporting addresses/mnemonics
-and uses p-code as the semantic IR for dataflow.
+Assembly is authoritative for addresses/mnemonics/disassembly. P-code is used
+as the internal IR for semantics and dataflow. The analysis runs in two modes:
+  * taint: starts from registry/config roots and propagates from there.
+  * full : analyzes all flows while still recording registry/config origins.
 """
 from __future__ import annotations
 
@@ -29,16 +30,20 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-try:
+try:  # pragma: no cover - executed inside Ghidra
     from ghidra import currentProgram
     from ghidra.program.flatapi import FlatProgramAPI
     from ghidra.program.model.block import BasicBlockModel
+    from ghidra.program.model.listing import Instruction
     from ghidra.program.model.pcode import PcodeOp
-except Exception:  # pragma: no cover - executed inside Ghidra
+    from ghidra.program.model.symbol import RefType
+except Exception:  # pragma: no cover
     currentProgram = None
     FlatProgramAPI = None
     BasicBlockModel = None
+    Instruction = None
     PcodeOp = None
+    RefType = None
 
 # ---------------------------------------------------------------------------
 # Argument parsing and logging
@@ -235,15 +240,13 @@ class FunctionSummary:
         if after_ret != before_ret:
             self.return_influence = after_ret
             changed = True
-        existing_slots = list(self.slot_writes)
         for slot in other.slot_writes:
-            if slot not in existing_slots:
+            if slot not in self.slot_writes:
                 self.slot_writes.append(slot)
                 changed = True
-        existing_dec = [d.to_dict() for d in self.decisions]
-        for d in other.decisions:
-            if d.to_dict() not in existing_dec:
-                self.decisions.append(d)
+        for dec in other.decisions:
+            if dec.to_dict() not in [d.to_dict() for d in self.decisions]:
+                self.decisions.append(dec)
                 changed = True
         return changed
 
@@ -287,6 +290,13 @@ def new_value_from_varnode(vn) -> AbstractValue:
     if vn and vn.isConstant():
         val.tainted = False
     return val
+
+
+def opcode_name(op: PcodeOp) -> str:
+    try:
+        return op.getMnemonic()
+    except Exception:
+        return str(op.getOpcode())
 
 
 # ---------------------------------------------------------------------------
@@ -356,28 +366,73 @@ class FunctionAnalyzer:
             log_debug("[warn] function iteration limit hit")
             self.global_state.analysis_stats["function_iterations_limit"] = True
 
+    # ------------------------------------------------------------------
+    # Function level fixed-point over basic blocks
+    # ------------------------------------------------------------------
+
     def analyze_function(self, func) -> FunctionSummary:
         summary = FunctionSummary(func.getName(), str(func.getEntryPoint()))
         body = func.getBody()
         listing = self.api.getCurrentProgram().getListing()
-        states: Dict[Tuple, AbstractValue] = {}
         block_model = BasicBlockModel(currentProgram)
         blocks = list(block_model.getCodeBlocksContaining(body, self.api.getMonitor()))
-        worklist: deque = deque(blocks)
-        visited = 0
-        while worklist and visited < self.max_steps:
-            block = worklist.popleft()
-            visited += 1
-            it = listing.getInstructions(block, True)
+        preds: Dict[Any, List[Any]] = defaultdict(list)
+        succs: Dict[Any, List[Any]] = defaultdict(list)
+        for blk in blocks:
+            it = blk.getDestinations(self.api.getMonitor())
             while it.hasNext():
-                inst = it.next()
-                pcode_ops = inst.getPcode()
-                for op in pcode_ops:
-                    self._process_pcode(func, inst, op, states, summary)
-        if visited >= self.max_steps:
-            log_debug("[warn] worklist limit hit in function %s" % func.getName())
+                dest = it.next()
+                succs[blk].append(dest.getDestinationBlock())
+                preds[dest.getDestinationBlock()].append(blk)
+        in_states: Dict[Any, Dict[Tuple, AbstractValue]] = {blk: {} for blk in blocks}
+        worklist: deque = deque(blocks)
+        steps = 0
+        while worklist and steps < self.max_steps:
+            blk = worklist.popleft()
+            steps += 1
+            state = self._merge_predecessors(blk, preds, in_states)
+            new_state = self._run_block(func, blk, state, listing, summary)
+            if self._state_changed(in_states.get(blk, {}), new_state):
+                in_states[blk] = new_state
+                for succ in succs.get(blk, []):
+                    if succ not in worklist:
+                        worklist.append(succ)
+        if steps >= self.max_steps:
+            log_debug(f"[warn] worklist limit hit in function {func.getName()}")
             self.global_state.analysis_stats["worklist_limit"] = True
+        self._finalize_summary_from_slots(summary)
         return summary
+
+    def _merge_predecessors(self, blk, preds: Dict[Any, List[Any]], in_states: Dict[Any, Dict[Tuple, AbstractValue]]):
+        merged: Dict[Tuple, AbstractValue] = {}
+        for pred in preds.get(blk, []):
+            for key, val in in_states.get(pred, {}).items():
+                if key not in merged:
+                    merged[key] = val.clone()
+                else:
+                    merged[key] = merged[key].merge(val)
+        return merged
+
+    def _state_changed(self, old: Dict[Tuple, AbstractValue], new: Dict[Tuple, AbstractValue]) -> bool:
+        if set(old.keys()) != set(new.keys()):
+            return True
+        for k, v in new.items():
+            o = old.get(k)
+            if o is None:
+                return True
+            if v.tainted != o.tainted or v.origins != o.origins or v.used_bits != o.used_bits or v.candidate_bits != o.candidate_bits:
+                return True
+        return False
+
+    def _run_block(self, func, blk, state: Dict[Tuple, AbstractValue], listing, summary: FunctionSummary) -> Dict[Tuple, AbstractValue]:
+        states = {k: v.clone() for k, v in state.items()}
+        it = listing.getInstructions(blk, True)
+        while it.hasNext():
+            inst = it.next()
+            pcode_ops = inst.getPcode()
+            for op in pcode_ops:
+                self._process_pcode(func, inst, op, states, summary)
+        return states
 
     # ------------------------------------------------------------------
     # P-code processing
@@ -392,13 +447,12 @@ class FunctionAnalyzer:
     def _set_val(self, vn, val: AbstractValue, states: Dict[Tuple, AbstractValue]) -> None:
         key = varnode_key(vn)
         states[key] = val
-        log_trace(f"[trace] set {key} -> {val}")
+        log_trace(f"[trace] set {key} -> tainted={val.tainted} origins={sorted(val.origins)} bits={sorted(val.candidate_bits)}")
 
-    def _process_pcode(self, func, inst, op: PcodeOp, states: Dict[Tuple, AbstractValue], summary: FunctionSummary) -> None:
-        opcode = op.getOpcode()
+    def _process_pcode(self, func, inst: Instruction, op: PcodeOp, states: Dict[Tuple, AbstractValue], summary: FunctionSummary) -> None:
+        opname = opcode_name(op)
         out = op.getOutput()
         inputs = [op.getInput(i) for i in range(op.getNumInputs())]
-        opname = op.getMnemonic()
         if opname in {"COPY", "INT_ZEXT", "INT_SEXT", "SUBPIECE"}:
             self._handle_copy(out, inputs, states)
         elif opname in {"INT_ADD", "INT_SUB"}:
@@ -434,6 +488,7 @@ class FunctionAnalyzer:
             return
         src = self._get_val(inputs[0], states)
         val = src.clone()
+        val.bit_width = out.getSize() * 8
         self._set_val(out, val, states)
 
     def _handle_addsub(self, out, inputs, states, opname):
@@ -455,7 +510,7 @@ class FunctionAnalyzer:
         elif b.pointer_pattern and inputs[0].isConstant():
             pp = b.pointer_pattern.clone()
             delta = int(inputs[0].getOffset())
-            pp.adjust_offset(delta)
+            pp.adjust_offset(delta if opname == "INT_ADD" else -delta)
             val.pointer_pattern = pp
         elif a.pointer_pattern and b.pointer_pattern:
             val.pointer_pattern = a.pointer_pattern.merge(b.pointer_pattern)
@@ -528,11 +583,13 @@ class FunctionAnalyzer:
         if shift is None:
             val.mark_all_bits_used()
         else:
-            for b in base.candidate_bits:
+            for b in base.candidate_bits or set(range(base.bit_width)):
                 if opname == "INT_LEFT":
-                    val.candidate_bits.add(b + shift)
+                    val.candidate_bits.add(min(val.bit_width - 1, b + shift))
                 else:
-                    new_b = max(0, b - shift)
+                    new_b = b - shift
+                    if new_b < 0:
+                        new_b = 0
                     val.candidate_bits.add(new_b)
             val.used_bits |= set(val.candidate_bits)
         self._set_val(out, val, states)
@@ -558,16 +615,19 @@ class FunctionAnalyzer:
             key = (addr_val.pointer_pattern.base_id, addr_val.pointer_pattern.offset)
             slot = self.global_state.struct_slots.get(key)
             if slot is None:
-                slot = StructSlot(addr_val.pointer_pattern.base_id, addr_val.pointer_pattern.offset,
-                                  addr_val.pointer_pattern.stride, addr_val.pointer_pattern.index_var,
-                                  value=src_val.clone())
+                slot = StructSlot(
+                    addr_val.pointer_pattern.base_id,
+                    addr_val.pointer_pattern.offset,
+                    addr_val.pointer_pattern.stride,
+                    addr_val.pointer_pattern.index_var,
+                    value=src_val.clone(),
+                )
                 self.global_state.struct_slots[key] = slot
             else:
                 slot.value = slot.value.merge(src_val)
             self.global_state.function_summaries.setdefault(
-                inst.getFunction().getName() if inst.getFunction() else "unknown", FunctionSummary(
-                    inst.getFunction().getName() if inst.getFunction() else "unknown", str(inst.getAddress())
-                )
+                inst.getFunction().getName() if inst.getFunction() else "unknown",
+                FunctionSummary(inst.getFunction().getName() if inst.getFunction() else "unknown", str(inst.getAddress())),
             ).slot_writes.append(
                 {
                     "base_id": slot.base_id,
@@ -576,12 +636,14 @@ class FunctionAnalyzer:
                 }
             )
             if slot.value.tainted and not src_val.tainted:
-                self.global_state.overrides.append({
-                    "address": str(inst.getAddress()),
-                    "function": inst.getFunction().getName() if inst.getFunction() else None,
-                    "source_origins": sorted(src_val.origins),
-                    "notes": "struct slot override",
-                })
+                self.global_state.overrides.append(
+                    {
+                        "address": str(inst.getAddress()),
+                        "function": inst.getFunction().getName() if inst.getFunction() else None,
+                        "source_origins": sorted(src_val.origins),
+                        "notes": "struct slot override",
+                    }
+                )
 
     def _handle_ptradd(self, out, inputs, states):
         if out is None or len(inputs) < 2:
@@ -623,9 +685,13 @@ class FunctionAnalyzer:
         merged.bit_width = out.getSize() * 8
         self._set_val(out, merged, states)
 
-    def _handle_call(self, inst, op, inputs, states, summary: FunctionSummary):
-        callee_refs = [r for r in inst.getReferencesFrom() if r.getReferenceType().isCall()]
+    def _handle_call(self, inst, op: PcodeOp, inputs, states, summary: FunctionSummary):
+        for idx, inp in enumerate(inputs):
+            arg_val = self._get_val(inp, states)
+            if arg_val.origins:
+                summary.param_influence[idx] |= set(arg_val.origins)
         callee_name = None
+        callee_refs = [r for r in inst.getReferencesFrom() if r.getReferenceType().isCall()]
         if callee_refs:
             to_addr = callee_refs[0].getToAddress()
             func = self.api.getFunctionManager().getFunctionAt(to_addr)
@@ -640,8 +706,11 @@ class FunctionAnalyzer:
                         val.origins |= roots
                         val.tainted = val.tainted or bool(roots)
                 if callee_summary.return_influence and op.getOutput() is not None:
-                    val = AbstractValue(tainted=True, origins=set(callee_summary.return_influence),
-                                        bit_width=op.getOutput().getSize() * 8)
+                    val = AbstractValue(
+                        tainted=True,
+                        origins=set(callee_summary.return_influence),
+                        bit_width=op.getOutput().getSize() * 8,
+                    )
                     self._set_val(op.getOutput(), val, states)
                 for slot in callee_summary.slot_writes:
                     key = (slot.get("base_id"), slot.get("offset"))
@@ -650,12 +719,15 @@ class FunctionAnalyzer:
                         slot_val.value.origins |= set(slot.get("origins", []))
             if is_registry_api(callee_name):
                 root_id = f"api_{callee_name}_{inst.getAddress()}"
-                self.global_state.roots.setdefault(root_id, {
-                    "id": root_id,
-                    "type": "registry",
-                    "api_name": callee_name,
-                    "address": str(inst.getAddress()),
-                })
+                self.global_state.roots.setdefault(
+                    root_id,
+                    {
+                        "id": root_id,
+                        "type": "registry",
+                        "api_name": callee_name,
+                        "address": str(inst.getAddress()),
+                    },
+                )
                 if op.getOutput() is not None:
                     val = self._get_val(op.getOutput(), states)
                     val.tainted = True
@@ -685,6 +757,11 @@ class FunctionAnalyzer:
             val.mark_all_bits_used()
         self._set_val(out, val, states)
 
+    def _finalize_summary_from_slots(self, summary: FunctionSummary) -> None:
+        existing = self.global_state.function_summaries.get(summary.name)
+        if existing:
+            summary.merge_from(existing)
+
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -699,14 +776,16 @@ def build_root_records(global_state: GlobalState) -> List[Dict[str, Any]]:
         candidate_bits: Set[int] = set()
         for (base_id, offset), slot in global_state.struct_slots.items():
             if slot.value.origins and root_id in slot.value.origins:
-                slot_entries.append({
-                    "base_id": base_id,
-                    "offset": offset,
-                    "offset_hex": hex(offset),
-                    "stride": slot.stride,
-                    "index_based": bool(slot.index_var),
-                    "notes": "struct slot",
-                })
+                slot_entries.append(
+                    {
+                        "base_id": base_id,
+                        "offset": offset,
+                        "offset_hex": hex(offset),
+                        "stride": slot.stride,
+                        "index_based": bool(slot.index_var),
+                        "notes": "struct slot",
+                    }
+                )
                 used_bits |= slot.value.used_bits
                 candidate_bits |= slot.value.candidate_bits
         decisions = [d.to_dict() for d in global_state.decisions if root_id in d.origins]
@@ -751,7 +830,6 @@ def emit_ndjson(global_state: GlobalState) -> None:
 
 
 def emit_improvement_suggestions(global_state: GlobalState) -> None:
-    """Print actionable suggestions to guide analysts toward better coverage."""
     suggestions: List[str] = []
     if not global_state.roots:
         suggestions.append(
@@ -762,9 +840,7 @@ def emit_improvement_suggestions(global_state: GlobalState) -> None:
             "No branch decisions were attributed to roots; enable trace logging to confirm taint propagation and broaden bit tracking."
         )
     if global_state.analysis_stats.get("worklist_limit"):
-        suggestions.append(
-            "Worklist iteration hit its safety limit; raise max_steps or refine CFG traversal to reach a fixpoint."
-        )
+        suggestions.append("Worklist iteration hit its safety limit; raise max_steps or refine CFG traversal to reach a fixpoint.")
     if global_state.analysis_stats.get("function_iterations_limit"):
         suggestions.append(
             "Function summary convergence stopped early; increase iteration budget or add call-depth pruning heuristics."
@@ -790,16 +866,13 @@ def main():
     global_state = GlobalState()
     global_state.roots = discover_registry_roots(api)
     if mode == "full" and not global_state.roots:
-        # ensure at least one synthetic root so all flows are kept
         global_state.roots["root_synthetic"] = {"id": "root_synthetic", "type": "synthetic", "details": {}}
     analyzer = FunctionAnalyzer(api, global_state, mode)
     analyzer.analyze_all()
     emit_ndjson(global_state)
     emit_improvement_suggestions(global_state)
     log_debug(
-        f"[debug] analyzed {len(global_state.function_summaries)} functions, "
-        f"roots={len(global_state.roots)} decisions={len(global_state.decisions)} "
-        f"slots={len(global_state.struct_slots)}"
+        f"[debug] analyzed {len(global_state.function_summaries)} functions, roots={len(global_state.roots)} decisions={len(global_state.decisions)} slots={len(global_state.struct_slots)}"
     )
 
 
