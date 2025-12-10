@@ -234,6 +234,31 @@ def _resolve_dummy_monitor():
 DUMMY_MONITOR = _resolve_dummy_monitor()
 
 
+def _resolve_active_monitor():
+    candidates = []
+    for name in ("monitor", "currentMonitor"):
+        cand = globals().get(name)
+        if cand is not None:
+            candidates.append(cand)
+    if TaskMonitor is not None:
+        try:
+            current = TaskMonitor.current()  # type: ignore[attr-defined]
+            if current is not None:
+                candidates.append(current)
+        except Exception:
+            pass
+    for cand in candidates:
+        try:
+            if cand is not None and hasattr(cand, "isCancelled"):
+                return cand
+        except Exception:
+            continue
+    return DUMMY_MONITOR
+
+
+ACTIVE_MONITOR = _resolve_active_monitor()
+
+
 def log_info(msg: str) -> None:
     print(msg, file=sys.stderr)
 
@@ -454,6 +479,9 @@ class GlobalState:
     analysis_stats: Dict[str, Any] = field(default_factory=lambda: defaultdict(int))
     overrides: List[Dict[str, Any]] = field(default_factory=list)
     registry_strings: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    root_decision_index: Dict[str, List[Decision]] = field(default_factory=lambda: defaultdict(list))
+    root_slot_index: Dict[str, Set[Tuple[str, int]]] = field(default_factory=lambda: defaultdict(set))
+    root_override_index: Dict[str, List[Dict[str, Any]]] = field(default_factory=lambda: defaultdict(list))
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +562,7 @@ def opcode_name(op: PcodeOp) -> str:
 
 
 REGISTRY_PREFIXES = ["Reg", "Zw", "Nt", "Cm", "Rtl"]
+REGISTRY_RTL_REGISTRY_RE = re.compile(r"(?i)^rtl(?:query|write|create|open|delete|check|enumerate)registry")
 
 REGISTRY_HIVE_ALIASES = {
     "HKLM": ["HKLM", "HKEY_LOCAL_MACHINE", "\\Registry\\Machine"],
@@ -589,7 +618,10 @@ def is_registry_api(name: str) -> bool:
     normalized = normalize_registry_label(name)
     if normalized:
         lowered = normalized.lower()
-        return any(lowered.startswith(pref.lower()) for pref in REGISTRY_PREFIXES)
+        if any(lowered.startswith(pref.lower()) for pref in ("reg", "zw", "nt", "cm")):
+            return True
+        if lowered.startswith("rtl"):
+            return bool(REGISTRY_RTL_REGISTRY_RE.match(lowered))
 
     return False
 
@@ -656,7 +688,14 @@ def collect_registry_string_candidates(program, scan_limit: Optional[int] = None
     it = listing.getDefinedData(True)
     max_scan = scan_limit if scan_limit is not None else 100_000
     scanned = 0
+    monitor = ACTIVE_MONITOR or DUMMY_MONITOR
     while it.hasNext():
+        try:
+            if monitor and hasattr(monitor, "isCancelled") and monitor.isCancelled():
+                log_debug("[debug] registry string scan cancelled by user")
+                break
+        except Exception:
+            pass
         scanned += 1
         if max_scan and scanned > max_scan:
             log_debug("[debug] registry string candidate scan capped for performance")
@@ -694,7 +733,13 @@ def collect_registry_string_candidates(program, scan_limit: Optional[int] = None
             meta = parse_registry_string(sval)
             if meta:
                 candidates[str(data.getAddress())] = meta
-        except Exception:
+        except Exception as e:
+            if DEBUG_ENABLED:
+                try:
+                    addr_str = str(data.getAddress())
+                except Exception:
+                    addr_str = "<unknown>"
+                log_debug(f"[debug] error in collect_registry_string_candidates at {addr_str}: {e!r}")
             continue
     return candidates
 
@@ -709,12 +754,13 @@ class FunctionAnalyzer:
         self.api = api
         self.global_state = global_state
         self.mode = mode
-        self.max_steps = 10_000_000
-        self.max_function_iterations = 1_000_000
+        self.max_steps = 5_000_000
+        self.max_function_iterations = 250_000
         self.max_call_depth = max_call_depth
         self.program = program
         # Reuse a single BasicBlockModel for the program (safe for Ghidra 12).
         self.block_model = BasicBlockModel(self.program)
+        self.monitor = ACTIVE_MONITOR or DUMMY_MONITOR
 
     def _get_function_for_inst(self, inst: Instruction):
         try:
@@ -727,18 +773,20 @@ class FunctionAnalyzer:
         if addr_str in self.global_state.registry_strings:
             return self.global_state.registry_strings[addr_str]
         data = self.program.getListing().getDataContaining(addr)
-        if data and data.hasStringValue():
-            try:
-                val_obj = data.getValue()
-                sval = val_obj.getString() if hasattr(val_obj, "getString") else str(val_obj)
-                meta = parse_registry_string(sval)
-                if meta:
-                    self.global_state.registry_strings[addr_str] = meta
-                    return meta
-            except Exception:
-                decoded = self._decode_string_at_address(addr, addr_str)
-                if decoded:
-                    return decoded
+            if data and data.hasStringValue():
+                try:
+                    val_obj = data.getValue()
+                    sval = val_obj.getString() if hasattr(val_obj, "getString") else str(val_obj)
+                    meta = parse_registry_string(sval)
+                    if meta:
+                        self.global_state.registry_strings[addr_str] = meta
+                        return meta
+                except Exception as e:
+                    if DEBUG_ENABLED:
+                        log_debug(f"[debug] error resolving string value at {addr_str}: {e!r}")
+                    decoded = self._decode_string_at_address(addr, addr_str)
+                    if decoded:
+                        return decoded
         return self._decode_string_at_address(addr, addr_str)
 
     def _resolve_string_from_vn(self, vn, states: Optional[Dict[Tuple, AbstractValue]] = None) -> Optional[Dict[str, Any]]:
@@ -768,7 +816,9 @@ class FunctionAnalyzer:
                 if meta:
                     return meta
             return None
-        except Exception:
+        except Exception as e:
+            if DEBUG_ENABLED:
+                log_debug(f"[debug] error in _resolve_string_from_vn for {vn}: {e!r}")
             return None
         return None
 
@@ -796,7 +846,9 @@ class FunctionAnalyzer:
                 if meta:
                     self.global_state.registry_strings[addr_str] = meta
                     return meta
-        except Exception:
+        except Exception as e:
+            if DEBUG_ENABLED:
+                log_debug(f"[debug] error decoding string at {addr_str}: {e!r}")
             return None
         return None
 
@@ -805,6 +857,13 @@ class FunctionAnalyzer:
         worklist = deque((func, 0) for func in fm.getFunctions(True))
         iteration_guard = 0
         while worklist and iteration_guard < self.max_function_iterations:
+            try:
+                if self.monitor and hasattr(self.monitor, "isCancelled") and self.monitor.isCancelled():
+                    self.global_state.analysis_stats["cancelled"] = True
+                    log_debug("[debug] analysis cancelled by user")
+                    break
+            except Exception:
+                pass
             func, depth = worklist.popleft()
             iteration_guard += 1
             if self.max_call_depth is not None and depth > self.max_call_depth:
@@ -815,10 +874,10 @@ class FunctionAnalyzer:
             existing = self.global_state.function_summaries.get(func.getName())
             if existing is None:
                 self.global_state.function_summaries[func.getName()] = summary
-                worklist.extend((callee, depth + 1) for callee in func.getCalledFunctions(DUMMY_MONITOR))
+                worklist.extend((callee, depth + 1) for callee in func.getCalledFunctions(self.monitor))
             else:
                 if existing.merge_from(summary):
-                    worklist.extend((callee, depth + 1) for callee in func.getCalledFunctions(DUMMY_MONITOR))
+                    worklist.extend((callee, depth + 1) for callee in func.getCalledFunctions(self.monitor))
         if iteration_guard >= self.max_function_iterations:
             log_debug("[warn] function iteration limit hit")
             self.global_state.analysis_stats["function_iterations_limit"] = True
@@ -832,11 +891,11 @@ class FunctionAnalyzer:
         summary = FunctionSummary(func.getName(), str(func.getEntryPoint()))
         body = func.getBody()
         listing = self.program.getListing()
-        blocks = list(self.block_model.getCodeBlocksContaining(body, DUMMY_MONITOR))
+        blocks = list(self.block_model.getCodeBlocksContaining(body, self.monitor))
         preds: Dict[Any, List[Any]] = defaultdict(list)
         succs: Dict[Any, List[Any]] = defaultdict(list)
         for blk in blocks:
-            it = blk.getDestinations(DUMMY_MONITOR)
+            it = blk.getDestinations(self.monitor)
             while it.hasNext():
                 dest = it.next()
                 succs[blk].append(dest.getDestinationBlock())
@@ -847,6 +906,11 @@ class FunctionAnalyzer:
         while worklist and steps < self.max_steps:
             blk = worklist.popleft()
             steps += 1
+            try:
+                if self.monitor and hasattr(self.monitor, "checkCanceled"):
+                    self.monitor.checkCanceled()
+            except Exception:
+                pass
             state = self._merge_predecessors(blk, preds, in_states)
             new_state = self._run_block(func, blk, state, listing, summary)
             if self._state_changed(in_states.get(blk, {}), new_state):
@@ -890,6 +954,13 @@ class FunctionAnalyzer:
             return states
         it = listing.getInstructions(addr_set, True)
         while it.hasNext():
+            try:
+                if self.monitor and hasattr(self.monitor, "isCancelled") and self.monitor.isCancelled():
+                    self.global_state.analysis_stats["cancelled"] = True
+                    log_debug("[debug] instruction traversal cancelled by user")
+                    break
+            except Exception:
+                pass
             inst = it.next()
             try:
                 pcode_ops = inst.getPcode()
@@ -1118,7 +1189,8 @@ class FunctionAnalyzer:
                 )
                 self.global_state.struct_slots[key] = slot
             else:
-                slot.value = slot.value.merge(src_val)
+                old_value = slot.value.clone()
+                slot.value = old_value.merge(src_val)
             inst_func = self._get_function_for_inst(inst)
             func_name = inst_func.getName() if inst_func else "unknown"
             self.global_state.function_summaries.setdefault(
@@ -1130,15 +1202,18 @@ class FunctionAnalyzer:
                     "origins": sorted(slot.value.origins),
                 }
             )
-            if slot.value.tainted and not src_val.tainted:
-                self.global_state.overrides.append(
-                    {
-                        "address": str(inst.getAddress()),
-                        "function": func_name,
-                        "source_origins": sorted(src_val.origins),
-                        "notes": "struct slot override",
-                    }
-                )
+            for origin in slot.value.origins:
+                self.global_state.root_slot_index[origin].add(key)
+            if old_value.tainted and not src_val.tainted:
+                override_entry = {
+                    "address": str(inst.getAddress()),
+                    "function": func_name,
+                    "source_origins": sorted(old_value.origins),
+                    "notes": "struct slot override",
+                }
+                self.global_state.overrides.append(override_entry)
+                for origin in old_value.origins:
+                    self.global_state.root_override_index[origin].append(override_entry)
 
     def _handle_ptradd(self, func, out, inputs, states):
         if out is None or len(inputs) < 2:
@@ -1184,11 +1259,10 @@ class FunctionAnalyzer:
         if self.mode == "taint" and not cond_val.origins:
             log_trace(f"[trace] skipping untainted branch at {inst.getAddress()}")
             return
-        if not cond_val.candidate_bits:
+        branch_detail = {"type": "branch"}
+        if not cond_val.candidate_bits and not cond_val.used_bits:
             cond_val.mark_all_bits_used()
-            branch_detail = {"type": "branch", "bit_heuristic": "all_bits_marked"}
-        else:
-            branch_detail = {"type": "branch"}
+            branch_detail["bit_heuristic"] = "all_bits_marked"
         decision = Decision(
             address=str(inst.getAddress()),
             mnemonic=inst.getMnemonicString(),
@@ -1200,6 +1274,8 @@ class FunctionAnalyzer:
         decision.details["branch_kind"] = "conditional"
         summary.add_decision(decision)
         self.global_state.decisions.append(decision)
+        for origin in decision.origins:
+            self.global_state.root_decision_index[origin].append(decision)
 
     def _handle_multiequal(self, out, inputs, states):
         if out is None:
@@ -1238,6 +1314,23 @@ class FunctionAnalyzer:
                         value_name = value_candidate
             return hive, path, value_name
 
+        def _pointerish_argument(vn, val: AbstractValue) -> bool:
+            try:
+                if val.pointer_targets or val.pointer_pattern:
+                    return True
+                if vn is None:
+                    return False
+                if hasattr(vn, "isAddrTied") and vn.isAddrTied():
+                    return True
+                if hasattr(vn, "isAddress") and vn.isAddress():
+                    return True
+                if not vn_is_constant(vn) and vn.getSize() * 8 >= DEFAULT_POINTER_BIT_WIDTH:
+                    return True
+            except Exception as e:
+                if DEBUG_ENABLED:
+                    log_debug(f"[debug] error checking pointer-like argument at {inst.getAddress()}: {e!r}")
+            return False
+
         def _seed_root(root_id: str, api_label: str, entry_point: Optional[str]) -> None:
             hive, path, value_name = _derive_registry_fields()
             root_meta = self.global_state.roots.setdefault(
@@ -1267,6 +1360,12 @@ class FunctionAnalyzer:
                 val.origins.add(root_id)
                 val.bit_width = op.getOutput().getSize() * 8
                 self._set_val(op.getOutput(), val, states)
+            for arg in call_args:
+                arg_val = self._get_val(arg, states)
+                if _pointerish_argument(arg, arg_val):
+                    arg_val.tainted = True
+                    arg_val.origins.add(root_id)
+                    self._set_val(arg, arg_val, states)
         for idx, inp in enumerate(call_args):
             arg_val = self._get_val(inp, states)
             if arg_val.origins:
@@ -1299,7 +1398,9 @@ class FunctionAnalyzer:
                     callee_func = f
                     callee_name = f.getName()
                     break
-            except Exception:
+            except Exception as e:
+                if DEBUG_ENABLED:
+                    log_debug(f"[debug] error resolving call reference at {inst.getAddress()}: {e!r}")
                 continue
 
         # Fallback: external location label if no direct function was found.
@@ -1312,7 +1413,9 @@ class FunctionAnalyzer:
                             callee_name = ext_loc.getLabel() or ext_loc.getOriginalImportedName()
                             if callee_name:
                                 break
-                except Exception:
+                except Exception as e:
+                    if DEBUG_ENABLED:
+                        log_debug(f"[debug] error resolving external reference at {inst.getAddress()}: {e!r}")
                     continue
 
         # P-code input 0 often carries the callee address for direct CALL
@@ -1337,7 +1440,9 @@ class FunctionAnalyzer:
                                     func_at_target = thunk_target
                             callee_func = func_at_target
                             callee_name = func_at_target.getName()
-                except Exception:
+                except Exception as e:
+                    if DEBUG_ENABLED:
+                        log_debug(f"[debug] error inferring call target at {inst.getAddress()}: {e!r}")
                     pass
 
         if DEBUG_ENABLED:
@@ -1369,12 +1474,16 @@ class FunctionAnalyzer:
                     slot_val = self.global_state.struct_slots.get(key)
                     if slot_val:
                         slot_val.value.origins |= set(slot.get("origins", []))
+                        for origin in slot_val.value.origins:
+                            self.global_state.root_slot_index[origin].add(key)
                     else:
                         origins = set(slot.get("origins", []))
                         if key[0] is not None and key[1] is not None:
                             self.global_state.struct_slots[key] = StructSlot(
                                 key[0], key[1], value=AbstractValue(origins=origins, tainted=bool(origins))
                             )
+                            for origin in origins:
+                                self.global_state.root_slot_index[origin].add(key)
             api_label = normalized_api_label or callee_name
             if is_registry_api(callee_name):
                 root_id = f"api_{safe_label}_{inst.getAddress()}"
@@ -1431,23 +1540,26 @@ def build_root_records(global_state: GlobalState) -> List[Dict[str, Any]]:
         used_bits: Set[int] = set()
         candidate_bits: Set[int] = set()
         slot_bit_widths: List[int] = []
-        for (base_id, offset), slot in global_state.struct_slots.items():
-            if slot.value.origins and root_id in slot.value.origins:
-                slot_entries.append(
-                    {
-                        "base_id": base_id,
-                        "offset": offset,
-                        "offset_hex": hex(offset),
-                        "stride": slot.stride,
-                        "index_based": bool(slot.index_var),
-                        "notes": "struct slot",
-                    }
-                )
-                used_bits |= slot.value.used_bits
-                candidate_bits |= slot.value.candidate_bits
-                slot_bit_widths.append(slot.value.bit_width)
-        decisions = [d.to_dict() for d in global_state.decisions if root_id in d.origins]
-        overrides = [o for o in global_state.overrides if root_id in o.get("source_origins", [])]
+        for key in sorted(global_state.root_slot_index.get(root_id, set())):
+            slot = global_state.struct_slots.get(key)
+            if slot is None:
+                continue
+            base_id, offset = key
+            slot_entries.append(
+                {
+                    "base_id": base_id,
+                    "offset": offset,
+                    "offset_hex": hex(offset),
+                    "stride": slot.stride,
+                    "index_based": bool(slot.index_var),
+                    "notes": "struct slot",
+                }
+            )
+            used_bits |= slot.value.used_bits
+            candidate_bits |= slot.value.candidate_bits
+            slot_bit_widths.append(slot.value.bit_width)
+        decisions = [d.to_dict() for d in global_state.root_decision_index.get(root_id, [])]
+        overrides = list(global_state.root_override_index.get(root_id, []))
         record = {
             "id": root_id,
             "type": meta.get("type", "registry"),
