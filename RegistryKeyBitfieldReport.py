@@ -897,6 +897,48 @@ class FunctionAnalyzer:
             meta = self._resolve_string_from_vn(inp)
             if meta:
                 string_args.append(meta)
+
+        def _derive_registry_fields() -> Tuple[Optional[str], Optional[str], Optional[str]]:
+            hive = path = value_name = None
+            if string_args:
+                hive = string_args[0].get("hive")
+                path = string_args[0].get("path")
+                value_name = string_args[0].get("value_name")
+                if len(string_args) > 1:
+                    value_candidate = string_args[1].get("value_name") or string_args[1].get("raw")
+                    if value_candidate:
+                        value_name = value_candidate
+            return hive, path, value_name
+
+        def _seed_root(root_id: str, api_label: str, entry_point: Optional[str]) -> None:
+            hive, path, value_name = _derive_registry_fields()
+            root_meta = self.global_state.roots.setdefault(
+                root_id,
+                {
+                    "id": root_id,
+                    "type": "registry",
+                    "api_name": api_label,
+                    "address": str(inst.getAddress()),
+                    "entry": entry_point,
+                    "hive": hive,
+                    "path": path,
+                    "value_name": value_name,
+                },
+            )
+            if entry_point and not root_meta.get("entry"):
+                root_meta["entry"] = entry_point
+            if hive and not root_meta.get("hive"):
+                root_meta["hive"] = hive
+            if path and not root_meta.get("path"):
+                root_meta["path"] = path
+            if value_name and not root_meta.get("value_name"):
+                root_meta["value_name"] = value_name
+            if op.getOutput() is not None:
+                val = self._get_val(op.getOutput(), states)
+                val.tainted = True
+                val.origins.add(root_id)
+                val.bit_width = op.getOutput().getSize() * 8
+                self._set_val(op.getOutput(), val, states)
         for idx, inp in enumerate(call_args):
             arg_val = self._get_val(inp, states)
             if arg_val.origins:
@@ -930,43 +972,20 @@ class FunctionAnalyzer:
                     if slot_val:
                         slot_val.value.origins |= set(slot.get("origins", []))
             if is_registry_api(callee_name):
-                hive = path = value_name = None
-                if string_args:
-                    hive = string_args[0].get("hive")
-                    path = string_args[0].get("path")
-                    value_name = string_args[0].get("value_name")
-                    if len(string_args) > 1:
-                        value_candidate = string_args[1].get("value_name") or string_args[1].get("raw")
-                        if value_candidate:
-                            value_name = value_candidate
                 root_id = f"api_{callee_name}_{inst.getAddress()}"
-                root_meta = self.global_state.roots.setdefault(
-                    root_id,
-                    {
-                        "id": root_id,
-                        "type": "registry",
-                        "api_name": callee_name,
-                        "address": str(inst.getAddress()),
-                        "entry": str(callee_func.getEntryPoint()) if callee_func else None,
-                        "hive": hive,
-                        "path": path,
-                        "value_name": value_name,
-                    },
-                )
-                if hive and not root_meta.get("hive"):
-                    root_meta["hive"] = hive
-                if path and not root_meta.get("path"):
-                    root_meta["path"] = path
-                if value_name and not root_meta.get("value_name"):
-                    root_meta["value_name"] = value_name
-                if op.getOutput() is not None:
-                    val = self._get_val(op.getOutput(), states)
-                    val.tainted = True
-                    val.origins.add(root_id)
-                    self._set_val(op.getOutput(), val, states)
+                entry_point = str(callee_func.getEntryPoint()) if callee_func else None
+                _seed_root(root_id, callee_name, entry_point)
+            elif string_args:
+                root_id = f"api_like_{callee_name}_{inst.getAddress()}"
+                entry_point = str(callee_func.getEntryPoint()) if callee_func else None
+                _seed_root(root_id, callee_name, entry_point)
         else:
+            if string_args:
+                root_id = f"indirect_{inst.getAddress()}"
+                _seed_root(root_id, "<indirect>", None)
             if op.getOutput() is not None:
-                out_val = AbstractValue(bit_width=op.getOutput().getSize() * 8)
+                out_val = self._get_val(op.getOutput(), states).clone()
+                out_val.bit_width = op.getOutput().getSize() * 8
                 for inp in call_args:
                     src = self._get_val(inp, states)
                     out_val = out_val.merge(src)
