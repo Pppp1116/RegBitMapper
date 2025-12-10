@@ -1,1173 +1,766 @@
 # coding: utf-8
-#@category RegBitMapper
-#@runtime Jython
 """
-RegistryKeyBitfieldReport (PyGhidra friendly)
+RegistryKeyBitfieldReport (PyGhidra / Python 3.x)
 
-This script performs program-wide analysis to discover registry usage. It can
-run directly from the Ghidra Script Manager or headlessly via PyGhidra. It
-keeps backward-compatible NDJSON output while adding optional "extended"
-metadata.
+This script is intended for Ghidra 12 with the PyGhidra CPython bridge. It is
+not a Jython script and must not subclass ``GhidraScript``. Run it using a
+command like:
+
+py -3.11 -m pyghidra ^
+  --project-path "C:\\GhidraProjects\\RegMap" ^
+  --project-name "MyProj" ^
+  "C:\\path\\to\\target.exe" ^
+  "C:\\path\\to\\RegistryKeyBitfieldReport.py" ^
+  mode=taint debug=true trace=false
+
+Arguments (key=value):
+  mode  : "taint" (registry/config seeded) or "full" (analyze all flows).
+  debug : verbose summaries (true/false/1/0/yes/no/on/off).
+  trace : per-step traces (true/false/1/0/yes/no/on/off).
+
+The analysis treats assembly as authoritative for reporting addresses/mnemonics
+and uses p-code as the semantic IR for dataflow.
 """
+from __future__ import annotations
 
-from __future__ import print_function
-
-import argparse
 import json
-import os
-import re
-import time
+import sys
 from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from ghidra.program.flatapi import FlatProgramAPI
-from ghidra.program.model.address import Address
-from ghidra.program.model.block import BasicBlockModel
-from ghidra.program.model.listing import Instruction
-from ghidra.program.model.pcode import PcodeOp
-from ghidra.program.model.symbol import FlowType, RefType
-from ghidra.util.task import ConsoleTaskMonitor
-
-# ---------------------------------------------------------------------------
-# Utility data containers
-# ---------------------------------------------------------------------------
-
-class ApiCallSite(object):
-    def __init__(self, addr, func_name, api_name, op_type, arg_index=None, width=None):
-        self.addr = addr
-        self.func_name = func_name
-        self.api_name = api_name
-        self.op_type = op_type
-        self.arg_index = arg_index
-        self.width = width
-        self.resolved_key = None
-        self.extended = {}
-
-    def to_dict(self):
-        base = {
-            "address": str(self.addr),
-            "function": self.func_name,
-            "api": self.api_name,
-            "operation": self.op_type,
-            "arg_index": self.arg_index,
-            "width": self.width,
-            "resolved_key": self.resolved_key,
-        }
-        if self.extended:
-            base["extended"] = self.extended
-        return base
-
-
-class TaintRecord(object):
-    def __init__(self, key_info, width=32, used_mask=None, ignored_mask=None, history=None, confidence=1.0, source="registry"):
-        self.key_info = key_info
-        self.width = width or 32
-        self.used_mask = used_mask if used_mask is not None else ((1 << self.width) - 1)
-        self.ignored_mask = ignored_mask if ignored_mask is not None else 0
-        self.history = history or []
-        self.confidence = confidence
-        self.source = source
-
-    def clone(self):
-        return TaintRecord(
-            self.key_info,
-            self.width,
-            self.used_mask,
-            self.ignored_mask,
-            list(self.history),
-            self.confidence,
-            self.source,
-        )
-
-    def _mask_limit(self):
-        return (1 << self.width) - 1
-
-    def apply_and(self, mask, note):
-        limit = self._mask_limit()
-        self.used_mask &= mask & limit
-        self.ignored_mask |= (~mask) & limit
-        self.history.append(("and", mask, note))
-
-    def apply_or(self, mask, note):
-        limit = self._mask_limit()
-        self.used_mask |= mask & limit
-        self.history.append(("or", mask, note))
-
-    def apply_xor(self, mask, note):
-        limit = self._mask_limit()
-        self.used_mask |= mask & limit
-        self.history.append(("xor", mask, note))
-
-    def apply_not(self, note):
-        limit = self._mask_limit()
-        self.used_mask = (~self.used_mask) & limit
-        self.history.append(("not", None, note))
-
-    def apply_shift(self, bits, direction, note):
-        if direction == "l":
-            self.used_mask <<= bits
-            self.ignored_mask <<= bits
-        else:
-            self.used_mask >>= bits
-            self.ignored_mask >>= bits
-        limit = self._mask_limit()
-        self.used_mask &= limit
-        self.ignored_mask &= limit
-        self.history.append(("shift" + direction, bits, note))
-
-    def mark_compare(self, mask, note):
-        if mask is None:
-            return
-        limit = self._mask_limit()
-        self.used_mask &= mask & limit
-        self.history.append(("cmp", mask, note))
-
-    def merge(self, other):
-        if other is None or other.key_info != self.key_info:
-            return self
-        merged = TaintRecord(self.key_info, width=max(self.width, other.width))
-        merged.used_mask = self.used_mask | other.used_mask
-        merged.ignored_mask = self.ignored_mask | other.ignored_mask
-        merged.history = list(self.history) + list(other.history)
-        merged.confidence = min(self.confidence, other.confidence)
-        merged.source = self.source or other.source
-        return merged
-
-
-class DecisionPoint(object):
-    def __init__(self, addr, condition, taint_record, func_name=None, history=None, extended=None):
-        self.addr = addr
-        self.condition = condition
-        self.taint_record = taint_record
-        self.func_name = func_name
-        self.history = history or []
-        self.extended = extended or {}
-
-    def _bits_from_mask(self, mask, width):
-        if mask is None or width is None:
-            return []
-        return [i for i in range(width) if mask & (1 << i)]
-
-    def to_dict(self):
-        base = {
-            "address": str(self.addr),
-            "condition": self.condition,
-            "function": self.func_name,
-            "used_bits": self._bits_from_mask(self.taint_record.used_mask, self.taint_record.width),
-            "ignored_bits": self._bits_from_mask(self.taint_record.ignored_mask, self.taint_record.width),
-            "width": self.taint_record.width,
-        }
-        ext = dict(self.extended)
-        if self.history:
-            ext["history"] = self.history
-        ext["confidence"] = self.taint_record.confidence
-        if ext:
-            base["extended"] = ext
-        return base
-
-
-class RegistryKeyInfo(object):
-    def __init__(self, key_string):
-        self.key_string = key_string
-        self.hive, self.subkey, self.value_name = self._split_key(key_string)
-        self.api_calls = []
-        self.decisions = []
-        self.used_mask = None
-        self.ignored_mask = None
-        self.width = None
-        self.extended = {"unreferenced_seed": False}
-
-    def _split_key(self, key_string):
-        parts = key_string.split("\\", 1)
-        hive = parts[0] if parts else None
-        rest = parts[1] if len(parts) > 1 else ""
-        subkey = rest
-        value_name = None
-        if rest and "\\" in rest:
-            sub_parts = rest.rsplit("\\", 1)
-            subkey = sub_parts[0]
-            value_name = sub_parts[1]
-        return hive, subkey, value_name
-
-    def add_api_call(self, call):
-        self.api_calls.append(call)
-
-    def add_decision(self, decision):
-        self.decisions.append(decision)
-
-    def update_masks(self, taint):
-        if taint is None:
-            return
-        if self.width is None:
-            self.width = taint.width
-        if self.used_mask is None:
-            self.used_mask = taint.used_mask
-        else:
-            self.used_mask |= taint.used_mask
-        if self.ignored_mask is None:
-            self.ignored_mask = taint.ignored_mask
-        else:
-            self.ignored_mask |= taint.ignored_mask
-
-    def _bits_from_mask(self, mask, width):
-        if mask is None or width is None:
-            return []
-        return [i for i in range(width) if mask & (1 << i)]
-
-    def to_ndjson(self):
-        base = {
-            "key": self.key_string,
-            "hive": self.hive,
-            "subkey": self.subkey,
-            "value_name": self.value_name,
-            "api_calls": [c.to_dict() for c in self.api_calls],
-            "decisions": [d.to_dict() for d in self.decisions],
-            "bit_usage": {
-                "width": self.width,
-                "used_bits": self._bits_from_mask(self.used_mask, self.width),
-                "ignored_bits": self._bits_from_mask(self.ignored_mask, self.width),
-            } if self.width else None,
-        }
-        if self.extended:
-            base["extended"] = self.extended
-        return base
-
-    def to_markdown(self):
-        lines = ["### %s" % self.key_string, ""]
-        lines.append("* Hive: %s" % (self.hive or ""))
-        lines.append("* Subkey: %s" % (self.subkey or ""))
-        lines.append("* Value: %s" % (self.value_name or ""))
-        if self.width:
-            lines.append("* Width: %d" % self.width)
-            lines.append("* Used bits: %s" % self._bits_from_mask(self.used_mask, self.width))
-            lines.append("* Ignored bits: %s" % self._bits_from_mask(self.ignored_mask, self.width))
-        if self.api_calls:
-            lines.append("* API calls:")
-            for call in self.api_calls:
-                lines.append("  - %s at %s (%s)" % (call.api_name, call.addr, call.func_name))
-        if self.decisions:
-            lines.append("* Decision points:")
-            for dec in self.decisions:
-                lines.append("  - %s using bits %s" % (
-                    dec.addr,
-                    dec._bits_from_mask(dec.taint_record.used_mask, dec.taint_record.width),
-                ))
-        if self.extended.get("unreferenced_seed"):
-            lines.append("* Warning: seed not tied to any call")
-        lines.append("")
-        return "\n".join(lines)
-
+try:
+    from ghidra import currentProgram
+    from ghidra.program.flatapi import FlatProgramAPI
+    from ghidra.program.model.block import BasicBlockModel
+    from ghidra.program.model.pcode import PcodeOp
+except Exception:  # pragma: no cover - executed inside Ghidra
+    currentProgram = None
+    FlatProgramAPI = None
+    BasicBlockModel = None
+    PcodeOp = None
 
 # ---------------------------------------------------------------------------
-# Main script implementation
+# Argument parsing and logging
 # ---------------------------------------------------------------------------
 
-class RegistryKeyBitfieldReport(object):
-    REGEX_REGISTRY_STRING = re.compile(
-        r"(HKLM|HKEY_LOCAL_MACHINE|HKCU|HKEY_CURRENT_USER|HKCR|HKEY_CLASSES_ROOT|HKU|HKCC|HKEY_CURRENT_CONFIG)",
-        re.IGNORECASE,
-    )
-    GUID_PATTERN = re.compile(r"\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}")
-    URL_PATTERN = re.compile(r"^[a-zA-Z]+://")
-    DEFAULT_DEPTH = 256
-    X64_FASTCALL_ORDER = ["RCX", "RDX", "R8", "R9"]
 
-    def __init__(self, program, monitor=None, args=None):
-        self.currentProgram = program
-        self.monitor = monitor or ConsoleTaskMonitor()
-        self.args = self._parse_args(args)
-        self._comparison_ops = self._build_comparison_ops()
-
-    def run(self):
-        # Defensive guard for execution
-        if self.currentProgram is None:
-            print("No active program; aborting.")
-            return
-
-        self.monitor.setMessage("RegistryKeyBitfieldReport running...")
-        self.api = FlatProgramAPI(self.currentProgram, self.monitor)
-        self.string_index = {}
-        self.registry_infos = {}
-        self.func_summaries = {}
-        self.call_depths = {}
-        self.pattern_cache = None
-        self.seeds_seen = set()
-        self.output_dir = self._get_output_dir()
-        try:
-            if not os.path.isdir(self.output_dir):
-                os.makedirs(self.output_dir)
-        except Exception:
-            pass
-
-        self._log("Collecting registry strings...")
-        self._collect_registry_strings()
-        self._log("Building API pattern registry...")
-        self._build_api_pattern_registry()
-        self._log("Scanning registry APIs...")
-        self._scan_registry_calls()
-        self._log("Running program-wide analysis...")
-        self._analyze_program()
-        self._log("Verifying seed coverage...")
-        self._mark_unreferenced_seeds()
-        self._log("Writing outputs...")
-        self._write_outputs()
-        self._log("Done.")
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-    def _build_comparison_ops(self):
-        comparison_names = [
-            "INT_EQUAL",
-            "INT_NOTEQUAL",
-            "INT_LESS",
-            "INT_LESSEQUAL",
-            "INT_SLESS",
-            "INT_SLESSEQUAL",
-            "INT_SGE",
-            "INT_SGREATER",
-            "INT_GE",
-            "INT_GREATER",
-        ]
-        ops = []
-        for name in comparison_names:
-            if hasattr(PcodeOp, name):
-                ops.append(getattr(PcodeOp, name))
-        return tuple(ops)
-
-    def _parse_args(self, overrides=None):
-        defaults = {
-            "depth": self.DEFAULT_DEPTH,
-            "debug": False,
-            "debug_trace": False,
-            "output_dir": None,
-            "additional_apis": "",
-        }
-        args = defaults.copy()
-        if overrides:
-            for key, value in overrides.items():
-                if key not in args or value is None:
-                    continue
-                if key == "depth":
-                    try:
-                        args[key] = int(value)
-                    except Exception:
-                        pass
-                elif key in ("debug", "debug_trace"):
-                    if isinstance(value, str):
-                        args[key] = value.strip().lower() in ("1", "true", "yes", "on")
-                    else:
-                        args[key] = bool(value)
-                elif key in ("output_dir", "additional_apis"):
-                    args[key] = value
-        return args
-
-    def _get_output_dir(self):
-        custom = self.args.get("output_dir")
-        if custom:
-            return os.path.abspath(custom)
-        home = os.path.expanduser("~")
-        program_name = self.currentProgram.getName() if self.currentProgram else "program"
-        return os.path.abspath(os.path.join(home, "regkeys", program_name))
-
-    def _log(self, msg):
-        if self.args.get("debug"):
-            print(msg)
-
-    def _trace(self, msg):
-        if self.args.get("debug_trace"):
-            print(msg)
-
-    # ------------------------------------------------------------------
-    # Registry string collection
-    # ------------------------------------------------------------------
-    def _collect_registry_strings(self):
-        listing = self.currentProgram.getListing()
-        data_iter = listing.getDefinedData(True)
-        while data_iter.hasNext():
-            if self.monitor.isCancelled():
-                break
-            data = data_iter.next()
-            try:
-                if data.hasStringValue():
-                    s = str(data.getValue())
-                else:
-                    continue
-            except Exception:
-                continue
-            if not s:
-                continue
-            if self._is_registry_like_string(s):
-                addr = data.getMinAddress()
-                self.string_index[addr] = s
-                if s not in self.registry_infos:
-                    self.registry_infos[s] = RegistryKeyInfo(s)
-        self._log("Indexed %d registry-like strings" % len(self.string_index))
-
-    def _is_registry_like_string(self, s):
-        if not s or len(s) < 3:
-            return False
-        if self.URL_PATTERN.match(s):
-            return False
-        if "\\" not in s:
-            return False
-        if not self.REGEX_REGISTRY_STRING.search(s):
-            return False
-        return True
-
-    # ------------------------------------------------------------------
-    # API registry
-    # ------------------------------------------------------------------
-    def _build_api_pattern_registry(self):
-        # Build a regex that covers discovered external symbols and defaults
-        names = set()
-        external_manager = self.currentProgram.getExternalManager()
-        try:
-            symbols = external_manager.getExternalSymbols()
-            while symbols.hasNext():
-                sym = symbols.next()
-                nm = sym.getLabel()
-                if nm:
-                    names.add(nm)
-        except Exception:
-            pass
-        default_patterns = [r"Reg.*", r"Nt.*", r"Zw.*", r"Rtl.*", r"Cm.*"]
-        if self.args.get("additional_apis"):
-            default_patterns.append(self.args["additional_apis"])
-        combined = "|".join(default_patterns + [re.escape(n) for n in names if self._looks_registry_api(n)])
-        try:
-            self.pattern_cache = re.compile("^(%s)" % combined, re.IGNORECASE)
-        except Exception:
-            self.pattern_cache = re.compile(r"^(Reg.*|Nt.*|Zw.*|Rtl.*|Cm.*)", re.IGNORECASE)
-
-    def _looks_registry_api(self, name):
-        low = name.lower()
-        return low.startswith("reg") or low.startswith("nt") or low.startswith("zw") or "registry" in low or "cm" in low
-
-    def _is_registry_api(self, name):
-        if not name:
-            return False
-        if self.pattern_cache and self.pattern_cache.match(name):
-            return True
+def _parse_bool(val: str) -> bool:
+    if val is None:
         return False
-
-    # ------------------------------------------------------------------
-    # API call scanning
-    # ------------------------------------------------------------------
-    def _scan_registry_calls(self):
-        fm = self.currentProgram.getFunctionManager()
-        functions = fm.getFunctions(True)
-        for func in functions:
-            if self.monitor.isCancelled():
-                break
-            inst_iter = self.currentProgram.getListing().getInstructions(func.getBody(), True)
-            while inst_iter.hasNext():
-                if self.monitor.isCancelled():
-                    break
-                inst = inst_iter.next()
-                if not inst.getFlowType().isCall():
-                    continue
-                callee_name = self._resolve_callee_name(inst, fm)
-                if not self._is_registry_api(callee_name):
-                    continue
-                key_info, resolved_key = self._resolve_call_key(inst)
-                api_call = ApiCallSite(inst.getMinAddress(), func.getName(), callee_name, "call")
-                api_call.resolved_key = resolved_key
-                api_call.extended = self._capture_call_arguments(inst)
-                if key_info is not None:
-                    key_info.add_api_call(api_call)
-                elif resolved_key:
-                    info = self.registry_infos.get(resolved_key)
-                    if info is None:
-                        info = RegistryKeyInfo(resolved_key)
-                        self.registry_infos[resolved_key] = info
-                    info.add_api_call(api_call)
-        self._log("Finished scanning registry API call sites")
-
-    def _resolve_callee_name(self, inst, fm):
-        refs = inst.getReferencesFrom()
-        callee_name = None
-        for ref in refs:
-            if ref.getReferenceType().isCall():
-                callee_func = fm.getFunctionAt(ref.getToAddress())
-                if callee_func:
-                    callee_name = callee_func.getName()
-                else:
-                    sym = self.api.getSymbolAt(ref.getToAddress())
-                    if sym:
-                        callee_name = sym.getName()
-                break
-        return callee_name
-
-    def _resolve_call_key(self, inst):
-        refs = inst.getReferencesFrom()
-        for ref in refs:
-            to_addr = ref.getToAddress()
-            if to_addr in self.string_index:
-                s = self.string_index[to_addr]
-                return self.registry_infos.get(s), s
-        try:
-            pcode = inst.getPcode()
-        except Exception:
-            return None, None
-        for op in pcode:
-            if op is None:
-                continue
-            for i in range(op.getNumInputs()):
-                vn = op.getInput(i)
-                addr = None
-                if vn.isConstant():
-                    try:
-                        addr = self.api.toAddr(vn.getOffset())
-                    except Exception:
-                        addr = None
-                elif vn.isAddress():
-                    addr = vn.getAddress()
-                if addr in self.string_index:
-                    s = self.string_index[addr]
-                    return self.registry_infos.get(s), s
-        return None, None
-
-    def _capture_call_arguments(self, inst):
-        args = {}
-        try:
-            pcode = inst.getPcode()
-        except Exception:
-            return args
-        for op in pcode:
-            if op.getOpcode() in (PcodeOp.CALL, PcodeOp.CALLIND):
-                for idx in range(op.getNumInputs()):
-                    vn = op.getInput(idx)
-                    try:
-                        args[idx] = str(vn)
-                    except Exception:
-                        pass
-        return args
-
-    # ------------------------------------------------------------------
-    # Analysis engine
-    # ------------------------------------------------------------------
-    def _analyze_program(self):
-        fm = self.currentProgram.getFunctionManager()
-        func_iter = fm.getFunctions(True)
-        for func in func_iter:
-            if self.monitor.isCancelled():
-                break
-            self._analyze_function(func, depth=0, incoming_state={})
-
-    def _analyze_function(self, func, depth, incoming_state):
-        if func is None:
-            return {}
-        if depth > self.args.get("depth", self.DEFAULT_DEPTH):
-            return {}
-        func_key = func.getEntryPoint()
-        prev_depth = self.call_depths.get(func_key)
-        if prev_depth is not None and prev_depth <= depth:
-            return self.func_summaries.get(func_key, {})
-        self.call_depths[func_key] = depth
-
-        listing = self.currentProgram.getListing()
-        bbm = BasicBlockModel(self.currentProgram)
-        try:
-            blocks_iter = bbm.getCodeBlocksContaining(func.getBody(), self.monitor)
-            blocks = [b for b in blocks_iter]
-        except Exception:
-            blocks = []
-        if not blocks:
-            blocks = self._fallback_blocks(func)
-
-        block_states_in = {}
-        worklist = deque()
-        for blk in blocks:
-            block_states_in[blk] = dict(incoming_state)
-            worklist.append(blk)
-
-        iteration_guard = 0
-        max_iter = max(len(blocks) * 32, 128)
-
-        while worklist:
-            if self.monitor.isCancelled():
-                break
-            blk = worklist.popleft()
-            iteration_guard += 1
-            if iteration_guard > max_iter:
-                break
-            state = dict(block_states_in.get(blk, {}))
-            inst_iter = listing.getInstructions(blk, True)
-            last_inst = None
-            while inst_iter.hasNext():
-                if self.monitor.isCancelled():
-                    break
-                inst = inst_iter.next()
-                last_inst = inst
-                self._propagate_taint(inst, state, func, depth)
-            dest_iter = None
-            try:
-                dest_iter = blk.getDestinations(self.monitor)
-            except Exception:
-                dest_iter = None
-
-            if dest_iter is not None:
-                while dest_iter.hasNext():
-                    succ = dest_iter.next()
-                    succ_block = succ.getDestinationBlock()
-                    if succ_block is None:
-                        continue
-                    prev_state = block_states_in.get(succ_block)
-                    merged = self._merge_states(prev_state, state)
-                    if merged != prev_state:
-                        block_states_in[succ_block] = merged
-                        worklist.append(succ_block)
-            if last_inst is not None:
-                self._capture_decision(last_inst, state, func)
-
-        self.func_summaries[func_key] = {"__ret__": self._summarize_return(func, block_states_in)}
-        return self.func_summaries[func_key]
-
-    def _fallback_blocks(self, func):
-        try:
-            bb = BasicBlockModel(self.currentProgram)
-            return [bb.getCodeBlockAt(func.getEntryPoint(), self.monitor)]
-        except Exception:
-            return []
-
-    def _merge_states(self, prev_state, new_state):
-        if prev_state is None:
-            return dict(new_state)
-        merged = dict(prev_state)
-        changed = False
-        for k, v in new_state.items():
-            if k not in merged:
-                merged[k] = v
-                changed = True
-            else:
-                m = merged[k].merge(v)
-                if m.used_mask != merged[k].used_mask or m.ignored_mask != merged[k].ignored_mask:
-                    merged[k] = m
-                    changed = True
-        return merged if changed else prev_state
-
-    def _propagate_taint(self, inst, state, func, depth):
-        try:
-            pcode = inst.getPcode()
-        except Exception:
-            pcode = []
-        for op in pcode:
-            opc = op.getOpcode()
-            if opc in (PcodeOp.COPY, PcodeOp.INT_ADD, PcodeOp.INT_SUB, PcodeOp.PTRSUB, PcodeOp.PTRADD, PcodeOp.CAST, PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT, PcodeOp.MULTIEQUAL):
-                self._taint_copy(op, state)
-            elif opc in (PcodeOp.LOAD,):
-                self._seed_from_string_load(op, state)
-            elif opc in (PcodeOp.STORE,):
-                self._taint_store(op, state)
-            elif opc in (PcodeOp.BOOL_AND, PcodeOp.BOOL_OR, PcodeOp.BOOL_XOR, PcodeOp.INT_AND, PcodeOp.INT_OR, PcodeOp.INT_XOR, PcodeOp.INT_LEFT, PcodeOp.INT_RIGHT, PcodeOp.INT_SRIGHT, PcodeOp.INT_NEGATE):
-                self._taint_bitwise(op, state)
-            elif opc in self._comparison_ops:
-                self._taint_compare(op, state)
-            elif opc in (PcodeOp.CALL, PcodeOp.CALLIND):
-                self._handle_call(op, state, func, depth)
-            elif opc == PcodeOp.RETURN:
-                pass
-        self._assembly_fallback(inst, state)
-
-    def _taint_copy(self, op, state):
-        dest = op.getOutput()
-        if dest is None:
-            return
-        src = op.getInput(0) if op.getNumInputs() > 0 else None
-        if src is None:
-            return
-        tr = state.get(self._varnode_key(src))
-        if tr:
-            state[self._varnode_key(dest)] = tr.clone()
-
-    def _taint_store(self, op, state):
-        if op.getNumInputs() < 3:
-            return
-        val = op.getInput(2)
-        ptr = op.getInput(1)
-        tr = state.get(self._varnode_key(val))
-        if tr and ptr is not None:
-            slot = self._pointer_slot(ptr)
-            if slot:
-                state[slot] = tr.clone()
-
-    def _taint_bitwise(self, op, state):
-        dest = op.getOutput()
-        if dest is None:
-            return
-        inp0 = op.getInput(0) if op.getNumInputs() > 0 else None
-        inp1 = op.getInput(1) if op.getNumInputs() > 1 else None
-        base_tr = state.get(self._varnode_key(inp0)) or state.get(self._varnode_key(inp1))
-        if base_tr is None:
-            return
-        tr = base_tr.clone()
-        opc = op.getOpcode()
-        if inp1 is not None and inp1.isConstant():
-            const = inp1.getOffset()
-            if opc == PcodeOp.INT_AND:
-                tr.apply_and(const, str(op))
-            elif opc == PcodeOp.INT_OR:
-                tr.apply_or(const, str(op))
-            elif opc == PcodeOp.INT_XOR:
-                tr.apply_xor(const, str(op))
-            elif opc in (PcodeOp.INT_LEFT, PcodeOp.INT_RIGHT, PcodeOp.INT_SRIGHT):
-                tr.apply_shift(const, "l" if opc == PcodeOp.INT_LEFT else "r", str(op))
-        elif opc == PcodeOp.INT_NEGATE:
-            tr.apply_not(str(op))
-        tr.history.append(("bitop", opc, str(op)))
-        state[self._varnode_key(dest)] = tr
-
-    def _taint_compare(self, op, state):
-        dest = op.getOutput()
-        if dest is None:
-            return
-        inp0 = op.getInput(0) if op.getNumInputs() > 0 else None
-        inp1 = op.getInput(1) if op.getNumInputs() > 1 else None
-        tr = state.get(self._varnode_key(inp0)) or state.get(self._varnode_key(inp1))
-        if tr is None:
-            return
-        clone = tr.clone()
-        if inp0 is not None and inp0.isConstant():
-            clone.mark_compare(inp0.getOffset(), str(op))
-        elif inp1 is not None and inp1.isConstant():
-            clone.mark_compare(inp1.getOffset(), str(op))
-        clone.history.append(("cmp", str(op), None))
-        state[self._varnode_key(dest)] = clone
-
-    def _seed_from_string_load(self, op, state):
-        if op.getOpcode() not in (PcodeOp.LOAD, PcodeOp.COPY):
-            return
-        dest = op.getOutput()
-        pointer = None
-        if op.getOpcode() == PcodeOp.LOAD and op.getNumInputs() > 1:
-            pointer = op.getInput(1)
-        elif op.getOpcode() == PcodeOp.COPY and op.getNumInputs() > 0:
-            pointer = op.getInput(0)
-        if dest is None or pointer is None:
-            return
-        addr = None
-        if pointer.isConstant():
-            try:
-                addr = self.api.toAddr(pointer.getOffset())
-            except Exception:
-                addr = None
-        elif pointer.isAddress():
-            addr = pointer.getAddress()
-        if addr and addr in self.string_index:
-            key_str = self.string_index[addr]
-            self.seeds_seen.add(key_str)
-            key_info = self.registry_infos.get(key_str)
-            if key_info is None:
-                key_info = RegistryKeyInfo(key_str)
-                self.registry_infos[key_str] = key_info
-            tr = TaintRecord(key_info, width=max(dest.getSize() * 8, 8))
-            tr.history.append(("seed-string", key_str, str(op)))
-            state[self._varnode_key(dest)] = tr
-
-    def _handle_call(self, op, state, func, depth):
-        callee_func = None
-        callee_name = None
-        fm = self.currentProgram.getFunctionManager()
-        if op.getOpcode() == PcodeOp.CALL and op.getNumInputs() > 0:
-            callee_addr = op.getInput(0).getAddress()
-            callee_func = fm.getFunctionAt(callee_addr)
-            callee_name = callee_func.getName() if callee_func else None
-        elif op.getOpcode() == PcodeOp.CALLIND:
-            callee_func, callee_name = self._resolve_indirect_callee(op, fm)
-
-        arg_taints = []
-        for i in range(1, op.getNumInputs()):
-            vn = op.getInput(i)
-            arg_taints.append(state.get(self._varnode_key(vn)))
-        dest = op.getOutput()
-
-        if callee_name and self._is_registry_api(callee_name):
-            tr = self._seed_taint_from_registry_call(callee_name, op, arg_taints, dest, state)
-            if tr and dest is not None:
-                state[self._varnode_key(dest)] = tr
-            if tr and callee_func is not None:
-                self._taint_return_to_callers(func, tr)
-            return
-
-        if callee_func and (dest is not None or any(arg_taints)):
-            entry_state = {}
-            for idx in range(min(len(arg_taints), len(self.X64_FASTCALL_ORDER))):
-                reg_name = self.X64_FASTCALL_ORDER[idx]
-                vn_key = ("register", reg_name, None)
-                tr = arg_taints[idx]
-                if tr:
-                    entry_state[vn_key] = tr.clone()
-            if depth < self.args.get("depth", self.DEFAULT_DEPTH):
-                callee_summary = self._analyze_function(callee_func, depth + 1, entry_state)
-                ret_taint = self._taint_from_summary(callee_summary)
-                if ret_taint and dest is not None:
-                    state[self._varnode_key(dest)] = ret_taint.clone()
-            elif any(arg_taints) and dest is not None:
-                state[self._varnode_key(dest)] = arg_taints[0].clone()
-
-    def _resolve_indirect_callee(self, call_op, fm):
-        inst_addr = call_op.getSeqnum().getTarget()
-        inst = self.api.getInstructionAt(inst_addr)
-        callee_name = None
-        func = None
-        if inst:
-            refs = inst.getReferencesFrom()
-            for ref in refs:
-                if ref.getReferenceType().isCall():
-                    func = fm.getFunctionAt(ref.getToAddress())
-                    if func:
-                        callee_name = func.getName()
-                    else:
-                        sym = self.api.getSymbolAt(ref.getToAddress())
-                        if sym:
-                            callee_name = sym.getName()
-                    break
-        return func, callee_name
-
-    def _seed_taint_from_registry_call(self, name, call_op, arg_taints, out_vn, state):
-        base_tr = None
-        for tr in arg_taints:
-            if tr is not None:
-                base_tr = tr
-                break
-        if base_tr is None:
-            resolved = self._resolve_constant_string(call_op)
-            if resolved:
-                info = self.registry_infos.get(resolved)
-                if info is None:
-                    info = RegistryKeyInfo(resolved)
-                    self.registry_infos[resolved] = info
-                base_tr = TaintRecord(info, width=32, source="registry-api")
-                base_tr.history.append(("api-seed", name, resolved))
-        if base_tr is None:
-            synthetic = "unknown:%s@%s" % (name, call_op.getSeqnum().getTarget())
-            info = self.registry_infos.get(synthetic)
-            if info is None:
-                info = RegistryKeyInfo(synthetic)
-                self.registry_infos[synthetic] = info
-            base_tr = TaintRecord(info, width=32, source="registry-api")
-            base_tr.history.append(("api-synthetic", name, None))
-        if out_vn is not None:
-            return base_tr.clone()
-        return None
-
-    def _resolve_constant_string(self, call_op, arg_index=None):
-        for op in [call_op]:
-            for i in range(op.getNumInputs()):
-                if arg_index is not None and i != arg_index:
-                    continue
-                vn = op.getInput(i)
-                addr = None
-                if vn.isConstant():
-                    try:
-                        addr = self.api.toAddr(vn.getOffset())
-                    except Exception:
-                        addr = None
-                elif vn.isAddress():
-                    addr = vn.getAddress()
-                if addr in self.string_index:
-                    return self.string_index[addr]
-        return None
-
-    def _taint_return_to_callers(self, func, tr):
-        if func is None or tr is None:
-            return
-        func_key = func.getEntryPoint()
-        summary = self.func_summaries.get(func_key)
-        if summary is None:
-            self.func_summaries[func_key] = {"__ret__": tr.clone()}
-        else:
-            summary["__ret__"] = tr.clone()
-
-    def _taint_from_summary(self, summary):
-        if summary is None:
-            return None
-        if isinstance(summary, dict):
-            return summary.get("__ret__")
-        return None
-
-    def _collect_operand_objects(self, inst):
-        objs = []
-        if not hasattr(inst, "getNumOperands") or not hasattr(inst, "getOpObjects"):
-            return objs
-        try:
-            count = inst.getNumOperands()
-        except Exception:
-            count = 0
-        for idx in range(count):
-            try:
-                objs.extend(inst.getOpObjects(idx) or [])
-            except TypeError:
-                # Some instruction adapters require a concrete operand index; skip invalid requests.
-                continue
-            except Exception:
-                continue
-        return objs
-
-    def _assembly_fallback(self, inst, state):
-        if not isinstance(inst, Instruction):
-            return
-        mnem = inst.getMnemonicString().upper()
-        ops = [str(op) for op in self._collect_operand_objects(inst)]
-        if mnem in ("TEST", "CMP") and len(ops) >= 2:
-            try:
-                mask = int(str(ops[1]).replace("0x", ""), 16)
-            except Exception:
-                return
-            src_vn = inst.getDefaultOperandRepresentationList()[0] if hasattr(inst, "getDefaultOperandRepresentationList") else None
-            if src_vn is None:
-                return
-            vn_key = ("asm", inst.getMinAddress(), 0)
-            tr = state.get(vn_key)
-            if tr:
-                tr.mark_compare(mask, "asm-%s" % mnem)
-                tr.history.append(("asm-cmp", mnem, mask))
-        if mnem in ("SHL", "SAL", "SHR", "SAR") and len(ops) >= 2:
-            try:
-                bits = int(str(ops[1]).replace("0x", ""), 16)
-            except Exception:
-                return
-            for k, tr in list(state.items()):
-                if isinstance(k, tuple) and k[0] == "asm" and k[1] == inst.getMinAddress():
-                    tr.apply_shift(bits, "l" if mnem in ("SHL", "SAL") else "r", "asm-shift")
-
-    def _capture_decision(self, inst, state, func):
-        flow = inst.getFlowType()
-        if not flow.isConditional():
-            return
-        pcode = []
-        try:
-            pcode = inst.getPcode()
-        except Exception:
-            pass
-        for op in pcode:
-            if op.getOpcode() in (PcodeOp.CBRANCH, PcodeOp.BRANCHIND, PcodeOp.BRANCH):
-                cond_vn = op.getInput(1) if op.getNumInputs() > 1 else None
-                taint = state.get(self._varnode_key(cond_vn)) if cond_vn else None
-                if taint is None:
-                    continue
-                dp = DecisionPoint(inst.getMinAddress(), str(inst), taint.clone(), func_name=func.getName())
-                taint.key_info.add_decision(dp)
-                taint.key_info.update_masks(taint)
-
-    # ------------------------------------------------------------------
-    # Seed coverage check
-    # ------------------------------------------------------------------
-    def _mark_unreferenced_seeds(self):
-        for key_str, info in self.registry_infos.items():
-            if key_str not in self.seeds_seen:
-                if not info.api_calls and not info.decisions:
-                    info.extended["unreferenced_seed"] = True
-
-    # ------------------------------------------------------------------
-    # Output
-    # ------------------------------------------------------------------
-    def _write_outputs(self):
-        program_name = self.currentProgram.getName() if self.currentProgram else "program"
-        ndjson_path = os.path.join(self.output_dir, "%s.registry_bitfields.ndjson" % program_name)
-        md_path = os.path.join(self.output_dir, "%s.registry_bitfields.md" % program_name)
-        try:
-            with open(ndjson_path, "w") as f:
-                for key in sorted(self.registry_infos.keys()):
-                    info = self.registry_infos[key]
-                    f.write(json.dumps(info.to_ndjson()))
-                    f.write("\n")
-        except Exception as e:
-            self._log("Failed to write NDJSON: %s" % e)
-        try:
-            with open(md_path, "w") as f:
-                f.write("# Registry Bitfield Report\n\n")
-                for key in sorted(self.registry_infos.keys()):
-                    info = self.registry_infos[key]
-                    f.write(info.to_markdown())
-                    f.write("\n")
-        except Exception as e:
-            self._log("Failed to write Markdown: %s" % e)
-
-    # ------------------------------------------------------------------
-    # Helper utilities
-    # ------------------------------------------------------------------
-    def _varnode_key(self, vn):
-        if vn is None:
-            return None
-        try:
-            if vn.isRegister():
-                return ("register", vn.getAddress(), vn.getSize())
-            if vn.isConstant():
-                return ("const", vn.getOffset(), vn.getSize())
-            if vn.isUnique():
-                return ("unique", vn.getOffset(), vn.getSize())
-            if vn.isAddrTied():
-                return ("ram", vn.getAddress(), vn.getSize())
-        except Exception:
-            pass
-        return ("vn", str(vn), None)
-
-    def _pointer_slot(self, vn):
-        if vn is None:
-            return None
-        try:
-            if vn.isConstant():
-                return ("ptr", ("const", vn.getOffset()), vn.getSize())
-            if vn.isAddress():
-                return ("ptr", ("addr", vn.getAddress().getOffset()), vn.getSize())
-        except Exception:
-            pass
-        return None
-
-    def _is_return_flow(self, flow_type):
-        if flow_type is None:
-            return False
-        try:
-            checker = getattr(flow_type, "isReturn", None)
-            if checker is not None:
-                return checker()
-        except Exception:
-            pass
-        try:
-            if flow_type == FlowType.RETURN:
-                return True
-        except Exception:
-            pass
-        try:
-            return flow_type.isTerminal() and not flow_type.isCall()
-        except Exception:
-            return False
-
-    def _summarize_return(self, func, block_states):
-        # Try to find a tainted register used at RET
-        ret_tr = None
-        ep = func.getEntryPoint()
-        listing = self.currentProgram.getListing()
-        inst_iter = listing.getInstructions(func.getBody(), True)
-        last_ret = None
-        while inst_iter.hasNext():
-            inst = inst_iter.next()
-            try:
-                flow_type = inst.getFlowType()
-            except Exception:
-                flow_type = None
-            if self._is_return_flow(flow_type):
-                last_ret = inst
-                break
-        if last_ret is None:
-            return None
-        try:
-            pcode = last_ret.getPcode()
-        except Exception:
-            pcode = []
-        for op in pcode:
-            if op.getOpcode() == PcodeOp.RETURN and op.getNumInputs() > 1:
-                vn = op.getInput(1)
-                for blk, st in block_states.items():
-                    tr = st.get(self._varnode_key(vn))
-                    if tr:
-                        if ret_tr is None:
-                            ret_tr = tr.clone()
-                        else:
-                            ret_tr = ret_tr.merge(tr)
-        return ret_tr
+    val = val.strip().lower()
+    return val in {"1", "true", "yes", "on"}
 
 
-def parse_cli_args():
-    parser = argparse.ArgumentParser(description="Registry key bitfield analysis (PyGhidra)")
-    parser.add_argument("binary", nargs="?", help="Path to the binary to analyze")
-    parser.add_argument("--depth", type=int, default=RegistryKeyBitfieldReport.DEFAULT_DEPTH, help="Maximum call depth")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument("--debug-trace", action="store_true", dest="debug_trace", help="Enable trace logging")
-    parser.add_argument("--output-dir", dest="output_dir", help="Output directory for reports")
-    parser.add_argument("--additional-apis", dest="additional_apis", default="", help="Additional API name regex pattern")
-    return parser.parse_args()
-
-
-def parse_script_args():
-    """Parse key/value arguments provided by Ghidra's Script Manager or analyzeHeadless."""
-
-    raw_args = []
-    getter = globals().get("getScriptArgs")
-    if callable(getter):
-        try:
-            raw_args = getter() or []
-        except Exception:
-            raw_args = []
-    elif "scriptArgs" in globals():
-        try:
-            raw_args = globals().get("scriptArgs") or []
-        except Exception:
-            raw_args = []
-
-    parsed = {}
-    for entry in raw_args:
-        if entry is None:
+def parse_args(raw_args: List[str]) -> Dict[str, Any]:
+    parsed: Dict[str, Any] = {}
+    for arg in raw_args:
+        if "=" not in arg:
             continue
-        text = str(entry)
-        if "=" in text:
-            key, value = text.split("=", 1)
-        else:
-            key, value = text, "true"
-        key = key.strip().replace("-", "_")
-        parsed[key] = value.strip()
+        k, v = arg.split("=", 1)
+        parsed[k.strip().lower()] = v
+    if "mode" not in parsed or parsed["mode"] not in {"taint", "full"}:
+        print("[error] mode argument missing or invalid (expected mode=taint|full)")
+        sys.exit(1)
+    parsed["debug"] = _parse_bool(parsed.get("debug", "false"))
+    parsed["trace"] = _parse_bool(parsed.get("trace", "false"))
     return parsed
 
 
-def get_active_program():
-    """Return the current Ghidra program when running inside the UI."""
-
-    program = globals().get("currentProgram")
-    if program is not None:
-        return program
-
-    state = globals().get("state")
-    try:
-        if state is not None:
-            program = state.getCurrentProgram()
-            if program is not None:
-                globals()["currentProgram"] = program
-                return program
-    except Exception:
-        pass
-
-    try:
-        get_state = globals().get("getState")
-        if callable(get_state):
-            program = get_state().getCurrentProgram()
-            if program is not None:
-                globals()["currentProgram"] = program
-                return program
-    except Exception:
-        pass
-
-    return None
+args = parse_args(sys.argv[1:]) if len(sys.argv) > 1 else {}
+DEBUG_ENABLED = args.get("debug", False)
+TRACE_ENABLED = args.get("trace", False)
 
 
-# Entry point for Ghidra headless compatibility
-if __name__ == "__main__":
-    # When running inside the Ghidra Script Manager, attempt to locate the
-    # active program through common bindings before falling back to CLI args.
-    active_program = get_active_program()
-    if active_program is not None:
-        monitor = ConsoleTaskMonitor()
-        monitor.setMessage("RegistryKeyBitfieldReport initializing...")
-        script_args = parse_script_args()
-        script = RegistryKeyBitfieldReport(active_program, monitor=monitor, args=script_args)
-        script.run()
-    else:
-        cli_args = parse_cli_args()
-        if not cli_args.binary:
-            raise SystemExit("binary path is required when running outside Ghidra")
+def log_info(msg: str) -> None:
+    print(msg)
 
-        from pyghidra import open_program
 
-        arg_dict = {
-            "depth": cli_args.depth,
-            "debug": cli_args.debug,
-            "debug_trace": cli_args.debug_trace,
-            "output_dir": cli_args.output_dir,
-            "additional_apis": cli_args.additional_apis,
+def log_debug(msg: str) -> None:
+    if DEBUG_ENABLED:
+        print(msg)
+
+
+def log_trace(msg: str) -> None:
+    if TRACE_ENABLED:
+        print(msg)
+
+
+if currentProgram is None:
+    print("RegistryKeyBitfieldReport must be run under PyGhidra (currentProgram required).")
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Abstract domain data structures
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PointerPattern:
+    base_id: Optional[str] = None
+    offset: Optional[int] = None
+    stride: Optional[int] = None
+    index_var: Optional[Any] = None
+    unknown: bool = False
+
+    def adjust_offset(self, delta: int) -> None:
+        if self.offset is None:
+            self.offset = delta
+        else:
+            self.offset += delta
+
+    def clone(self) -> "PointerPattern":
+        return PointerPattern(
+            base_id=self.base_id,
+            offset=self.offset,
+            stride=self.stride,
+            index_var=self.index_var,
+            unknown=self.unknown,
+        )
+
+    def merge(self, other: "PointerPattern") -> "PointerPattern":
+        if other is None:
+            return self
+        if self.unknown or other.unknown:
+            return PointerPattern(base_id=self.base_id or other.base_id, unknown=True)
+        if self.base_id != other.base_id:
+            return PointerPattern(base_id=self.base_id or other.base_id, unknown=True)
+        merged = PointerPattern(base_id=self.base_id)
+        merged.offset = self.offset if self.offset == other.offset else None
+        merged.stride = self.stride if self.stride == other.stride else None
+        merged.index_var = self.index_var if self.index_var == other.index_var else None
+        merged.unknown = merged.offset is None or merged.stride is None or merged.index_var is None
+        return merged
+
+
+@dataclass
+class AbstractValue:
+    tainted: bool = False
+    origins: Set[str] = field(default_factory=set)
+    bit_width: int = 32
+    used_bits: Set[int] = field(default_factory=set)
+    candidate_bits: Set[int] = field(default_factory=set)
+    pointer_pattern: Optional[PointerPattern] = None
+
+    def clone(self) -> "AbstractValue":
+        return AbstractValue(
+            tainted=self.tainted,
+            origins=set(self.origins),
+            bit_width=self.bit_width,
+            used_bits=set(self.used_bits),
+            candidate_bits=set(self.candidate_bits),
+            pointer_pattern=self.pointer_pattern.clone() if self.pointer_pattern else None,
+        )
+
+    def mark_bits_used(self, mask: int) -> None:
+        for i in range(self.bit_width):
+            if mask & (1 << i):
+                self.candidate_bits.add(i)
+                self.used_bits.add(i)
+
+    def mark_all_bits_used(self) -> None:
+        for i in range(self.bit_width):
+            self.candidate_bits.add(i)
+            self.used_bits.add(i)
+
+    def merge(self, other: "AbstractValue") -> "AbstractValue":
+        if other is None:
+            return self
+        merged = AbstractValue()
+        merged.tainted = self.tainted or other.tainted
+        merged.origins = set(self.origins | other.origins)
+        merged.bit_width = max(self.bit_width, other.bit_width)
+        merged.used_bits = set(self.used_bits | other.used_bits)
+        merged.candidate_bits = set(self.candidate_bits | other.candidate_bits)
+        if self.pointer_pattern and other.pointer_pattern:
+            merged.pointer_pattern = self.pointer_pattern.merge(other.pointer_pattern)
+        elif self.pointer_pattern:
+            merged.pointer_pattern = self.pointer_pattern.clone()
+        elif other.pointer_pattern:
+            merged.pointer_pattern = other.pointer_pattern.clone()
+        else:
+            merged.pointer_pattern = None
+        return merged
+
+
+@dataclass
+class StructSlot:
+    base_id: str
+    offset: int
+    stride: Optional[int] = None
+    index_var: Optional[Any] = None
+    value: AbstractValue = field(default_factory=AbstractValue)
+
+
+@dataclass
+class Decision:
+    address: str
+    mnemonic: str
+    disasm: str
+    origins: Set[str]
+    used_bits: Set[int]
+    details: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "address": self.address,
+            "mnemonic": self.mnemonic,
+            "disasm": self.disasm,
+            "origins": sorted(self.origins),
+            "used_bits": sorted(self.used_bits),
+            "details": self.details,
         }
 
-        with open_program(cli_args.binary) as program:
-            monitor = ConsoleTaskMonitor()
-            monitor.setMessage("RegistryKeyBitfieldReport initializing...")
-            script = RegistryKeyBitfieldReport(program, monitor=monitor, args=arg_dict)
-            script.run()
+
+@dataclass
+class FunctionSummary:
+    name: str
+    entry: str
+    param_influence: Dict[int, Set[str]] = field(default_factory=lambda: defaultdict(set))
+    return_influence: Set[str] = field(default_factory=set)
+    slot_writes: List[Dict[str, Any]] = field(default_factory=list)
+    decisions: List[Decision] = field(default_factory=list)
+
+    def merge_from(self, other: "FunctionSummary") -> bool:
+        changed = False
+        for idx, roots in other.param_influence.items():
+            before = set(self.param_influence.get(idx, set()))
+            after = before | roots
+            if after != before:
+                self.param_influence[idx] = after
+                changed = True
+        before_ret = set(self.return_influence)
+        after_ret = before_ret | other.return_influence
+        if after_ret != before_ret:
+            self.return_influence = after_ret
+            changed = True
+        existing_slots = list(self.slot_writes)
+        for slot in other.slot_writes:
+            if slot not in existing_slots:
+                self.slot_writes.append(slot)
+                changed = True
+        existing_dec = [d.to_dict() for d in self.decisions]
+        for d in other.decisions:
+            if d.to_dict() not in existing_dec:
+                self.decisions.append(d)
+                changed = True
+        return changed
+
+
+@dataclass
+class GlobalState:
+    roots: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    struct_slots: Dict[Tuple[str, int], StructSlot] = field(default_factory=dict)
+    decisions: List[Decision] = field(default_factory=list)
+    function_summaries: Dict[str, FunctionSummary] = field(default_factory=dict)
+    analysis_stats: Dict[str, Any] = field(default_factory=lambda: defaultdict(int))
+    overrides: List[Dict[str, Any]] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Helper utilities
+# ---------------------------------------------------------------------------
+
+
+def boolify(val: bool) -> bool:
+    return bool(val)
+
+
+def varnode_key(vn) -> Tuple:
+    if vn is None:
+        return (None,)
+    if vn.isRegister():
+        return ("reg", str(vn.getAddress()), vn.getSize())
+    if vn.isUnique():
+        return ("tmp", int(vn.getOffset()), vn.getSize())
+    if vn.isConstant():
+        return ("const", int(vn.getOffset()), vn.getSize())
+    if vn.isAddrTied():
+        return ("mem", str(vn.getAddress()), vn.getSize())
+    return ("unk", str(vn), vn.getSize())
+
+
+def new_value_from_varnode(vn) -> AbstractValue:
+    width = vn.getSize() * 8 if vn else 32
+    val = AbstractValue(bit_width=width)
+    if vn and vn.isConstant():
+        val.tainted = False
+    return val
+
+
+# ---------------------------------------------------------------------------
+# Registry root detection
+# ---------------------------------------------------------------------------
+
+
+REGISTRY_PREFIXES = ["Reg", "Zw", "Nt", "Cm"]
+
+
+def is_registry_api(name: str) -> bool:
+    for pref in REGISTRY_PREFIXES:
+        if name.startswith(pref):
+            return True
+    return False
+
+
+def discover_registry_roots(api: FlatProgramAPI) -> Dict[str, Dict[str, Any]]:
+    roots: Dict[str, Dict[str, Any]] = {}
+    root_counter = 0
+    fm = api.getFunctionManager()
+    for func in fm.getFunctions(True):
+        name = func.getName()
+        if not is_registry_api(name):
+            continue
+        root_id = f"root_{root_counter:03d}"
+        root_counter += 1
+        roots[root_id] = {
+            "id": root_id,
+            "type": "registry",
+            "api_name": name,
+            "entry": str(func.getEntryPoint()),
+            "details": {},
+        }
+    return roots
+
+
+# ---------------------------------------------------------------------------
+# Core analysis engine
+# ---------------------------------------------------------------------------
+
+
+class FunctionAnalyzer:
+    def __init__(self, api: FlatProgramAPI, global_state: GlobalState, mode: str):
+        self.api = api
+        self.global_state = global_state
+        self.mode = mode
+        self.max_steps = 10_000_000
+
+    def analyze_all(self) -> None:
+        fm = self.api.getFunctionManager()
+        worklist = deque(fm.getFunctions(True))
+        iteration_guard = 0
+        while worklist and iteration_guard < 1_000_000:
+            func = worklist.popleft()
+            iteration_guard += 1
+            summary = self.analyze_function(func)
+            existing = self.global_state.function_summaries.get(func.getName())
+            if existing is None:
+                self.global_state.function_summaries[func.getName()] = summary
+                worklist.extend(func.getCalledFunctions(None))
+            else:
+                if existing.merge_from(summary):
+                    worklist.extend(func.getCalledFunctions(None))
+        if iteration_guard >= 1_000_000:
+            log_debug("[warn] function iteration limit hit")
+            self.global_state.analysis_stats["function_iterations_limit"] = True
+
+    def analyze_function(self, func) -> FunctionSummary:
+        summary = FunctionSummary(func.getName(), str(func.getEntryPoint()))
+        body = func.getBody()
+        listing = self.api.getCurrentProgram().getListing()
+        states: Dict[Tuple, AbstractValue] = {}
+        block_model = BasicBlockModel(currentProgram)
+        blocks = list(block_model.getCodeBlocksContaining(body, self.api.getMonitor()))
+        worklist: deque = deque(blocks)
+        visited = 0
+        while worklist and visited < self.max_steps:
+            block = worklist.popleft()
+            visited += 1
+            it = listing.getInstructions(block, True)
+            while it.hasNext():
+                inst = it.next()
+                pcode_ops = inst.getPcode()
+                for op in pcode_ops:
+                    self._process_pcode(func, inst, op, states, summary)
+        if visited >= self.max_steps:
+            log_debug("[warn] worklist limit hit in function %s" % func.getName())
+            self.global_state.analysis_stats["worklist_limit"] = True
+        return summary
+
+    # ------------------------------------------------------------------
+    # P-code processing
+    # ------------------------------------------------------------------
+
+    def _get_val(self, vn, states: Dict[Tuple, AbstractValue]) -> AbstractValue:
+        key = varnode_key(vn)
+        if key not in states:
+            states[key] = new_value_from_varnode(vn)
+        return states[key]
+
+    def _set_val(self, vn, val: AbstractValue, states: Dict[Tuple, AbstractValue]) -> None:
+        key = varnode_key(vn)
+        states[key] = val
+        log_trace(f"[trace] set {key} -> {val}")
+
+    def _process_pcode(self, func, inst, op: PcodeOp, states: Dict[Tuple, AbstractValue], summary: FunctionSummary) -> None:
+        opcode = op.getOpcode()
+        out = op.getOutput()
+        inputs = [op.getInput(i) for i in range(op.getNumInputs())]
+        opname = op.getMnemonic()
+        if opname in {"COPY", "INT_ZEXT", "INT_SEXT", "SUBPIECE"}:
+            self._handle_copy(out, inputs, states)
+        elif opname in {"INT_ADD", "INT_SUB"}:
+            self._handle_addsub(out, inputs, states, opname)
+        elif opname in {"INT_MULT", "INT_DIV"}:
+            self._handle_multdiv(out, inputs, states)
+        elif opname == "INT_AND":
+            self._handle_and(out, inputs, states)
+        elif opname in {"INT_OR", "INT_XOR"}:
+            self._handle_orxor(out, inputs, states)
+        elif opname in {"INT_LEFT", "INT_RIGHT", "INT_SRIGHT"}:
+            self._handle_shift(out, inputs, states, opname)
+        elif opname == "LOAD":
+            self._handle_load(out, inputs, states)
+        elif opname == "STORE":
+            self._handle_store(inst, inputs, states)
+        elif opname == "PTRADD":
+            self._handle_ptradd(out, inputs, states)
+        elif opname in {"BRANCH", "CBRANCH"}:
+            self._handle_branch(func, inst, inputs, states, summary)
+        elif opname == "MULTIEQUAL":
+            self._handle_multiequal(out, inputs, states)
+        elif opname == "CALL":
+            self._handle_call(inst, op, inputs, states, summary)
+        elif opname == "RETURN":
+            self._handle_return(inputs, states, summary)
+        else:
+            self._handle_unknown(out, inputs, states)
+
+    # Individual handlers
+    def _handle_copy(self, out, inputs, states):
+        if out is None or not inputs:
+            return
+        src = self._get_val(inputs[0], states)
+        val = src.clone()
+        self._set_val(out, val, states)
+
+    def _handle_addsub(self, out, inputs, states, opname):
+        if out is None or len(inputs) < 2:
+            return
+        a = self._get_val(inputs[0], states)
+        b = self._get_val(inputs[1], states)
+        val = AbstractValue()
+        val.tainted = a.tainted or b.tainted
+        val.origins = set(a.origins | b.origins)
+        val.bit_width = out.getSize() * 8
+        val.used_bits = set(a.used_bits | b.used_bits)
+        val.candidate_bits = set(a.candidate_bits | b.candidate_bits)
+        if a.pointer_pattern and inputs[1].isConstant():
+            pp = a.pointer_pattern.clone()
+            delta = int(inputs[1].getOffset())
+            pp.adjust_offset(delta if opname == "INT_ADD" else -delta)
+            val.pointer_pattern = pp
+        elif b.pointer_pattern and inputs[0].isConstant():
+            pp = b.pointer_pattern.clone()
+            delta = int(inputs[0].getOffset())
+            pp.adjust_offset(delta)
+            val.pointer_pattern = pp
+        elif a.pointer_pattern and b.pointer_pattern:
+            val.pointer_pattern = a.pointer_pattern.merge(b.pointer_pattern)
+        self._set_val(out, val, states)
+
+    def _handle_multdiv(self, out, inputs, states):
+        if out is None or len(inputs) < 2:
+            return
+        a = self._get_val(inputs[0], states)
+        b = self._get_val(inputs[1], states)
+        val = AbstractValue()
+        val.tainted = a.tainted or b.tainted
+        val.origins = set(a.origins | b.origins)
+        val.bit_width = out.getSize() * 8
+        val.used_bits = set(a.used_bits | b.used_bits)
+        val.candidate_bits = set(a.candidate_bits | b.candidate_bits)
+        val.pointer_pattern = PointerPattern(unknown=True) if (a.pointer_pattern or b.pointer_pattern) else None
+        self._set_val(out, val, states)
+
+    def _handle_and(self, out, inputs, states):
+        if out is None or len(inputs) < 2:
+            return
+        a = self._get_val(inputs[0], states)
+        b = self._get_val(inputs[1], states)
+        val = AbstractValue()
+        val.tainted = a.tainted or b.tainted
+        val.origins = set(a.origins | b.origins)
+        val.bit_width = out.getSize() * 8
+        val.used_bits = set(a.used_bits | b.used_bits)
+        val.candidate_bits = set(a.candidate_bits | b.candidate_bits)
+        mask_src = None
+        other = None
+        if inputs[0].isConstant():
+            mask_src = inputs[0]
+            other = b
+        elif inputs[1].isConstant():
+            mask_src = inputs[1]
+            other = a
+        if mask_src is not None and other is not None:
+            mask_val = int(mask_src.getOffset())
+            other_bits = AbstractValue(bit_width=other.bit_width)
+            other_bits.mark_bits_used(mask_val)
+            val.used_bits |= other_bits.used_bits
+            val.candidate_bits |= other_bits.candidate_bits
+        self._set_val(out, val, states)
+
+    def _handle_orxor(self, out, inputs, states):
+        if out is None or len(inputs) < 2:
+            return
+        a = self._get_val(inputs[0], states)
+        b = self._get_val(inputs[1], states)
+        val = AbstractValue()
+        val.tainted = a.tainted or b.tainted
+        val.origins = set(a.origins | b.origins)
+        val.bit_width = out.getSize() * 8
+        val.used_bits = set(a.used_bits | b.used_bits)
+        val.candidate_bits = set(a.candidate_bits | b.candidate_bits)
+        self._set_val(out, val, states)
+
+    def _handle_shift(self, out, inputs, states, opname):
+        if out is None or len(inputs) < 2:
+            return
+        base = self._get_val(inputs[0], states)
+        amt = inputs[1]
+        val = AbstractValue()
+        val.tainted = base.tainted or self._get_val(amt, states).tainted
+        val.origins = set(base.origins | self._get_val(amt, states).origins)
+        val.bit_width = out.getSize() * 8
+        shift = amt.getOffset() if amt.isConstant() else None
+        if shift is None:
+            val.mark_all_bits_used()
+        else:
+            for b in base.candidate_bits:
+                if opname == "INT_LEFT":
+                    val.candidate_bits.add(b + shift)
+                else:
+                    new_b = max(0, b - shift)
+                    val.candidate_bits.add(new_b)
+            val.used_bits |= set(val.candidate_bits)
+        self._set_val(out, val, states)
+
+    def _handle_load(self, out, inputs, states):
+        if out is None or len(inputs) < 2:
+            return
+        addr_val = self._get_val(inputs[1], states)
+        val = AbstractValue(bit_width=out.getSize() * 8)
+        if addr_val.pointer_pattern and addr_val.pointer_pattern.base_id and addr_val.pointer_pattern.offset is not None:
+            key = (addr_val.pointer_pattern.base_id, addr_val.pointer_pattern.offset)
+            slot = self.global_state.struct_slots.get(key)
+            if slot:
+                val = slot.value.clone()
+        self._set_val(out, val, states)
+
+    def _handle_store(self, inst, inputs, states):
+        if len(inputs) < 2:
+            return
+        addr_val = self._get_val(inputs[1], states)
+        src_val = self._get_val(inputs[0], states)
+        if addr_val.pointer_pattern and addr_val.pointer_pattern.base_id and addr_val.pointer_pattern.offset is not None:
+            key = (addr_val.pointer_pattern.base_id, addr_val.pointer_pattern.offset)
+            slot = self.global_state.struct_slots.get(key)
+            if slot is None:
+                slot = StructSlot(addr_val.pointer_pattern.base_id, addr_val.pointer_pattern.offset,
+                                  addr_val.pointer_pattern.stride, addr_val.pointer_pattern.index_var,
+                                  value=src_val.clone())
+                self.global_state.struct_slots[key] = slot
+            else:
+                slot.value = slot.value.merge(src_val)
+            if slot.value.tainted and not src_val.tainted:
+                self.global_state.overrides.append({
+                    "address": str(inst.getAddress()),
+                    "function": inst.getFunction().getName() if inst.getFunction() else None,
+                    "source_origins": sorted(src_val.origins),
+                    "notes": "struct slot override",
+                })
+
+    def _handle_ptradd(self, out, inputs, states):
+        if out is None or len(inputs) < 2:
+            return
+        base = self._get_val(inputs[0], states)
+        offset = inputs[1]
+        val = base.clone()
+        if val.pointer_pattern is None:
+            val.pointer_pattern = PointerPattern(base_id=str(inputs[0]))
+        if offset.isConstant():
+            val.pointer_pattern.adjust_offset(int(offset.getOffset()))
+        else:
+            val.pointer_pattern.unknown = True
+        self._set_val(out, val, states)
+
+    def _handle_branch(self, func, inst, inputs, states, summary: FunctionSummary):
+        if not inputs:
+            return
+        cond_val = self._get_val(inputs[0], states)
+        if not cond_val.candidate_bits:
+            cond_val.mark_all_bits_used()
+        decision = Decision(
+            address=str(inst.getAddress()),
+            mnemonic=inst.getMnemonicString(),
+            disasm=inst.toString(),
+            origins=set(cond_val.origins),
+            used_bits=set(cond_val.used_bits or cond_val.candidate_bits),
+            details={"type": "branch"},
+        )
+        summary.decisions.append(decision)
+        self.global_state.decisions.append(decision)
+
+    def _handle_multiequal(self, out, inputs, states):
+        if out is None:
+            return
+        merged = AbstractValue()
+        for inp in inputs:
+            merged = merged.merge(self._get_val(inp, states))
+        merged.bit_width = out.getSize() * 8
+        self._set_val(out, merged, states)
+
+    def _handle_call(self, inst, op, inputs, states, summary: FunctionSummary):
+        callee_refs = [r for r in inst.getReferencesFrom() if r.getReferenceType().isCall()]
+        callee_name = None
+        if callee_refs:
+            to_addr = callee_refs[0].getToAddress()
+            func = self.api.getFunctionManager().getFunctionAt(to_addr)
+            if func:
+                callee_name = func.getName()
+        if callee_name:
+            callee_summary = self.global_state.function_summaries.get(callee_name)
+            if callee_summary:
+                for idx, roots in callee_summary.param_influence.items():
+                    if idx < len(inputs):
+                        val = self._get_val(inputs[idx], states)
+                        val.origins |= roots
+                        val.tainted = val.tainted or bool(roots)
+                if callee_summary.return_influence and op.getOutput() is not None:
+                    val = AbstractValue(tainted=True, origins=set(callee_summary.return_influence),
+                                        bit_width=op.getOutput().getSize() * 8)
+                    self._set_val(op.getOutput(), val, states)
+                for slot in callee_summary.slot_writes:
+                    key = (slot.get("base_id"), slot.get("offset"))
+                    slot_val = self.global_state.struct_slots.get(key)
+                    if slot_val:
+                        slot_val.value.origins |= set(slot.get("origins", []))
+            if is_registry_api(callee_name):
+                root_id = f"api_{callee_name}_{inst.getAddress()}"
+                self.global_state.roots.setdefault(root_id, {
+                    "id": root_id,
+                    "type": "registry",
+                    "api_name": callee_name,
+                    "address": str(inst.getAddress()),
+                })
+                if op.getOutput() is not None:
+                    val = self._get_val(op.getOutput(), states)
+                    val.tainted = True
+                    val.origins.add(root_id)
+                    self._set_val(op.getOutput(), val, states)
+        else:
+            if op.getOutput() is not None:
+                out_val = AbstractValue(bit_width=op.getOutput().getSize() * 8)
+                for inp in inputs:
+                    src = self._get_val(inp, states)
+                    out_val = out_val.merge(src)
+                self._set_val(op.getOutput(), out_val, states)
+
+    def _handle_return(self, inputs, states, summary: FunctionSummary):
+        if not inputs:
+            return
+        ret_val = self._get_val(inputs[0], states)
+        summary.return_influence |= set(ret_val.origins)
+
+    def _handle_unknown(self, out, inputs, states):
+        if out is None:
+            return
+        val = AbstractValue(bit_width=out.getSize() * 8)
+        for inp in inputs:
+            val = val.merge(self._get_val(inp, states))
+        if not val.candidate_bits:
+            val.mark_all_bits_used()
+        self._set_val(out, val, states)
+
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+
+def build_root_records(global_state: GlobalState) -> List[Dict[str, Any]]:
+    records = []
+    for root_id, meta in sorted(global_state.roots.items()):
+        slot_entries = []
+        used_bits: Set[int] = set()
+        candidate_bits: Set[int] = set()
+        for (base_id, offset), slot in global_state.struct_slots.items():
+            if slot.value.origins and root_id in slot.value.origins:
+                slot_entries.append({
+                    "base_id": base_id,
+                    "offset": offset,
+                    "offset_hex": hex(offset),
+                    "stride": slot.stride,
+                    "index_based": bool(slot.index_var),
+                    "notes": "struct slot",
+                })
+                used_bits |= slot.value.used_bits
+                candidate_bits |= slot.value.candidate_bits
+        decisions = [d.to_dict() for d in global_state.decisions if root_id in d.origins]
+        overrides = [o for o in global_state.overrides if root_id in o.get("source_origins", [])]
+        record = {
+            "id": root_id,
+            "type": meta.get("type", "registry"),
+            "hive": meta.get("hive"),
+            "path": meta.get("path"),
+            "value_name": meta.get("value_name"),
+            "api_name": meta.get("api_name"),
+            "entry": meta.get("entry"),
+            "struct_slots": slot_entries,
+            "bit_usage": {
+                "bit_width": max([32] + [slot.value.bit_width for slot in global_state.struct_slots.values()]),
+                "used_bits": sorted(used_bits),
+                "candidate_bits": sorted(candidate_bits),
+            },
+            "decisions": decisions,
+            "overrides": overrides,
+        }
+        records.append(record)
+    return records
+
+
+def emit_ndjson(global_state: GlobalState) -> None:
+    for rec in build_root_records(global_state):
+        print(json.dumps(rec))
+    summary = {
+        "type": "analysis_summary",
+        "functions_analyzed": len(global_state.function_summaries),
+        "roots": len(global_state.roots),
+        "decisions": len(global_state.decisions),
+        "struct_slots": len(global_state.struct_slots),
+        "limits_hit": {
+            "worklist": boolify(global_state.analysis_stats.get("worklist_limit")),
+            "function_iterations": boolify(global_state.analysis_stats.get("function_iterations_limit")),
+            "call_depth": boolify(global_state.analysis_stats.get("call_depth_limit")),
+        },
+    }
+    print(json.dumps(summary))
+
+
+# ---------------------------------------------------------------------------
+# Main driver
+# ---------------------------------------------------------------------------
+
+
+def main():
+    api = FlatProgramAPI(currentProgram)
+    mode = args.get("mode")
+    log_info(f"[info] RegistryKeyBitfieldReport starting (mode={mode}, debug={DEBUG_ENABLED}, trace={TRACE_ENABLED})")
+    global_state = GlobalState()
+    global_state.roots = discover_registry_roots(api)
+    if mode == "full" and not global_state.roots:
+        # ensure at least one synthetic root so all flows are kept
+        global_state.roots["root_synthetic"] = {"id": "root_synthetic", "type": "synthetic", "details": {}}
+    analyzer = FunctionAnalyzer(api, global_state, mode)
+    analyzer.analyze_all()
+    emit_ndjson(global_state)
+    log_debug(
+        f"[debug] analyzed {len(global_state.function_summaries)} functions, "
+        f"roots={len(global_state.roots)} decisions={len(global_state.decisions)} "
+        f"slots={len(global_state.struct_slots)}"
+    )
+
+
+if __name__ == "__main__":
+    main()
