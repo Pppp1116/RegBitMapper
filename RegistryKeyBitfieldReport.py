@@ -490,12 +490,32 @@ REGISTRY_STRING_PREFIX_RE = re.compile(
 
 
 def is_registry_api(name: str) -> bool:
+    """
+    Return True if the given function name looks like a Windows registry API.
+
+    This handles both plain names (e.g., "RegOpenKeyExA") and module-prefixed
+    imports that Ghidra may emit (e.g., "ADVAPI32.dll::RegOpenKeyExA" or
+    "ADVAPI32.dll_RegQueryValueExW").
+    """
     if not name:
         return False
+
     lowered = name.lower()
     for pref in REGISTRY_PREFIXES:
         if lowered.startswith(pref.lower()):
             return True
+
+    # Allow module-prefixed import names by checking each segment separated by
+    # common delimiters such as '::', '.', ':', '@', '!', or '_'.
+    parts = re.split(r"[.:@!_]", name)
+    for part in parts:
+        if not part:
+            continue
+        pl = part.lower()
+        for pref in REGISTRY_PREFIXES:
+            if pl.startswith(pref.lower()):
+                return True
+
     return False
 
 
