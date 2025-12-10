@@ -156,12 +156,13 @@ def _has_mode(arg_list: List[str]) -> bool:
 
 script_manager_args = _filter_kv_args(_get_script_args())
 cli_args = _filter_kv_args(_SYS_RAW_ARGS)
+
 if script_manager_args:
     INVOCATION_CONTEXT = "script_manager"
     args = parse_args(script_manager_args, INVOCATION_CONTEXT)
 elif __name__ == "__main__" or _has_mode(cli_args):
     INVOCATION_CONTEXT = "headless"
-    if cli_args and not _has_mode(cli_args):
+    if not _has_mode(cli_args):
         print("[error] headless execution requires mode=taint|full", file=sys.stderr)
         sys.exit(1)
     args = parse_args(cli_args, INVOCATION_CONTEXT)
@@ -173,18 +174,19 @@ TRACE_ENABLED = args.get("trace", False)
 
 
 def _resolve_dummy_monitor():
-    if TaskMonitor is None:
-        return None
-    candidate = getattr(TaskMonitor, "DUMMY", None)
+    candidate = getattr(TaskMonitor, "DUMMY", None) if TaskMonitor else None
     if candidate is not None:
         return candidate
     if TaskMonitorAdapter is not None:
-        return getattr(TaskMonitorAdapter, "DUMMY", None)
+        adapter_dummy = getattr(TaskMonitorAdapter, "DUMMY", None)
+        if adapter_dummy is not None:
+            return adapter_dummy
     if DummyTaskMonitor is not None:
         try:
             return DummyTaskMonitor()
         except Exception:
-            return None
+            pass
+
     class _NoOpMonitor:
         def checkCanceled(self):
             return False
@@ -482,7 +484,7 @@ REGISTRY_HIVE_ALIASES = {
 }
 
 REGISTRY_STRING_PREFIX_RE = re.compile(
-    r"^(HKLM|HKCU|HKCR|HKU|HKCC|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER|HKEY_CLASSES_ROOT|HKEY_USERS|HKEY_CURRENT_CONFIG|\\\\Registry\\\\Machine|\\\\Registry\\\\User)",
+    r"(HKLM|HKCU|HKCR|HKU|HKCC|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER|HKEY_CLASSES_ROOT|HKEY_USERS|HKEY_CURRENT_CONFIG|\\\\Registry\\\\Machine|\\\\Registry\\\\User|\\\\Registry\\\\Users)",
     re.IGNORECASE,
 )
 
@@ -500,12 +502,17 @@ def is_registry_api(name: str) -> bool:
 def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
     if not raw:
         return None
-    raw = raw.strip("\x00")
-    m = REGISTRY_STRING_PREFIX_RE.match(raw)
+    raw = raw.strip("\x00").strip()
+    if not raw:
+        return None
+    # Trim leading junk before a known hive fragment if present.
+    m = REGISTRY_STRING_PREFIX_RE.search(raw)
     hive_key = None
     path = None
     value_name = None
+    candidate_segment = raw
     if m:
+        candidate_segment = raw[m.start() :]
         prefix = m.group(1)
         for short, aliases in REGISTRY_HIVE_ALIASES.items():
             for alias in aliases:
@@ -515,25 +522,35 @@ def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
             if hive_key:
                 break
         hive_key = hive_key or prefix
-        path = raw[len(prefix) :].lstrip("\\/")
-    else:
+        path = candidate_segment[len(prefix) :].lstrip("\\/")
+    if path is None:
         lowered = raw.lower()
         partial_prefixes = [
+            "\\registry\\machine\\",
+            "\\registry\\user\\",
             "system\\currentcontrolset\\",
             "system\\controlset",
             "software\\",
             "control\\",
         ]
-        partial_tuple = tuple(partial_prefixes)
-        if any(pref in lowered for pref in partial_prefixes) or lowered.startswith(partial_tuple):
+        for pref in partial_prefixes:
+            pos = lowered.find(pref)
+            if pos != -1:
+                path = raw[pos:].lstrip("\\/")
+                break
+        if path is None and lowered.startswith(tuple(partial_prefixes)):
             path = raw.lstrip("\\/")
     if path is None:
         return None
-    value_name = None
+    path = path.strip().strip("\x00")
+    if not path:
+        return None
+    path = path.strip("\0\r\n \t\"")
     if path and "\\" in path:
-        parts = path.split("\\")
-        if parts[-1]:
+        parts = [p for p in path.split("\\") if p]
+        if parts:
             value_name = parts[-1]
+            path = "\\".join(parts)
     return {"hive": hive_key, "path": path, "value_name": value_name, "raw": raw}
 
 
@@ -550,18 +567,39 @@ def collect_registry_string_candidates(program) -> Dict[str, Dict[str, Any]]:
             break
         data = it.next()
         try:
-            if not data.hasStringValue():
+            sval: Optional[str] = None
+            if data.hasStringValue():
+                try:
+                    val_obj = data.getValue()
+                    sval = val_obj.getString() if hasattr(val_obj, "getString") else str(val_obj)
+                except Exception:
+                    sval = None
+            if sval is None:
+                try:
+                    mem = program.getMemory()
+                    buf = bytearray(max(16, data.getLength()))
+                    read = mem.getBytes(data.getAddress(), buf)
+                    if read:
+                        trimmed = bytes(buf[: int(read) if isinstance(read, (int, float)) else len(buf)])
+                        for codec, terminator in (("utf-16-le", b"\x00\x00"), ("utf-8", b"\x00"), ("latin-1", b"\x00")):
+                            try:
+                                segment = trimmed.split(terminator)[0]
+                                if not segment:
+                                    continue
+                                sval = segment.decode(codec, errors="ignore")
+                                if sval:
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    sval = None
+            if not sval:
                 continue
-            val_obj = data.getValue()
-            if hasattr(val_obj, "getString"):
-                sval = val_obj.getString()
-            else:
-                sval = str(val_obj)
+            meta = parse_registry_string(sval)
+            if meta:
+                candidates[str(data.getAddress())] = meta
         except Exception:
             continue
-        meta = parse_registry_string(sval)
-        if meta:
-            candidates[str(data.getAddress())] = meta
     return candidates
 
 
@@ -631,7 +669,7 @@ class FunctionAnalyzer:
             candidates: List[str] = []
             for codec, terminator in (("utf-16-le", b"\x00\x00"), ("utf-8", b"\x00"), ("latin-1", b"\x00")):
                 try:
-                    segment = trimmed.split(terminator)[0]
+                    segment = trimmed.split(terminator)[0].lstrip(b"\x00")
                     if not segment:
                         continue
                     sval = segment.decode(codec, errors="ignore")
