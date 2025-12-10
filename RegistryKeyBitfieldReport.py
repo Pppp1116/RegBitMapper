@@ -49,6 +49,10 @@ try:  # pragma: no cover - executed inside Ghidra
         from ghidra.util.task import TaskMonitorAdapter
     except Exception:
         TaskMonitorAdapter = None
+    try:
+        from ghidra.util.task import DummyTaskMonitor
+    except Exception:
+        DummyTaskMonitor = None
 except Exception:  # pragma: no cover
     FlatProgramAPI = None
     BasicBlockModel = None
@@ -57,6 +61,7 @@ except Exception:  # pragma: no cover
     RefType = None
     TaskMonitor = None
     TaskMonitorAdapter = None
+    DummyTaskMonitor = None
     AddressSet = None
 
 try:  # pragma: no cover - ensure currentProgram exists in PyGhidra
@@ -163,6 +168,11 @@ def _resolve_dummy_monitor():
         return candidate
     if TaskMonitorAdapter is not None:
         return getattr(TaskMonitorAdapter, "DUMMY", None)
+    if DummyTaskMonitor is not None:
+        try:
+            return DummyTaskMonitor()
+        except Exception:
+            return None
     return None
 
 
@@ -697,7 +707,12 @@ class FunctionAnalyzer:
         it = listing.getInstructions(addr_set, True)
         while it.hasNext():
             inst = it.next()
-            pcode_ops = inst.getPcode()
+            try:
+                pcode_ops = inst.getPcode()
+            except Exception:
+                pcode_ops = None
+            if not pcode_ops:
+                continue
             for op in pcode_ops:
                 self._process_pcode(func, inst, op, states, summary)
         return states
@@ -1215,5 +1230,23 @@ def main():
     )
 
 
+_REGKEYBITFIELDREPORT_RAN = False
+
+def _maybe_run_main_from_script_manager():
+    """
+    Ghidra's Script Manager may execute this module without setting __name__ to
+    "__main__". Run main() once in that scenario while avoiding double
+    execution when PyGhidra invokes the script normally.
+    """
+
+    global _REGKEYBITFIELDREPORT_RAN
+    if INVOCATION_CONTEXT == "script_manager" and not _REGKEYBITFIELDREPORT_RAN:
+        _REGKEYBITFIELDREPORT_RAN = True
+        main()
+
+
 if __name__ == "__main__":
+    _REGKEYBITFIELDREPORT_RAN = True
     main()
+else:
+    _maybe_run_main_from_script_manager()
