@@ -13,14 +13,16 @@ py -3.11 -m pyghidra ^
   mode=taint debug=true trace=false
 
 Arguments (key=value):
-  mode  : "taint" (registry/config seeded) or "full" (analyze all flows).
+  mode  : "taint" (registry/config seeded) or "full" (analyze all flows with synthetic fallback).
   debug : verbose summaries (true/false/1/0/yes/no/on/off).
   trace : per-step traces (true/false/1/0/yes/no/on/off).
 
 Assembly is authoritative for addresses/mnemonics/disassembly. P-code is used
 as the internal IR for semantics and dataflow. The analysis runs in two modes:
   * taint: starts from registry/config roots and propagates from there.
-  * full : analyzes all flows while still recording registry/config origins.
+  * full : walks all functions, tracks registry/config origins when present,
+    and seeds a synthetic root when no registry APIs are detected so downstream
+    tools still have at least one root.
 
 Mode differences:
   * taint mode reports only facts that originate from discovered roots (no
@@ -1255,6 +1257,8 @@ def main():
     if INVOCATION_CONTEXT == "script_manager":
         log_info("[info] Script Manager detected; NDJSON output will appear in the Ghidra console.")
     global_state = GlobalState()
+    # ensure call_depth_limit is explicitly initialized (future use)
+    global_state.analysis_stats["call_depth_limit"] = False
     global_state.registry_strings = collect_registry_string_candidates(program)
     log_debug(
         f"[debug] initial registry roots={len(global_state.roots)} registry-like strings={len(global_state.registry_strings)}"
@@ -1265,6 +1269,19 @@ def main():
     if args.get("max_function_iterations"):
         analyzer.max_function_iterations = max(1, int(args.get("max_function_iterations")))
     analyzer.analyze_all()
+    # Synthetic root for full mode when no registry APIs are detected
+    if mode == "full" and not global_state.roots:
+        synthetic_id = "synthetic_full_mode_root"
+        global_state.roots[synthetic_id] = {
+            "id": synthetic_id,
+            "type": "synthetic",
+            "api_name": None,
+            "address": None,
+            "entry": None,
+            "hive": None,
+            "path": None,
+            "value_name": None,
+        }
     emit_ndjson(global_state)
     emit_improvement_suggestions(global_state)
     log_debug(
