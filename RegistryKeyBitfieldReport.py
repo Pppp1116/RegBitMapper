@@ -890,7 +890,7 @@ class FunctionAnalyzer:
             self._handle_store(inst, inputs, states)
         elif opname == "PTRADD":
             self._handle_ptradd(func, out, inputs, states)
-        elif opname in {"BRANCH", "CBRANCH"}:
+        elif opname == "CBRANCH":  # unconditional BRANCH has no condition operand
             self._handle_branch(func, inst, opname, inputs, states, summary)
         elif opname == "MULTIEQUAL":
             self._handle_multiequal(out, inputs, states)
@@ -1084,7 +1084,7 @@ class FunctionAnalyzer:
         self._set_val(out, val, states)
 
     def _handle_branch(self, func, inst, opname, inputs, states, summary: FunctionSummary):
-        if not inputs:
+        if opname != "CBRANCH" or not inputs:
             return
         cond_val = self._get_val(inputs[0], states)
         if self.mode == "taint" and not cond_val.origins:
@@ -1103,7 +1103,7 @@ class FunctionAnalyzer:
             used_bits=set(cond_val.used_bits or cond_val.candidate_bits),
             details=branch_detail,
         )
-        decision.details["branch_kind"] = "unconditional" if opname == "BRANCH" else "conditional"
+        decision.details["branch_kind"] = "conditional"
         summary.add_decision(decision)
         self.global_state.decisions.append(decision)
 
