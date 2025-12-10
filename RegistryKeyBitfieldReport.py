@@ -44,6 +44,7 @@ try:  # pragma: no cover - executed inside Ghidra
     from ghidra.program.model.listing import Instruction
     from ghidra.program.model.pcode import PcodeOp
     from ghidra.program.model.symbol import RefType
+    from ghidra.util.task import TaskMonitor
 except Exception:  # pragma: no cover
     currentProgram = None
     FlatProgramAPI = None
@@ -51,6 +52,7 @@ except Exception:  # pragma: no cover
     Instruction = None
     PcodeOp = None
     RefType = None
+    TaskMonitor = None
 
 # ---------------------------------------------------------------------------
 # Argument parsing and logging
@@ -334,8 +336,11 @@ REGISTRY_STRING_PREFIX_RE = re.compile(
 
 
 def is_registry_api(name: str) -> bool:
+    if not name:
+        return False
+    lowered = name.lower()
     for pref in REGISTRY_PREFIXES:
-        if name.startswith(pref):
+        if lowered.startswith(pref.lower()):
             return True
     return False
 
@@ -343,6 +348,7 @@ def is_registry_api(name: str) -> bool:
 def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
     if not raw:
         return None
+    raw = raw.strip("\x00")
     m = REGISTRY_STRING_PREFIX_RE.match(raw)
     if not m:
         return None
@@ -365,8 +371,8 @@ def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
     return {"hive": hive_key, "path": path, "value_name": value_name, "raw": raw}
 
 
-def collect_registry_string_candidates(api: FlatProgramAPI) -> Dict[str, Dict[str, Any]]:
-    listing = api.getCurrentProgram().getListing()
+def collect_registry_string_candidates(program) -> Dict[str, Dict[str, Any]]:
+    listing = program.getListing()
     candidates: Dict[str, Dict[str, Any]] = {}
     it = listing.getDefinedData(True)
     while it.hasNext():
@@ -391,10 +397,10 @@ def collect_registry_string_candidates(api: FlatProgramAPI) -> Dict[str, Dict[st
 # could be wired here and merged into the roots dictionary in main().
 
 
-def discover_registry_roots(api: FlatProgramAPI) -> Dict[str, Dict[str, Any]]:
+def discover_registry_roots(program) -> Dict[str, Dict[str, Any]]:
     roots: Dict[str, Dict[str, Any]] = {}
     root_counter = 0
-    fm = api.getCurrentProgram().getFunctionManager()
+    fm = program.getFunctionManager()
     for func in fm.getFunctions(True):
         name = func.getName()
         if not is_registry_api(name):
@@ -420,12 +426,12 @@ def discover_registry_roots(api: FlatProgramAPI) -> Dict[str, Dict[str, Any]]:
 
 
 class FunctionAnalyzer:
-    def __init__(self, api: FlatProgramAPI, global_state: GlobalState, mode: str):
+    def __init__(self, api: FlatProgramAPI, program, global_state: GlobalState, mode: str):
         self.api = api
         self.global_state = global_state
         self.mode = mode
         self.max_steps = 10_000_000
-        self.program = self.api.getCurrentProgram()
+        self.program = program
 
     def _get_function_for_inst(self, inst: Instruction):
         try:
@@ -495,11 +501,11 @@ class FunctionAnalyzer:
         body = func.getBody()
         listing = self.program.getListing()
         block_model = BasicBlockModel(self.program)
-        blocks = list(block_model.getCodeBlocksContaining(body, self.api.getMonitor()))
+        blocks = list(block_model.getCodeBlocksContaining(body, TaskMonitor.DUMMY))
         preds: Dict[Any, List[Any]] = defaultdict(list)
         succs: Dict[Any, List[Any]] = defaultdict(list)
         for blk in blocks:
-            it = blk.getDestinations(self.api.getMonitor())
+            it = blk.getDestinations(TaskMonitor.DUMMY)
             while it.hasNext():
                 dest = it.next()
                 succs[blk].append(dest.getDestinationBlock())
@@ -1009,7 +1015,8 @@ def emit_improvement_suggestions(global_state: GlobalState) -> None:
 
 
 def main():
-    api = FlatProgramAPI(currentProgram)
+    program = currentProgram
+    api = FlatProgramAPI(program)
     mode = args.get("mode") or "taint"
     log_info(
         f"[info] RegistryKeyBitfieldReport starting (mode={mode}, debug={DEBUG_ENABLED}, trace={TRACE_ENABLED}, context={INVOCATION_CONTEXT})"
@@ -1017,8 +1024,8 @@ def main():
     if INVOCATION_CONTEXT == "script_manager":
         log_info("[info] Script Manager detected; NDJSON output will appear in the Ghidra console.")
     global_state = GlobalState()
-    global_state.roots = discover_registry_roots(api)
-    global_state.registry_strings = collect_registry_string_candidates(api)
+    global_state.roots = discover_registry_roots(program)
+    global_state.registry_strings = collect_registry_string_candidates(program)
     log_debug(
         f"[debug] discovered {len(global_state.roots)} registry roots; {len(global_state.registry_strings)} registry-like strings"
     )
@@ -1028,7 +1035,7 @@ def main():
             "type": "synthetic",
             "details": {"note": "no registry roots detected; synthetic seed"},
         }
-    analyzer = FunctionAnalyzer(api, global_state, mode)
+    analyzer = FunctionAnalyzer(api, program, global_state, mode)
     analyzer.analyze_all()
     emit_ndjson(global_state)
     emit_improvement_suggestions(global_state)
