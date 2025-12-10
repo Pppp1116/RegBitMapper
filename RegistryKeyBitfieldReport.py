@@ -21,12 +21,19 @@ Assembly is authoritative for addresses/mnemonics/disassembly. P-code is used
 as the internal IR for semantics and dataflow. The analysis runs in two modes:
   * taint: starts from registry/config roots and propagates from there.
   * full : analyzes all flows while still recording registry/config origins.
+
+Mode differences:
+  * taint mode reports only facts that originate from discovered roots (no
+    untainted decisions/slots are attached to any root).
+  * full mode walks all functions, keeps registry-aware origins, and seeds a
+    synthetic root when no registry APIs are detected.
 """
 from __future__ import annotations
 
 import json
 import sys
 from collections import defaultdict, deque
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -259,6 +266,7 @@ class GlobalState:
     function_summaries: Dict[str, FunctionSummary] = field(default_factory=dict)
     analysis_stats: Dict[str, Any] = field(default_factory=lambda: defaultdict(int))
     overrides: List[Dict[str, Any]] = field(default_factory=list)
+    registry_strings: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +312,20 @@ def opcode_name(op: PcodeOp) -> str:
 # ---------------------------------------------------------------------------
 
 
-REGISTRY_PREFIXES = ["Reg", "Zw", "Nt", "Cm"]
+REGISTRY_PREFIXES = ["Reg", "Zw", "Nt", "Cm", "Rtl"]
+
+REGISTRY_HIVE_ALIASES = {
+    "HKLM": ["HKLM", "HKEY_LOCAL_MACHINE", "\\Registry\\Machine"],
+    "HKCU": ["HKCU", "HKEY_CURRENT_USER", "\\Registry\\User"],
+    "HKCR": ["HKCR", "HKEY_CLASSES_ROOT"],
+    "HKU": ["HKU", "HKEY_USERS"],
+    "HKCC": ["HKCC", "HKEY_CURRENT_CONFIG"],
+}
+
+REGISTRY_STRING_PREFIX_RE = re.compile(
+    r"^(HKLM|HKCU|HKCR|HKU|HKCC|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER|HKEY_CLASSES_ROOT|HKEY_USERS|HKEY_CURRENT_CONFIG|\\\\Registry\\\\Machine|\\\\Registry\\\\User)",
+    re.IGNORECASE,
+)
 
 
 def is_registry_api(name: str) -> bool:
@@ -312,6 +333,57 @@ def is_registry_api(name: str) -> bool:
         if name.startswith(pref):
             return True
     return False
+
+
+def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
+    if not raw:
+        return None
+    m = REGISTRY_STRING_PREFIX_RE.match(raw)
+    if not m:
+        return None
+    prefix = m.group(1)
+    hive_key = None
+    for short, aliases in REGISTRY_HIVE_ALIASES.items():
+        for alias in aliases:
+            if prefix.lower().startswith(alias.lower()):
+                hive_key = short
+                break
+        if hive_key:
+            break
+    hive_key = hive_key or prefix
+    path = raw[len(prefix) :].lstrip("\\/")
+    value_name = None
+    if path and "\\" in path:
+        parts = path.split("\\")
+        if parts[-1] and not parts[-1].startswith("{"):
+            value_name = parts[-1]
+    return {"hive": hive_key, "path": path, "value_name": value_name, "raw": raw}
+
+
+def collect_registry_string_candidates(api: FlatProgramAPI) -> Dict[str, Dict[str, Any]]:
+    listing = api.getCurrentProgram().getListing()
+    candidates: Dict[str, Dict[str, Any]] = {}
+    it = listing.getDefinedData(True)
+    while it.hasNext():
+        data = it.next()
+        try:
+            if not data.hasStringValue():
+                continue
+            val_obj = data.getValue()
+            if hasattr(val_obj, "getString"):
+                sval = val_obj.getString()
+            else:
+                sval = str(val_obj)
+        except Exception:
+            continue
+        meta = parse_registry_string(sval)
+        if meta:
+            candidates[str(data.getAddress())] = meta
+    return candidates
+
+
+# Extension point: future detectors (e.g., environment variables, config files)
+# could be wired here and merged into the roots dictionary in main().
 
 
 def discover_registry_roots(api: FlatProgramAPI) -> Dict[str, Dict[str, Any]]:
@@ -330,6 +402,9 @@ def discover_registry_roots(api: FlatProgramAPI) -> Dict[str, Dict[str, Any]]:
             "api_name": name,
             "entry": str(func.getEntryPoint()),
             "details": {},
+            "hive": None,
+            "path": None,
+            "value_name": None,
         }
     return roots
 
@@ -345,6 +420,45 @@ class FunctionAnalyzer:
         self.global_state = global_state
         self.mode = mode
         self.max_steps = 10_000_000
+        self.program = self.api.getCurrentProgram()
+
+    def _get_function_for_inst(self, inst: Instruction):
+        try:
+            fm = self.program.getFunctionManager()
+            return fm.getFunctionContaining(inst.getAddress())
+        except Exception:
+            return None
+
+    def _resolve_string_from_vn(self, vn) -> Optional[Dict[str, Any]]:
+        try:
+            addr = None
+            if vn is None:
+                return None
+            if hasattr(vn, "isAddress") and vn.isAddress():
+                addr = vn.getAddress()
+            elif vn.isAddrTied():
+                addr = vn.getAddress()
+            elif vn.isConstant():
+                addr = self.api.toAddr(vn.getOffset())
+            if addr is None:
+                return None
+            addr_str = str(addr)
+            if addr_str in self.global_state.registry_strings:
+                return self.global_state.registry_strings[addr_str]
+            data = self.program.getListing().getDataContaining(addr)
+            if data and data.hasStringValue():
+                try:
+                    val_obj = data.getValue()
+                    sval = val_obj.getString() if hasattr(val_obj, "getString") else str(val_obj)
+                    meta = parse_registry_string(sval)
+                    if meta:
+                        self.global_state.registry_strings[addr_str] = meta
+                        return meta
+                except Exception:
+                    return None
+        except Exception:
+            return None
+        return None
 
     def analyze_all(self) -> None:
         fm = self.api.getFunctionManager()
@@ -373,8 +487,8 @@ class FunctionAnalyzer:
     def analyze_function(self, func) -> FunctionSummary:
         summary = FunctionSummary(func.getName(), str(func.getEntryPoint()))
         body = func.getBody()
-        listing = self.api.getCurrentProgram().getListing()
-        block_model = BasicBlockModel(currentProgram)
+        listing = self.program.getListing()
+        block_model = BasicBlockModel(self.program)
         blocks = list(block_model.getCodeBlocksContaining(body, self.api.getMonitor()))
         preds: Dict[Any, List[Any]] = defaultdict(list)
         succs: Dict[Any, List[Any]] = defaultdict(list)
@@ -476,7 +590,7 @@ class FunctionAnalyzer:
         elif opname == "MULTIEQUAL":
             self._handle_multiequal(out, inputs, states)
         elif opname == "CALL":
-            self._handle_call(inst, op, inputs, states, summary)
+            self._handle_call(func, inst, op, inputs, states, summary)
         elif opname == "RETURN":
             self._handle_return(inputs, states, summary)
         else:
@@ -625,9 +739,10 @@ class FunctionAnalyzer:
                 self.global_state.struct_slots[key] = slot
             else:
                 slot.value = slot.value.merge(src_val)
+            inst_func = self._get_function_for_inst(inst)
+            func_name = inst_func.getName() if inst_func else "unknown"
             self.global_state.function_summaries.setdefault(
-                inst.getFunction().getName() if inst.getFunction() else "unknown",
-                FunctionSummary(inst.getFunction().getName() if inst.getFunction() else "unknown", str(inst.getAddress())),
+                func_name, FunctionSummary(func_name, str(inst.getAddress()))
             ).slot_writes.append(
                 {
                     "base_id": slot.base_id,
@@ -639,7 +754,7 @@ class FunctionAnalyzer:
                 self.global_state.overrides.append(
                     {
                         "address": str(inst.getAddress()),
-                        "function": inst.getFunction().getName() if inst.getFunction() else None,
+                        "function": func_name,
                         "source_origins": sorted(src_val.origins),
                         "notes": "struct slot override",
                     }
@@ -663,6 +778,8 @@ class FunctionAnalyzer:
         if not inputs:
             return
         cond_val = self._get_val(inputs[0], states)
+        if self.mode == "taint" and not cond_val.origins:
+            return
         if not cond_val.candidate_bits:
             cond_val.mark_all_bits_used()
         decision = Decision(
@@ -685,7 +802,12 @@ class FunctionAnalyzer:
         merged.bit_width = out.getSize() * 8
         self._set_val(out, merged, states)
 
-    def _handle_call(self, inst, op: PcodeOp, inputs, states, summary: FunctionSummary):
+    def _handle_call(self, func, inst, op: PcodeOp, inputs, states, summary: FunctionSummary):
+        string_args: List[Dict[str, Any]] = []
+        for inp in inputs:
+            meta = self._resolve_string_from_vn(inp)
+            if meta:
+                string_args.append(meta)
         for idx, inp in enumerate(inputs):
             arg_val = self._get_val(inp, states)
             if arg_val.origins:
@@ -718,16 +840,35 @@ class FunctionAnalyzer:
                     if slot_val:
                         slot_val.value.origins |= set(slot.get("origins", []))
             if is_registry_api(callee_name):
+                hive = path = value_name = None
+                if string_args:
+                    hive = string_args[0].get("hive")
+                    path = string_args[0].get("path")
+                    value_name = string_args[0].get("value_name")
+                    if len(string_args) > 1:
+                        value_candidate = string_args[1].get("value_name") or string_args[1].get("raw")
+                        if value_candidate:
+                            value_name = value_candidate
                 root_id = f"api_{callee_name}_{inst.getAddress()}"
-                self.global_state.roots.setdefault(
+                root_meta = self.global_state.roots.setdefault(
                     root_id,
                     {
                         "id": root_id,
                         "type": "registry",
                         "api_name": callee_name,
                         "address": str(inst.getAddress()),
+                        "entry": str(func.getEntryPoint()) if func else None,
+                        "hive": hive,
+                        "path": path,
+                        "value_name": value_name,
                     },
                 )
+                if hive and not root_meta.get("hive"):
+                    root_meta["hive"] = hive
+                if path and not root_meta.get("path"):
+                    root_meta["path"] = path
+                if value_name and not root_meta.get("value_name"):
+                    root_meta["value_name"] = value_name
                 if op.getOutput() is not None:
                     val = self._get_val(op.getOutput(), states)
                     val.tainted = True
@@ -865,8 +1006,13 @@ def main():
     log_info(f"[info] RegistryKeyBitfieldReport starting (mode={mode}, debug={DEBUG_ENABLED}, trace={TRACE_ENABLED})")
     global_state = GlobalState()
     global_state.roots = discover_registry_roots(api)
+    global_state.registry_strings = collect_registry_string_candidates(api)
     if mode == "full" and not global_state.roots:
-        global_state.roots["root_synthetic"] = {"id": "root_synthetic", "type": "synthetic", "details": {}}
+        global_state.roots["root_synthetic"] = {
+            "id": "root_synthetic",
+            "type": "synthetic",
+            "details": {"note": "no registry roots detected; synthetic seed"},
+        }
     analyzer = FunctionAnalyzer(api, global_state, mode)
     analyzer.analyze_all()
     emit_ndjson(global_state)
