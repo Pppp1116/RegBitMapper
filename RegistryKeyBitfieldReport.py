@@ -38,7 +38,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 try:  # pragma: no cover - executed inside Ghidra
-    from ghidra import currentProgram
     from ghidra.program.flatapi import FlatProgramAPI
     from ghidra.program.model.block import BasicBlockModel
     from ghidra.program.model.listing import Instruction
@@ -47,7 +46,6 @@ try:  # pragma: no cover - executed inside Ghidra
     from ghidra.program.model.symbol import RefType
     from ghidra.util.task import TaskMonitor
 except Exception:  # pragma: no cover
-    currentProgram = None
     FlatProgramAPI = None
     BasicBlockModel = None
     Instruction = None
@@ -55,6 +53,11 @@ except Exception:  # pragma: no cover
     RefType = None
     TaskMonitor = None
     AddressSet = None
+
+try:  # pragma: no cover - ensure currentProgram exists in PyGhidra
+    currentProgram  # type: ignore[name-defined]
+except NameError:  # pragma: no cover
+    currentProgram = None
 
 # ---------------------------------------------------------------------------
 # Argument parsing and logging
@@ -83,6 +86,12 @@ def parse_args(raw_args: List[str]) -> Dict[str, Any]:
     return parsed
 
 
+if currentProgram is None or FlatProgramAPI is None or BasicBlockModel is None or TaskMonitor is None:
+    print(
+        "RegistryKeyBitfieldReport must be run inside Ghidra 12 with the PyGhidra CPython bridge (currentProgram and core APIs required)."
+    )
+    sys.exit(1)
+
 raw_args = [a for a in sys.argv[1:] if "=" in a]
 if raw_args:
     args = parse_args(raw_args)
@@ -106,11 +115,6 @@ def log_debug(msg: str) -> None:
 def log_trace(msg: str) -> None:
     if TRACE_ENABLED:
         print(msg)
-
-
-if currentProgram is None:
-    print("RegistryKeyBitfieldReport must be run under PyGhidra (currentProgram required).")
-    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +208,25 @@ class AbstractValue:
         else:
             merged.pointer_pattern = None
         return merged
+
+    def state_signature(self) -> Tuple:
+        pointer_sig = None
+        if self.pointer_pattern is not None:
+            pointer_sig = (
+                self.pointer_pattern.base_id,
+                self.pointer_pattern.offset,
+                self.pointer_pattern.stride,
+                bool(self.pointer_pattern.index_var is not None),
+                self.pointer_pattern.unknown,
+            )
+        return (
+            self.tainted,
+            frozenset(self.origins),
+            self.bit_width,
+            frozenset(self.used_bits),
+            frozenset(self.candidate_bits),
+            pointer_sig,
+        )
 
 
 @dataclass
@@ -594,7 +617,7 @@ class FunctionAnalyzer:
             o = old.get(k)
             if o is None:
                 return True
-            if v.tainted != o.tainted or v.origins != o.origins or v.used_bits != o.used_bits or v.candidate_bits != o.candidate_bits:
+            if v.state_signature() != o.state_signature():
                 return True
         return False
 
@@ -983,6 +1006,7 @@ def build_root_records(global_state: GlobalState) -> List[Dict[str, Any]]:
         slot_entries = []
         used_bits: Set[int] = set()
         candidate_bits: Set[int] = set()
+        slot_bit_widths: List[int] = []
         for (base_id, offset), slot in global_state.struct_slots.items():
             if slot.value.origins and root_id in slot.value.origins:
                 slot_entries.append(
@@ -997,6 +1021,7 @@ def build_root_records(global_state: GlobalState) -> List[Dict[str, Any]]:
                 )
                 used_bits |= slot.value.used_bits
                 candidate_bits |= slot.value.candidate_bits
+                slot_bit_widths.append(slot.value.bit_width)
         decisions = [d.to_dict() for d in global_state.decisions if root_id in d.origins]
         overrides = [o for o in global_state.overrides if root_id in o.get("source_origins", [])]
         record = {
@@ -1009,7 +1034,7 @@ def build_root_records(global_state: GlobalState) -> List[Dict[str, Any]]:
             "entry": meta.get("entry"),
             "struct_slots": slot_entries,
             "bit_usage": {
-                "bit_width": max([32] + [slot.value.bit_width for slot in global_state.struct_slots.values()]),
+                "bit_width": max([32] + slot_bit_widths),
                 "used_bits": sorted(used_bits),
                 "candidate_bits": sorted(candidate_bits),
             },
