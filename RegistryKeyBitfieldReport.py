@@ -1171,27 +1171,48 @@ class FunctionAnalyzer:
                 summary.param_influence[idx] |= set(arg_val.origins)
         callee_name = None
         callee_func = None
-        callee_refs = [r for r in inst.getReferencesFrom() if r.getReferenceType().isCall()]
-        if callee_refs:
-            to_addr = callee_refs[0].getToAddress()
-            callee_func = self.program.getFunctionManager().getFunctionAt(to_addr)
-            if callee_func:
-                if getattr(callee_func, "isThunk", lambda: False)():
-                    thunk_target = getattr(callee_func, "getThunkedFunction", lambda: None)()
-                    if thunk_target:
-                        callee_func = thunk_target
-                callee_name = callee_func.getName()
-            if not callee_name:
-                for ref in callee_refs:
-                    try:
-                        if hasattr(ref, "isExternalReference") and ref.isExternalReference():
-                            ext_loc = ref.getExternalLocation()
-                            if ext_loc:
-                                callee_name = ext_loc.getLabel() or ext_loc.getOriginalImportedName()
-                                if callee_name:
-                                    break
-                    except Exception:
-                        continue
+
+        # Be liberal: for imported functions the reference type may not report
+        # isCall(), so scan all refs and ask FunctionManager if the target is
+        # a function. This works better for IAT/thunks on PE files.
+        refs = list(inst.getReferencesFrom())
+        fm = self.program.getFunctionManager()
+        for r in refs:
+            try:
+                to_addr = r.getToAddress()
+                if to_addr is None:
+                    continue
+                f = fm.getFunctionAt(to_addr)
+                if f is not None:
+                    # Resolve through thunk if needed.
+                    if getattr(f, "isThunk", lambda: False)():
+                        thunk_target = getattr(f, "getThunkedFunction", lambda: None)()
+                        if thunk_target:
+                            f = thunk_target
+                    callee_func = f
+                    callee_name = f.getName()
+                    break
+            except Exception:
+                continue
+
+        # Fallback: external location label if no direct function was found.
+        if callee_name is None:
+            for r in refs:
+                try:
+                    if hasattr(r, "isExternalReference") and r.isExternalReference():
+                        ext_loc = r.getExternalLocation()
+                        if ext_loc:
+                            callee_name = ext_loc.getLabel() or ext_loc.getOriginalImportedName()
+                            if callee_name:
+                                break
+                except Exception:
+                    continue
+
+        if DEBUG_ENABLED:
+            log_debug(
+                f"[debug] call at {inst.getAddress()} opname={opcode_name(op)} "
+                f"callee_name={callee_name!r} refs={len(refs)}"
+            )
         normalized_api_label = normalize_registry_label(callee_name) if callee_name else None
         label_fragment = normalized_api_label or callee_name or "<indirect>"
         safe_label = re.sub(r"[^A-Za-z0-9_]+", "_", label_fragment)
