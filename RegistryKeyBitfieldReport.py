@@ -101,24 +101,37 @@ def parse_args(raw_args: List[str], context_hint: str) -> Dict[str, Any]:
     mode = parsed.get("mode")
     if mode not in {"taint", "full"}:
         if context_hint == "headless" and raw_args:
-            print("[error] mode argument missing or invalid (expected mode=taint|full)")
+            print("[error] mode argument missing or invalid (expected mode=taint|full)", file=sys.stderr)
             sys.exit(1)
         parsed["mode"] = "taint"
     parsed["debug"] = _parse_bool(parsed.get("debug", "false"))
     parsed["trace"] = _parse_bool(parsed.get("trace", "false"))
+    if "max_steps" in parsed:
+        try:
+            parsed["max_steps"] = int(parsed.get("max_steps", "0"))
+        except Exception:
+            print("[warn] max_steps is not an integer; using default", file=sys.stderr)
+            parsed.pop("max_steps", None)
+    if "max_function_iterations" in parsed:
+        try:
+            parsed["max_function_iterations"] = int(parsed.get("max_function_iterations", "0"))
+        except Exception:
+            print("[warn] max_function_iterations is not an integer; using default", file=sys.stderr)
+            parsed.pop("max_function_iterations", None)
     return parsed
 
 
 def _ensure_environment(context_hint: str) -> bool:
     if FlatProgramAPI is None or BasicBlockModel is None or TaskMonitor is None:
         print(
-            "RegistryKeyBitfieldReport must be run inside Ghidra 12 with the PyGhidra CPython bridge (core APIs required)."
+            "RegistryKeyBitfieldReport must be run inside Ghidra 12 with the PyGhidra CPython bridge (core APIs required).",
+            file=sys.stderr,
         )
         if context_hint == "headless":
             sys.exit(1)
         return False
     if currentProgram is None:
-        print("[error] currentProgram is not available; open a program before running the script.")
+        print("[error] currentProgram is not available; open a program before running the script.", file=sys.stderr)
         if context_hint == "headless":
             sys.exit(1)
         return False
@@ -141,17 +154,14 @@ def _has_mode(arg_list: List[str]) -> bool:
 
 script_manager_args = _filter_kv_args(_get_script_args())
 cli_args = _filter_kv_args(_SYS_RAW_ARGS)
-if _has_mode(cli_args):
+if script_manager_args:
+    INVOCATION_CONTEXT = "script_manager"
+    args = parse_args(script_manager_args, INVOCATION_CONTEXT)
+elif __name__ == "__main__" or _has_mode(cli_args):
     INVOCATION_CONTEXT = "headless"
-    args = parse_args(cli_args, INVOCATION_CONTEXT)
-elif _has_mode(script_manager_args):
-    INVOCATION_CONTEXT = "script_manager"
-    args = parse_args(script_manager_args, INVOCATION_CONTEXT)
-elif script_manager_args:
-    INVOCATION_CONTEXT = "script_manager"
-    args = parse_args(script_manager_args, INVOCATION_CONTEXT)
-elif cli_args:
-    INVOCATION_CONTEXT = "script_manager"
+    if cli_args and not _has_mode(cli_args):
+        print("[error] headless execution requires mode=taint|full", file=sys.stderr)
+        sys.exit(1)
     args = parse_args(cli_args, INVOCATION_CONTEXT)
 else:
     INVOCATION_CONTEXT = "script_manager"
@@ -173,24 +183,37 @@ def _resolve_dummy_monitor():
             return DummyTaskMonitor()
         except Exception:
             return None
-    return None
+    class _NoOpMonitor:
+        def checkCanceled(self):
+            return False
+
+        def isCancelled(self):
+            return False
+
+        def setMessage(self, msg):
+            return None
+
+        def setProgress(self, val):
+            return None
+
+    return _NoOpMonitor()
 
 
 DUMMY_MONITOR = _resolve_dummy_monitor()
 
 
 def log_info(msg: str) -> None:
-    print(msg)
+    print(msg, file=sys.stderr)
 
 
 def log_debug(msg: str) -> None:
     if DEBUG_ENABLED:
-        print(msg)
+        print(msg, file=sys.stderr)
 
 
 def log_trace(msg: str) -> None:
     if TRACE_ENABLED:
-        print(msg)
+        print(msg, file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +365,23 @@ class FunctionSummary:
     return_influence: Set[str] = field(default_factory=set)
     slot_writes: List[Dict[str, Any]] = field(default_factory=list)
     decisions: List[Decision] = field(default_factory=list)
+    _decision_signatures: Set[Tuple] = field(default_factory=set, init=False, repr=False)
+
+    @staticmethod
+    def _decision_signature(decision: Decision) -> Tuple:
+        return (
+            decision.address,
+            tuple(sorted(decision.origins)),
+            tuple(sorted(decision.used_bits)),
+            tuple(sorted(decision.details.items())),
+        )
+
+    def add_decision(self, decision: Decision) -> None:
+        sig = self._decision_signature(decision)
+        if sig in self._decision_signatures:
+            return
+        self._decision_signatures.add(sig)
+        self.decisions.append(decision)
 
     def merge_from(self, other: "FunctionSummary") -> bool:
         changed = False
@@ -361,7 +401,9 @@ class FunctionSummary:
                 self.slot_writes.append(slot)
                 changed = True
         for dec in other.decisions:
-            if dec.to_dict() not in [d.to_dict() for d in self.decisions]:
+            sig = self._decision_signature(dec)
+            if sig not in self._decision_signatures:
+                self._decision_signatures.add(sig)
                 self.decisions.append(dec)
                 changed = True
         return changed
@@ -399,6 +441,12 @@ def varnode_key(vn) -> Tuple:
     if vn.isAddrTied():
         return ("mem", str(vn.getAddress()), vn.getSize())
     return ("unk", str(vn), vn.getSize())
+
+
+def pointer_base_identifier(func, vn) -> str:
+    key = varnode_key(vn)
+    func_name = func.getName() if func else "<unknown>"
+    return f"{func_name}::{key}"
 
 
 def new_value_from_varnode(vn) -> AbstractValue:
@@ -482,7 +530,7 @@ def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
     value_name = None
     if path and "\\" in path:
         parts = path.split("\\")
-        if parts[-1] and not parts[-1].startswith("{"):
+        if parts[-1]:
             value_name = parts[-1]
     return {"hive": hive_key, "path": path, "value_name": value_name, "raw": raw}
 
@@ -491,7 +539,13 @@ def collect_registry_string_candidates(program) -> Dict[str, Dict[str, Any]]:
     listing = program.getListing()
     candidates: Dict[str, Dict[str, Any]] = {}
     it = listing.getDefinedData(True)
+    max_scan = 100_000
+    scanned = 0
     while it.hasNext():
+        scanned += 1
+        if max_scan and scanned > max_scan:
+            log_debug("[debug] registry string candidate scan capped for performance")
+            break
         data = it.next()
         try:
             if not data.hasStringValue():
@@ -509,33 +563,6 @@ def collect_registry_string_candidates(program) -> Dict[str, Dict[str, Any]]:
     return candidates
 
 
-# Extension point: future detectors (e.g., environment variables, config files)
-# could be wired here and merged into the roots dictionary in main().
-
-
-def discover_registry_roots(program) -> Dict[str, Dict[str, Any]]:
-    roots: Dict[str, Dict[str, Any]] = {}
-    root_counter = 0
-    fm = program.getFunctionManager()
-    for func in fm.getFunctions(True):
-        name = func.getName()
-        if not is_registry_api(name):
-            continue
-        root_id = f"root_{root_counter:03d}"
-        root_counter += 1
-        roots[root_id] = {
-            "id": root_id,
-            "type": "registry",
-            "api_name": name,
-            "entry": str(func.getEntryPoint()),
-            "details": {},
-            "hive": None,
-            "path": None,
-            "value_name": None,
-        }
-    return roots
-
-
 # ---------------------------------------------------------------------------
 # Core analysis engine
 # ---------------------------------------------------------------------------
@@ -547,7 +574,10 @@ class FunctionAnalyzer:
         self.global_state = global_state
         self.mode = mode
         self.max_steps = 10_000_000
+        self.max_function_iterations = 1_000_000
         self.program = program
+        # Reuse a single BasicBlockModel for the program (safe for Ghidra 12).
+        self.block_model = BasicBlockModel(self.program)
 
     def _get_function_for_inst(self, inst: Instruction):
         try:
@@ -622,7 +652,7 @@ class FunctionAnalyzer:
         iteration_guard = 0
         # NOTE: call-depth limiting is not currently implemented; the call_depth_limit
         # flag in analysis_stats remains a placeholder for future enhancements.
-        while worklist and iteration_guard < 1_000_000:
+        while worklist and iteration_guard < self.max_function_iterations:
             func = worklist.popleft()
             iteration_guard += 1
             summary = self.analyze_function(func)
@@ -634,7 +664,7 @@ class FunctionAnalyzer:
             else:
                 if existing.merge_from(summary):
                     worklist.extend(func.getCalledFunctions(DUMMY_MONITOR))
-        if iteration_guard >= 1_000_000:
+        if iteration_guard >= self.max_function_iterations:
             log_debug("[warn] function iteration limit hit")
             self.global_state.analysis_stats["function_iterations_limit"] = True
 
@@ -647,8 +677,7 @@ class FunctionAnalyzer:
         summary = FunctionSummary(func.getName(), str(func.getEntryPoint()))
         body = func.getBody()
         listing = self.program.getListing()
-        block_model = BasicBlockModel(self.program)
-        blocks = list(block_model.getCodeBlocksContaining(body, DUMMY_MONITOR))
+        blocks = list(self.block_model.getCodeBlocksContaining(body, DUMMY_MONITOR))
         preds: Dict[Any, List[Any]] = defaultdict(list)
         succs: Dict[Any, List[Any]] = defaultdict(list)
         for blk in blocks:
@@ -753,9 +782,9 @@ class FunctionAnalyzer:
         elif opname == "STORE":
             self._handle_store(inst, inputs, states)
         elif opname == "PTRADD":
-            self._handle_ptradd(out, inputs, states)
+            self._handle_ptradd(func, out, inputs, states)
         elif opname in {"BRANCH", "CBRANCH"}:
-            self._handle_branch(func, inst, inputs, states, summary)
+            self._handle_branch(func, inst, opname, inputs, states, summary)
         elif opname == "MULTIEQUAL":
             self._handle_multiequal(out, inputs, states)
         elif opname == "CALL":
@@ -929,37 +958,43 @@ class FunctionAnalyzer:
                     }
                 )
 
-    def _handle_ptradd(self, out, inputs, states):
+    def _handle_ptradd(self, func, out, inputs, states):
         if out is None or len(inputs) < 2:
             return
         base = self._get_val(inputs[0], states)
         offset = inputs[1]
         val = base.clone()
         if val.pointer_pattern is None:
-            val.pointer_pattern = PointerPattern(base_id=str(inputs[0]))
+            val.pointer_pattern = PointerPattern(base_id=pointer_base_identifier(func, inputs[0]))
         if offset.isConstant():
             val.pointer_pattern.adjust_offset(int(offset.getOffset()))
         else:
+            val.pointer_pattern.index_var = varnode_key(offset)
             val.pointer_pattern.unknown = True
         self._set_val(out, val, states)
 
-    def _handle_branch(self, func, inst, inputs, states, summary: FunctionSummary):
+    def _handle_branch(self, func, inst, opname, inputs, states, summary: FunctionSummary):
         if not inputs:
             return
         cond_val = self._get_val(inputs[0], states)
         if self.mode == "taint" and not cond_val.origins:
+            log_trace(f"[trace] skipping untainted branch at {inst.getAddress()}")
             return
         if not cond_val.candidate_bits:
             cond_val.mark_all_bits_used()
+            branch_detail = {"type": "branch", "bit_heuristic": "all_bits_marked"}
+        else:
+            branch_detail = {"type": "branch"}
         decision = Decision(
             address=str(inst.getAddress()),
             mnemonic=inst.getMnemonicString(),
             disasm=inst.toString(),
             origins=set(cond_val.origins),
             used_bits=set(cond_val.used_bits or cond_val.candidate_bits),
-            details={"type": "branch"},
+            details=branch_detail,
         )
-        summary.decisions.append(decision)
+        decision.details["branch_kind"] = "unconditional" if opname == "BRANCH" else "conditional"
+        summary.add_decision(decision)
         self.global_state.decisions.append(decision)
 
     def _handle_multiequal(self, out, inputs, states):
@@ -1038,6 +1073,7 @@ class FunctionAnalyzer:
                 for idx, roots in callee_summary.param_influence.items():
                     if idx < len(call_args):
                         val = self._get_val(call_args[idx], states)
+                        summary.param_influence[idx] |= set(roots)
                         val.origins |= roots
                         val.tainted = val.tainted or bool(roots)
                 if callee_summary.return_influence and op.getOutput() is not None:
@@ -1052,6 +1088,12 @@ class FunctionAnalyzer:
                     slot_val = self.global_state.struct_slots.get(key)
                     if slot_val:
                         slot_val.value.origins |= set(slot.get("origins", []))
+                    else:
+                        origins = set(slot.get("origins", []))
+                        if key[0] is not None and key[1] is not None:
+                            self.global_state.struct_slots[key] = StructSlot(
+                                key[0], key[1], value=AbstractValue(origins=origins, tainted=bool(origins))
+                            )
             if is_registry_api(callee_name):
                 root_id = f"api_{callee_name}_{inst.getAddress()}"
                 entry_point = str(callee_func.getEntryPoint()) if callee_func else None
@@ -1197,7 +1239,10 @@ def main():
     if not _ensure_environment(INVOCATION_CONTEXT):
         return
     if DUMMY_MONITOR is None:
-        print("[error] TaskMonitor.DUMMY is unavailable; cannot proceed with control-flow analysis.")
+        print(
+            "[error] TaskMonitor.DUMMY is unavailable; cannot proceed with control-flow analysis.",
+            file=sys.stderr,
+        )
         if INVOCATION_CONTEXT == "headless":
             sys.exit(1)
         return
@@ -1210,18 +1255,15 @@ def main():
     if INVOCATION_CONTEXT == "script_manager":
         log_info("[info] Script Manager detected; NDJSON output will appear in the Ghidra console.")
     global_state = GlobalState()
-    global_state.roots = discover_registry_roots(program)
     global_state.registry_strings = collect_registry_string_candidates(program)
     log_debug(
-        f"[debug] discovered {len(global_state.roots)} registry roots; {len(global_state.registry_strings)} registry-like strings"
+        f"[debug] initial registry roots={len(global_state.roots)} registry-like strings={len(global_state.registry_strings)}"
     )
-    if mode == "full" and not global_state.roots:
-        global_state.roots["root_synthetic"] = {
-            "id": "root_synthetic",
-            "type": "synthetic",
-            "details": {"note": "no registry roots detected; synthetic seed"},
-        }
     analyzer = FunctionAnalyzer(api, program, global_state, mode)
+    if args.get("max_steps"):
+        analyzer.max_steps = max(1, int(args.get("max_steps")))
+    if args.get("max_function_iterations"):
+        analyzer.max_function_iterations = max(1, int(args.get("max_function_iterations")))
     analyzer.analyze_all()
     emit_ndjson(global_state)
     emit_improvement_suggestions(global_state)
