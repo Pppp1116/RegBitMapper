@@ -481,6 +481,22 @@ def pointer_base_identifier(func, vn) -> str:
     return f"{func_name}::{key}"
 
 
+def vn_is_constant(vn) -> bool:
+    try:
+        return bool(vn) and vn.isConstant()
+    except Exception:
+        return False
+
+
+def vn_get_offset(vn) -> Optional[int]:
+    try:
+        if vn_is_constant(vn):
+            return int(vn.getOffset())
+    except Exception:
+        return None
+    return None
+
+
 def new_value_from_varnode(vn) -> AbstractValue:
     width = vn.getSize() * 8 if vn else DEFAULT_POINTER_BIT_WIDTH
     if not width:
@@ -526,11 +542,11 @@ def normalize_registry_label(raw: Optional[str]) -> Optional[str]:
     if not cleaned:
         return None
     cleaned = re.sub(r"(?i)^(?:__imp__?|imp_)", "", cleaned)
-    # Treat common separators as boundaries while preserving the most
-    # registry-looking suffix (e.g., ADVAPI32.dll::RegOpenKeyExA@16 ->
-    # RegOpenKeyExA@16).
+    # Keep suffixes that look registry-like, handling common separators and
+    # mangled import labels such as ADVAPI32.dll::RegOpenKeyExA@16 or
+    # ADVAPI32.dll_RegQueryValueExW.
     tokens: List[str] = []
-    for part in re.split(r"[.:@!_]", cleaned):
+    for part in re.split(r"[.:@!_\\/]", cleaned):
         for sub in part.split("::"):
             for seg in sub.split("_"):
                 if seg:
@@ -570,6 +586,7 @@ def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
     raw = raw.strip("\x00").strip()
     if not raw:
         return None
+    raw = raw.replace("/", "\\")
     # Trim leading junk before a known hive fragment if present.
     m = REGISTRY_STRING_PREFIX_RE.search(raw)
     hive_key = None
@@ -699,10 +716,12 @@ class FunctionAnalyzer:
                 return None
             if hasattr(vn, "isAddress") and vn.isAddress():
                 addr = vn.getAddress()
-            elif vn.isAddrTied():
+            elif hasattr(vn, "isAddrTied") and vn.isAddrTied():
                 addr = vn.getAddress()
-            elif vn.isConstant():
-                addr = self.api.toAddr(vn.getOffset())
+            elif vn_is_constant(vn):
+                off = vn_get_offset(vn)
+                if off is not None:
+                    addr = self.api.toAddr(off)
             if addr is None:
                 return None
             addr_str = str(addr)
@@ -924,14 +943,14 @@ class FunctionAnalyzer:
         val.bit_width = out.getSize() * 8
         val.used_bits = set(a.used_bits | b.used_bits)
         val.candidate_bits = set(a.candidate_bits | b.candidate_bits)
-        if a.pointer_pattern and inputs[1].isConstant():
+        if a.pointer_pattern and vn_is_constant(inputs[1]):
             pp = a.pointer_pattern.clone()
-            delta = int(inputs[1].getOffset())
+            delta = vn_get_offset(inputs[1]) or 0
             pp.adjust_offset(delta if opname == "INT_ADD" else -delta)
             val.pointer_pattern = pp
-        elif b.pointer_pattern and inputs[0].isConstant():
+        elif b.pointer_pattern and vn_is_constant(inputs[0]):
             pp = b.pointer_pattern.clone()
-            delta = int(inputs[0].getOffset())
+            delta = vn_get_offset(inputs[0]) or 0
             pp.adjust_offset(delta if opname == "INT_ADD" else -delta)
             val.pointer_pattern = pp
         elif a.pointer_pattern and b.pointer_pattern:
@@ -965,14 +984,14 @@ class FunctionAnalyzer:
         val.candidate_bits = set(a.candidate_bits | b.candidate_bits)
         mask_src = None
         other = None
-        if inputs[0].isConstant():
+        if vn_is_constant(inputs[0]):
             mask_src = inputs[0]
             other = b
-        elif inputs[1].isConstant():
+        elif vn_is_constant(inputs[1]):
             mask_src = inputs[1]
             other = a
         if mask_src is not None and other is not None:
-            mask_val = int(mask_src.getOffset())
+            mask_val = vn_get_offset(mask_src) or 0
             other_bits = AbstractValue(bit_width=other.bit_width)
             other_bits.mark_bits_used(mask_val)
             val.used_bits |= other_bits.used_bits
@@ -1001,7 +1020,7 @@ class FunctionAnalyzer:
         val.tainted = base.tainted or self._get_val(amt, states).tainted
         val.origins = set(base.origins | self._get_val(amt, states).origins)
         val.bit_width = out.getSize() * 8
-        shift = amt.getOffset() if amt.isConstant() else None
+        shift = vn_get_offset(amt)
         if shift is None:
             val.mark_all_bits_used()
         else:
@@ -1076,10 +1095,10 @@ class FunctionAnalyzer:
         val = base.clone()
         if val.pointer_pattern is None:
             val.pointer_pattern = PointerPattern(base_id=pointer_base_identifier(func, inputs[0]))
-        if offset.isConstant():
-            val.pointer_pattern.adjust_offset(int(offset.getOffset()))
+        if vn_is_constant(offset):
+            val.pointer_pattern.adjust_offset(vn_get_offset(offset) or 0)
         else:
-            val.pointer_pattern.index_var = varnode_key(offset)
+            val.pointer_pattern.index_var = varnode_key(offset) if offset is not None else None
             val.pointer_pattern.unknown = True
         self._set_val(out, val, states)
 
@@ -1175,7 +1194,12 @@ class FunctionAnalyzer:
         # Be liberal: for imported functions the reference type may not report
         # isCall(), so scan all refs and ask FunctionManager if the target is
         # a function. This works better for IAT/thunks on PE files.
-        refs = list(inst.getReferencesFrom())
+        refs_iter = None
+        try:
+            refs_iter = inst.getReferencesFrom()
+        except Exception:
+            refs_iter = None
+        refs = list(refs_iter) if refs_iter else []
         fm = self.program.getFunctionManager()
         for r in refs:
             try:
@@ -1207,6 +1231,31 @@ class FunctionAnalyzer:
                                 break
                 except Exception:
                     continue
+
+        # P-code input 0 often carries the callee address for direct CALL
+        # sites. Use it as another hint when reference metadata is sparse.
+        if callee_name is None and inputs:
+            target_vn = inputs[0]
+            if target_vn is not None:
+                try:
+                    target_addr = None
+                    if hasattr(target_vn, "getAddress"):
+                        target_addr = target_vn.getAddress()
+                    if target_addr is None and vn_is_constant(target_vn):
+                        off = vn_get_offset(target_vn)
+                        if off is not None:
+                            target_addr = self.api.toAddr(off)
+                    if target_addr is not None:
+                        func_at_target = fm.getFunctionAt(target_addr)
+                        if func_at_target:
+                            if getattr(func_at_target, "isThunk", lambda: False)():
+                                thunk_target = getattr(func_at_target, "getThunkedFunction", lambda: None)()
+                                if thunk_target:
+                                    func_at_target = thunk_target
+                            callee_func = func_at_target
+                            callee_name = func_at_target.getName()
+                except Exception:
+                    pass
 
         if DEBUG_ENABLED:
             log_debug(
