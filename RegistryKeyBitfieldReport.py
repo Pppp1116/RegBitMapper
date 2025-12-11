@@ -314,6 +314,7 @@ class AbstractValue:
     candidate_bits: Set[int] = field(default_factory=set)
     pointer_pattern: Optional[PointerPattern] = None
     pointer_targets: Set[int] = field(default_factory=set)
+    function_pointer_labels: Set[str] = field(default_factory=set)
 
     def clone(self) -> "AbstractValue":
         return AbstractValue(
@@ -324,6 +325,7 @@ class AbstractValue:
             candidate_bits=set(self.candidate_bits),
             pointer_pattern=self.pointer_pattern.clone() if self.pointer_pattern else None,
             pointer_targets=set(self.pointer_targets),
+            function_pointer_labels=set(self.function_pointer_labels),
         )
 
     def mark_bits_used(self, mask: int) -> None:
@@ -347,6 +349,7 @@ class AbstractValue:
         merged.used_bits = set(self.used_bits | other.used_bits)
         merged.candidate_bits = set(self.candidate_bits | other.candidate_bits)
         merged.pointer_targets = set(self.pointer_targets | other.pointer_targets)
+        merged.function_pointer_labels = set(self.function_pointer_labels | other.function_pointer_labels)
         if self.pointer_pattern and other.pointer_pattern:
             merged.pointer_pattern = self.pointer_pattern.merge(other.pointer_pattern)
         elif self.pointer_pattern:
@@ -375,6 +378,7 @@ class AbstractValue:
             frozenset(self.candidate_bits),
             pointer_sig,
             frozenset(self.pointer_targets),
+            frozenset(self.function_pointer_labels),
         )
 
 
@@ -471,6 +475,7 @@ class GlobalState:
     root_decision_index: Dict[str, List[Decision]] = field(default_factory=lambda: defaultdict(list))
     root_slot_index: Dict[str, Set[Tuple[str, int]]] = field(default_factory=lambda: defaultdict(set))
     root_override_index: Dict[str, List[Dict[str, Any]]] = field(default_factory=lambda: defaultdict(list))
+    heap_string_writes: Dict[str, Dict[int, bytes]] = field(default_factory=lambda: defaultdict(dict))
 
 
 # ---------------------------------------------------------------------------
@@ -770,13 +775,13 @@ def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
     if not raw:
         return None
     raw = raw.replace("/", "\\")
-    # Trim leading junk before a known hive fragment if present.
+    # Trim leading junk before a known hive fragment if present, but do not
+    # require a canonical prefix – synthetic/relative paths are allowed.
     m = REGISTRY_STRING_PREFIX_RE.search(raw)
     hive_key = None
-    path = None
+    path = raw
     key_path: Optional[str] = None
     value_name = None
-    candidate_segment = raw
     if m:
         candidate_segment = raw[m.start() :]
         prefix = m.group(1)
@@ -788,26 +793,7 @@ def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
             if hive_key:
                 break
         hive_key = hive_key or prefix
-        path = candidate_segment[len(prefix) :].lstrip("\\/")
-    if path is None:
-        lowered = raw.lower()
-        partial_prefixes = [
-            "\\registry\\machine\\",
-            "\\registry\\user\\",
-            "system\\currentcontrolset\\",
-            "system\\controlset",
-            "software\\",
-            "control\\",
-        ]
-        for pref in partial_prefixes:
-            pos = lowered.find(pref)
-            if pos != -1:
-                path = raw[pos:].lstrip("\\/")
-                break
-        if path is None and lowered.startswith(tuple(partial_prefixes)):
-            path = raw.lstrip("\\/")
-    if path is None:
-        return None
+        path = candidate_segment[len(prefix) :].lstrip("\\/") or candidate_segment
     path = path.strip().strip("\x00")
     if not path:
         return None
@@ -1100,6 +1086,23 @@ class FunctionAnalyzer:
                         addr_candidates.append(self.api.toAddr(off))
                     except Exception:
                         continue
+                if val.pointer_pattern and val.pointer_pattern.base_id:
+                    heap_bytes = self.global_state.heap_string_writes.get(val.pointer_pattern.base_id)
+                    if heap_bytes:
+                        collected = bytearray()
+                        # Prefer contiguous bytes from the exact offset forward.
+                        start = val.pointer_pattern.offset or 0
+                        for i in range(0, 256):
+                            b = heap_bytes.get(start + i)
+                            if b is None:
+                                break
+                            collected.extend(b)
+                            if b == b"\x00":
+                                break
+                        if collected:
+                            meta = parse_registry_string(collected.decode("latin-1", errors="ignore"))
+                            if meta:
+                                return meta
             for addr in addr_candidates:
                 if addr is None:
                     continue
@@ -1289,6 +1292,18 @@ class FunctionAnalyzer:
             self._handle_ptradd(func, out, inputs, states)
         elif opname == "PTRSUB":
             self._handle_ptrsub(func, out, inputs, states)
+        elif opname in {
+            "INT_EQUAL",
+            "INT_NOTEQUAL",
+            "INT_LESS",
+            "INT_LESSEQUAL",
+            "INT_SLESS",
+            "INT_SLESSEQUAL",
+            "INT_CARRY",
+            "INT_SCARRY",
+            "INT_SBORROW",
+        }:
+            self._handle_compare(out, inputs, states)
         elif opname == "CBRANCH":  # unconditional BRANCH has no condition operand
             self._handle_branch(func, inst, opname, inputs, states, summary)
         elif opname == "MULTIEQUAL":
@@ -1437,6 +1452,26 @@ class FunctionAnalyzer:
                 val.pointer_targets = set()
         self._set_val(out, val, states)
 
+    def _handle_compare(self, out, inputs, states):
+        if out is None or len(inputs) < 2:
+            return
+        a = self._get_val(inputs[0], states)
+        b = self._get_val(inputs[1], states)
+        val = AbstractValue(bit_width=out.getSize() * 8)
+        val.tainted = a.tainted or b.tainted
+        val.origins = set(a.origins | b.origins)
+        # All bits used from both sides since comparison is full-width.
+        if a.candidate_bits:
+            val.used_bits |= set(a.candidate_bits)
+        else:
+            val.used_bits |= set(range(a.bit_width))
+        if b.candidate_bits:
+            val.used_bits |= set(b.candidate_bits)
+        else:
+            val.used_bits |= set(range(b.bit_width))
+        val.candidate_bits = set(val.used_bits)
+        self._set_val(out, val, states)
+
     def _handle_load(self, out, inputs, states):
         if out is None or len(inputs) < 2:
             return
@@ -1497,6 +1532,17 @@ class FunctionAnalyzer:
                 self.global_state.overrides.append(override_entry)
                 for origin in old_value.origins:
                     self.global_state.root_override_index[origin].append(override_entry)
+        # Reconstruct heap/stack string fragments from MOV/STORE sequences.
+        if addr_val.pointer_pattern and addr_val.pointer_pattern.base_id and vn_is_constant(inputs[2]):
+            try:
+                const_val = vn_get_offset(inputs[2]) or 0
+                width = inputs[2].getSize()
+                bytes_le = const_val.to_bytes(width, byteorder="little", signed=False)
+                for idx, b in enumerate(bytes_le):
+                    offset = (addr_val.pointer_pattern.offset or 0) + idx
+                    self.global_state.heap_string_writes[addr_val.pointer_pattern.base_id][offset] = bytes([b])
+            except Exception:
+                pass
 
     def _handle_ptradd(self, func, out, inputs, states):
         if out is None or len(inputs) < 2:
@@ -1630,10 +1676,10 @@ class FunctionAnalyzer:
 
         def _pointerish_argument(vn, val: AbstractValue) -> bool:
             try:
-                if val.pointer_targets or val.pointer_pattern:
-                    return True
                 if vn is None:
                     return False
+                if val.pointer_targets or val.pointer_pattern or val.function_pointer_labels:
+                    return True
                 if vn_has_address(vn):
                     return True
                 if not vn_is_constant(vn) and vn.getSize() * 8 >= DEFAULT_POINTER_BIT_WIDTH:
@@ -1645,6 +1691,8 @@ class FunctionAnalyzer:
 
         def _seed_root(root_id: str, api_label: str, entry_point: Optional[str]) -> None:
             hive, path, value_name = _derive_registry_fields()
+            if path is None:
+                path = f"unknown_path_{inst.getAddress()}"
             root_meta = self.global_state.roots.setdefault(
                 root_id,
                 {
@@ -1685,6 +1733,23 @@ class FunctionAnalyzer:
                 summary.param_influence[idx] |= set(arg_val.origins)
             if _pointerish_argument(inp, arg_val):
                 pointer_like_args.append(inp)
+        # Special-case registry read APIs to ensure output buffers are tainted.
+        def _taint_registry_outputs(label: Optional[str]) -> None:
+            if label is None:
+                return
+            lowered = label.lower()
+            buffer_indices = []
+            if "queryvalueex" in lowered:
+                buffer_indices = [3, 4]
+            elif "rtlqueryregistryvalues" in lowered:
+                buffer_indices = list(range(len(call_args)))
+            for idx in buffer_indices:
+                if idx < len(call_args):
+                    val = self._get_val(call_args[idx], states)
+                    val.tainted = True
+                    for origin in val.origins:
+                        self.global_state.root_slot_index[origin].add((pointer_base_identifier(func, call_args[idx]), 0))
+                    self._set_val(call_args[idx], val, states)
         callee_name = None
         callee_func = None
 
@@ -1750,6 +1815,10 @@ class FunctionAnalyzer:
                         off = vn_get_offset(target_vn)
                         if off is not None:
                             target_addr = self.api.toAddr(off)
+                    if callee_name is None:
+                        val = self._get_val(target_vn, states)
+                        if val.function_pointer_labels:
+                            callee_name = sorted(val.function_pointer_labels)[0]
                     if target_addr is not None:
                         func_at_target = fm.getFunctionAt(target_addr)
                         if func_at_target:
@@ -1797,6 +1866,17 @@ class FunctionAnalyzer:
         normalized_api_label = normalize_registry_label(callee_name) if callee_name else None
         label_fragment = normalized_api_label or callee_name or "<indirect>"
         safe_label = re.sub(r"[^A-Za-z0-9_]+", "_", label_fragment)
+        if normalized_api_label == "getprocaddress" and op.getOutput() is not None:
+            try:
+                out_val = self._get_val(op.getOutput(), states)
+                if string_args:
+                    target = string_args[-1].get("raw") or string_args[-1].get("path")
+                    norm_target = normalize_registry_label(target)
+                    if norm_target:
+                        out_val.function_pointer_labels.add(norm_target)
+                self._set_val(op.getOutput(), out_val, states)
+            except Exception:
+                pass
         if callee_name:
             callee_summary = self.global_state.function_summaries.get(callee_name)
             if callee_summary:
@@ -1834,6 +1914,7 @@ class FunctionAnalyzer:
                 # Prefer the resolved callee entrypoint when tying registry roots to call sites.
                 entry_point = str(callee_func.getEntryPoint()) if callee_func else None
                 _seed_root(root_id, api_label, entry_point)
+                _taint_registry_outputs(api_label)
             elif string_args and (callee_func is None or getattr(callee_func, "isExternal", lambda: False)()):
                 root_id = f"api_like_{safe_label}_{inst.getAddress()}"
                 # Prefer the resolved callee entrypoint when available; otherwise fall back to the call site.
