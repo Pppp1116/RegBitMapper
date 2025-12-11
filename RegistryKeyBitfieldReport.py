@@ -872,7 +872,7 @@ CURATED_REGISTRY_APIS = {
 # Imported registry APIs gathered from the binary's externals. Filled in at
 # runtime inside main().
 IMPORTED_REGISTRY_API_NAMES: Set[str] = set()
-IMPORTED_REGISTRY_API_ADDRS: Dict[int, str] = {}
+IMPORTED_REGISTRY_API_ADDRS: Dict[Any, str] = {}
 
 # HKEY_* handle constants and their logical hive names/kernels-style roots for
 # combining with "SOFTWARE\\RegTestMatrix\\..." suffixes.
@@ -1143,9 +1143,9 @@ def collect_registry_string_candidates(program, scan_limit: Optional[int] = None
     return candidates
 
 
-def collect_imported_registry_apis(program) -> Tuple[Set[str], Dict[int, str]]:
+def collect_imported_registry_apis(program) -> Tuple[Set[str], Dict[Any, str]]:
     names: Set[str] = set()
-    addr_map: Dict[int, str] = {}
+    addr_map: Dict[Any, str] = {}
 
     def _record_symbol(sym_name: Optional[str], addr_obj) -> None:
         normalized = normalize_registry_label(sym_name)
@@ -1160,6 +1160,7 @@ def collect_imported_registry_apis(program) -> Tuple[Set[str], Dict[int, str]]:
         try:
             if addr_obj is not None and hasattr(addr_obj, "getOffset"):
                 addr_map[int(addr_obj.getOffset())] = normalized
+                addr_map[str(addr_obj)] = normalized
                 if DEBUG_ENABLED:
                     log_debug(
                         f"[debug] registry import detected: raw={sym_name!r} normalized={normalized!r} addr={addr_obj}"
@@ -1489,6 +1490,13 @@ class FunctionAnalyzer:
                 callee_func = func_at_target
                 if callee is None:
                     callee = func_at_target.getName()
+            mapped = IMPORTED_REGISTRY_API_ADDRS.get(str(target_addr))
+            if mapped:
+                callee = callee or mapped
+                try:
+                    callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(target_addr))
+                except Exception:
+                    pass
         try:
             target = target_vn.getOffset() if target_vn is not None and hasattr(target_vn, "getOffset") else None
         except Exception:
@@ -1513,6 +1521,12 @@ class FunctionAnalyzer:
                     break
                 try:
                     addr_obj = self.api.toAddr(tgt)
+                    str_addr = str(addr_obj)
+                    mapped = IMPORTED_REGISTRY_API_ADDRS.get(str_addr)
+                    if mapped:
+                        callee = mapped
+                        callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(addr_obj))
+                        break
                     ext_label = self._external_label_for_address(addr_obj)
                     if ext_label:
                         callee = ext_label
@@ -2407,7 +2421,8 @@ class FunctionAnalyzer:
         if DEBUG_ENABLED:
             log_debug(
                 f"[debug] call at {inst.getAddress()} opname={opcode_name(op)} "
-                f"callee_name={callee_name!r} refs={len(refs)}"
+                f"callee_name={callee_name!r} refs={len(refs)} "
+                f"strings={string_args} hkey_meta={detected_hkey_meta}"
             )
         normalized_api_label = normalize_registry_label(callee_name) if callee_name else None
         label_fragment = normalized_api_label or callee_name or "<indirect>"
@@ -2489,6 +2504,18 @@ class FunctionAnalyzer:
                     log_debug(
                         f"[debug] wrapper-based registry root seeded: id={root_id} api={api_label} at={inst.getAddress()}"
                     )
+            if not callee_is_registry and string_seeds_enabled:
+                if string_args or uses_registry_strings or detected_hkey_meta:
+                    root_id = f"string_seed_{inst.getAddress()}_{safe_label}"
+                    entry_point = str(callee_func.getEntryPoint()) if callee_func else str(inst.getAddress())
+                    _seed_root(
+                        root_id=root_id,
+                        api_label=label_fragment or "<string_seed>",
+                        entry_point=entry_point,
+                        api_kind="string_seed",
+                        indirect_reason="string_only",
+                    )
+                    self._taint_registry_outputs(func, call_args, states, label_fragment, root_id)
             if string_args and string_seeds_enabled and indirect_roots_enabled:
                 indirect_reason = None
                 if string_has_registry_prefix:
