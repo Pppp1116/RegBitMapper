@@ -2666,6 +2666,107 @@ class FunctionAnalyzer:
 # ---------------------------------------------------------------------------
 
 
+def seed_fallback_roots(program, global_state: GlobalState, args: Dict[str, Any]) -> None:
+    """
+    When no 'real' registry roots were detected, fall back to heuristic roots so that
+    small or heavily optimized binaries still produce something useful.
+
+    Priority:
+      1) Registry-like strings (HKLM\\..., HKCU\\..., etc.).
+      2) Imported registry APIs (ADVAPI32::RegOpenKeyExW, NTDLL::NtQueryValueKey, ...).
+
+    These roots are marked as synthetic and do NOT have precise bit usage; they are
+    just anchors so the NDJSON isn't empty.
+    """
+    # If we already have roots from real calls, do nothing.
+    if global_state.roots:
+        return
+
+    # ------------------------------------------------------------------
+    # 1) Fallback from registry-like strings
+    # ------------------------------------------------------------------
+    registry_strings = getattr(global_state, "registry_strings", None) or {}
+    if registry_strings:
+        af = program.getAddressFactory()
+        fm = program.getFunctionManager()
+        ref_mgr = program.getReferenceManager()
+        created = 0
+
+        for addr_str, meta in registry_strings.items():
+            try:
+                addr = af.getAddress(addr_str)
+            except Exception:
+                addr = None
+
+            entry = None
+            if addr is not None and ref_mgr is not None and fm is not None:
+                try:
+                    refs = ref_mgr.getReferencesTo(addr)
+                    for r in refs:
+                        try:
+                            f = fm.getFunctionContaining(r.getFromAddress())
+                        except Exception:
+                            f = None
+                        if f:
+                            try:
+                                entry = str(f.getEntryPoint())
+                            except Exception:
+                                entry = f.getName()
+                            break
+                except Exception:
+                    pass
+
+            root_id = f"string_seed_global_{addr_str}"
+            if root_id in global_state.roots:
+                continue
+
+            global_state.roots[root_id] = {
+                "id": root_id,
+                "type": "synthetic",      # so root_kind=='synthetic' in NDJSON
+                "api_name": None,
+                "entry": entry,
+                "hive": meta.get("hive") or meta.get("nt_root"),
+                "path": meta.get("path") or meta.get("raw"),
+                "value_name": meta.get("value_name"),
+            }
+            created += 1
+
+        if DEBUG_ENABLED:
+            log_debug(f"[debug] fallback: created {created} synthetic roots from registry-like strings")
+
+        # If we managed to create at least one string-based root, we're done.
+        if created > 0:
+            return
+
+    # ------------------------------------------------------------------
+    # 2) Fallback from imported registry APIs
+    # ------------------------------------------------------------------
+    # IMPORTED_REGISTRY_API_NAMES / ADDRS are populated in main().
+    global IMPORTED_REGISTRY_API_NAMES
+    names = IMPORTED_REGISTRY_API_NAMES or set()
+    if not names:
+        return
+
+    created = 0
+    for api_name in sorted(names):
+        root_id = f"import_seed_{api_name}"
+        if root_id in global_state.roots:
+            continue
+        global_state.roots[root_id] = {
+            "id": root_id,
+            "type": "synthetic",
+            "api_name": api_name,
+            "entry": None,
+            "hive": None,
+            "path": None,
+            "value_name": None,
+        }
+        created += 1
+
+    if DEBUG_ENABLED:
+        log_debug(f"[debug] fallback: created {created} synthetic roots from imported registry APIs")
+
+
 def build_root_records(global_state: GlobalState) -> List[Dict[str, Any]]:
     records = []
     for root_id, meta in sorted(global_state.roots.items()):
@@ -2836,6 +2937,10 @@ def main():
     if args.get("max_function_iterations"):
         analyzer.max_function_iterations = max(1, int(args.get("max_function_iterations")))
     analyzer.analyze_all()
+
+    # Heuristic fallback: create synthetic roots when taint-mode finds nothing.
+    # This applies to BOTH modes, but only if no real roots exist.
+    seed_fallback_roots(program, global_state, args)
     # Synthetic root for full mode when no registry APIs are detected
     if mode == "full" and not global_state.roots and args.get("enable_synthetic_full_root", True):
         synthetic_id = "synthetic_full_mode_root"
