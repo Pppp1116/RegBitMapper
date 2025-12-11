@@ -35,14 +35,10 @@ from __future__ import annotations
 import json
 import sys
 import os
-import warnings
 from collections import defaultdict, deque
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
-
-warnings.simplefilter("ignore", category=DeprecationWarning)
-warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 _JAVA_UNSAFE_SUPPRESS_FLAG = "-Dorg.apache.felix.framework.debug=false"
 _existing_java_opts = os.environ.get("JAVA_TOOL_OPTIONS", "")
@@ -57,14 +53,6 @@ try:  # pragma: no cover - executed inside Ghidra
     from ghidra.program.model.pcode import PcodeOp
     from ghidra.program.model.symbol import RefType
     from ghidra.util.task import TaskMonitor
-    try:
-        from ghidra.util.task import TaskMonitorAdapter
-    except Exception:
-        TaskMonitorAdapter = None
-    try:
-        from ghidra.util.task import DummyTaskMonitor
-    except Exception:
-        DummyTaskMonitor = None
 except Exception:  # pragma: no cover
     FlatProgramAPI = None
     BasicBlockModel = None
@@ -72,8 +60,6 @@ except Exception:  # pragma: no cover
     PcodeOp = None
     RefType = None
     TaskMonitor = None
-    TaskMonitorAdapter = None
-    DummyTaskMonitor = None
     AddressSet = None
 
 try:  # pragma: no cover - ensure currentProgram exists in PyGhidra
@@ -218,18 +204,6 @@ def _resolve_dummy_monitor():
         candidate = None
     if candidate is not None:
         return candidate
-    if TaskMonitorAdapter is not None:
-        try:
-            adapter_dummy = getattr(TaskMonitorAdapter, "DUMMY", None)
-        except Exception:
-            adapter_dummy = None
-        if adapter_dummy is not None:
-            return adapter_dummy
-    if DummyTaskMonitor is not None:
-        try:
-            return DummyTaskMonitor()
-        except Exception:
-            pass
 
     class _NoOpMonitor:
         def checkCanceled(self):
@@ -251,19 +225,18 @@ DUMMY_MONITOR = _resolve_dummy_monitor()
 
 
 def _resolve_active_monitor():
-    candidates = []
+    if TaskMonitor is not None:
+        for accessor in ("getActiveMonitor", "current", "getCurrentMonitor"):
+            try:
+                getter = getattr(TaskMonitor, accessor, None)
+                if getter:
+                    current = getter()
+                    if current is not None:
+                        return current
+            except Exception:
+                continue
     for name in ("monitor", "currentMonitor"):
         cand = globals().get(name)
-        if cand is not None:
-            candidates.append(cand)
-    if TaskMonitor is not None:
-        try:
-            current = TaskMonitor.current()  # type: ignore[attr-defined]
-            if current is not None:
-                candidates.append(current)
-        except Exception:
-            pass
-    for cand in candidates:
         try:
             if cand is not None and hasattr(cand, "isCancelled"):
                 return cand
@@ -509,6 +482,19 @@ def boolify(val: bool) -> bool:
     return bool(val)
 
 
+def vn_has_address(vn) -> bool:
+    try:
+        if vn is None:
+            return False
+        if hasattr(vn, "isAddress") and vn.isAddress():
+            return True
+        if hasattr(vn, "isAddrTied") and vn.isAddrTied():
+            return True
+    except Exception:
+        return False
+    return False
+
+
 def varnode_key(vn) -> Tuple:
     if vn is None:
         return (None,)
@@ -518,7 +504,7 @@ def varnode_key(vn) -> Tuple:
         return ("tmp", int(vn.getOffset()), vn.getSize())
     if vn.isConstant():
         return ("const", int(vn.getOffset()), vn.getSize())
-    if vn.isAddrTied():
+    if vn_has_address(vn):
         return ("mem", str(vn.getAddress()), vn.getSize())
     return ("unk", str(vn), vn.getSize())
 
@@ -556,9 +542,9 @@ def new_value_from_varnode(vn) -> AbstractValue:
         if off is not None:
             val.pointer_targets.add(off)
     try:
-        if vn and (hasattr(vn, "isAddress") and vn.isAddress() or hasattr(vn, "isAddrTied") and vn.isAddrTied()):
+        if vn_has_address(vn):
             addr = vn.getAddress()
-            if addr is not None:
+            if addr is not None and hasattr(addr, "getOffset"):
                 val.pointer_targets.add(int(addr.getOffset()))
     except Exception:
         pass
@@ -701,11 +687,10 @@ def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
 def collect_registry_string_candidates(program, scan_limit: Optional[int] = None) -> Dict[str, Dict[str, Any]]:
     listing = program.getListing()
     candidates: Dict[str, Dict[str, Any]] = {}
-    it = listing.getDefinedData(True)
     max_scan = scan_limit if scan_limit is not None else 100_000
     scanned = 0
     monitor = ACTIVE_MONITOR or DUMMY_MONITOR
-    while it.hasNext():
+    for data in listing.getDefinedData(True):
         try:
             if monitor and hasattr(monitor, "isCancelled") and monitor.isCancelled():
                 log_debug("[debug] registry string scan cancelled by user")
@@ -716,7 +701,6 @@ def collect_registry_string_candidates(program, scan_limit: Optional[int] = None
         if max_scan and scanned > max_scan:
             log_debug("[debug] registry string candidate scan capped for performance")
             break
-        data = it.next()
         try:
             sval: Optional[str] = None
             if data.hasStringValue():
@@ -811,9 +795,7 @@ class FunctionAnalyzer:
             addr_candidates: List[Any] = []
             if vn is None:
                 return None
-            if hasattr(vn, "isAddress") and vn.isAddress():
-                addr_candidates.append(vn.getAddress())
-            elif hasattr(vn, "isAddrTied") and vn.isAddrTied():
+            if vn_has_address(vn):
                 addr_candidates.append(vn.getAddress())
             elif vn_is_constant(vn):
                 off = vn_get_offset(vn)
@@ -969,8 +951,7 @@ class FunctionAnalyzer:
             addr_set.addRange(blk.getFirstStartAddress(), blk.getMaxAddress())
         except Exception:
             return states
-        it = listing.getInstructions(addr_set, True)
-        while it.hasNext():
+        for inst in listing.getInstructions(addr_set, True):
             try:
                 if self.monitor and hasattr(self.monitor, "isCancelled") and self.monitor.isCancelled():
                     self.global_state.analysis_stats["cancelled"] = True
@@ -978,9 +959,8 @@ class FunctionAnalyzer:
                     break
             except Exception:
                 pass
-            inst = it.next()
             try:
-                pcode_ops = inst.getPcode()
+                pcode_ops = list(inst.getPcodeOps())
             except Exception:
                 pcode_ops = None
             if not pcode_ops:
@@ -1338,9 +1318,7 @@ class FunctionAnalyzer:
                     return True
                 if vn is None:
                     return False
-                if hasattr(vn, "isAddrTied") and vn.isAddrTied():
-                    return True
-                if hasattr(vn, "isAddress") and vn.isAddress():
+                if vn_has_address(vn):
                     return True
                 if not vn_is_constant(vn) and vn.getSize() * 8 >= DEFAULT_POINTER_BIT_WIDTH:
                     return True
@@ -1394,12 +1372,12 @@ class FunctionAnalyzer:
         # Be liberal: for imported functions the reference type may not report
         # isCall(), so scan all refs and ask FunctionManager if the target is
         # a function. This works better for IAT/thunks on PE files.
-        refs_iter = None
+        refs = []
         try:
-            refs_iter = inst.getReferencesFrom()
+            ref_mgr = self.program.getReferenceManager()
+            refs = list(ref_mgr.getReferencesFrom(inst.getAddress())) if ref_mgr else []
         except Exception:
-            refs_iter = None
-        refs = list(refs_iter) if refs_iter else []
+            refs = []
         fm = self.program.getFunctionManager()
         for r in refs:
             try:
