@@ -37,7 +37,6 @@ import sys
 import os
 from collections import defaultdict, deque
 import re
-import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -466,7 +465,7 @@ class GlobalState:
     struct_slots: Dict[Tuple[str, int], StructSlot] = field(default_factory=dict)
     decisions: List[Decision] = field(default_factory=list)
     function_summaries: Dict[str, FunctionSummary] = field(default_factory=dict)
-    analysis_stats: Dict[str, Any] = field(default_factory=lambda: defaultdict(int))
+    analysis_stats: Dict[str, Any] = field(default_factory=dict)
     overrides: List[Dict[str, Any]] = field(default_factory=list)
     registry_strings: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     root_decision_index: Dict[str, List[Decision]] = field(default_factory=lambda: defaultdict(list))
@@ -820,7 +819,6 @@ class FunctionAnalyzer:
             if DEBUG_ENABLED:
                 log_debug(f"[debug] error in _resolve_string_from_vn for {vn}: {e!r}")
             return None
-        return None
 
     def _decode_string_at_address(self, addr, addr_str: str) -> Optional[Dict[str, Any]]:
         try:
@@ -870,7 +868,9 @@ class FunctionAnalyzer:
                 self.global_state.analysis_stats["call_depth_limit"] = True
                 continue
             summary = self.analyze_function(func)
-            self.global_state.analysis_stats["functions_analyzed"] += 1
+            self.global_state.analysis_stats["functions_analyzed"] = self.global_state.analysis_stats.get(
+                "functions_analyzed", 0
+            ) + 1
             existing = self.global_state.function_summaries.get(func.getName())
             if existing is None:
                 self.global_state.function_summaries[func.getName()] = summary
@@ -1192,8 +1192,12 @@ class FunctionAnalyzer:
                 slot.value = old_value.merge(src_val)
             inst_func = self._get_function_for_inst(inst)
             func_name = inst_func.getName() if inst_func else "unknown"
+            if inst_func is not None:
+                entry_str = str(inst_func.getEntryPoint())
+            else:
+                entry_str = str(inst.getAddress())
             self.global_state.function_summaries.setdefault(
-                func_name, FunctionSummary(func_name, str(inst.getAddress()))
+                func_name, FunctionSummary(func_name, entry_str)
             ).slot_writes.append(
                 {
                     "base_id": slot.base_id,
@@ -1484,10 +1488,12 @@ class FunctionAnalyzer:
             api_label = normalized_api_label or callee_name
             if is_registry_api(callee_name):
                 root_id = f"api_{safe_label}_{inst.getAddress()}"
+                # Prefer the resolved callee entrypoint when tying registry roots to call sites.
                 entry_point = str(callee_func.getEntryPoint()) if callee_func else None
                 _seed_root(root_id, api_label, entry_point)
             elif string_args:
                 root_id = f"api_like_{safe_label}_{inst.getAddress()}"
+                # Prefer the resolved callee entrypoint when available; otherwise fall back to the call site.
                 entry_point = str(callee_func.getEntryPoint()) if callee_func else None
                 _seed_root(root_id, api_label or "<unknown>", entry_point)
         else:
@@ -1635,14 +1641,6 @@ def main():
     )
     if not _ensure_environment(INVOCATION_CONTEXT):
         return
-    if DUMMY_MONITOR is None:
-        print(
-            "[error] TaskMonitor.DUMMY is unavailable; cannot proceed with control-flow analysis.",
-            file=sys.stderr,
-        )
-        if INVOCATION_CONTEXT == "headless":
-            sys.exit(1)
-        return
     program = currentProgram
     api = FlatProgramAPI(program)
     global DEFAULT_POINTER_BIT_WIDTH
@@ -1752,7 +1750,6 @@ def _launch_via_pyghidra_bridge() -> None:
 if __name__ == "__main__":
     _REGKEYBITFIELDREPORT_RAN = True
     if currentProgram is None:
-        warnings.filterwarnings("ignore", category=DeprecationWarning)
         _launch_via_pyghidra_bridge()
     else:
         main()
