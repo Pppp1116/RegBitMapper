@@ -38,7 +38,7 @@ import os
 from collections import defaultdict, deque
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 _JAVA_UNSAFE_SUPPRESS_FLAG = "-Dorg.apache.felix.framework.debug=false"
 _existing_java_opts = os.environ.get("JAVA_TOOL_OPTIONS", "")
@@ -187,13 +187,13 @@ DEFAULT_POINTER_BIT_WIDTH = 32
 def _detect_pointer_bit_width(program) -> int:
     try:
         lang = program.getLanguage()
-        space = lang.getDefaultSpace() if hasattr(lang, "getDefaultSpace") else None
+        space = getattr(lang, "getDefaultSpace", lambda: None)()
         if space:
             size_bytes = space.getPointerSize()
             if size_bytes:
                 return int(size_bytes) * 8
     except Exception:
-        return DEFAULT_POINTER_BIT_WIDTH
+        pass
     return DEFAULT_POINTER_BIT_WIDTH
 
 
@@ -696,6 +696,57 @@ def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _decode_registry_string_from_memory(
+    program, addr, max_len: int = 512, strip_leading_nulls: bool = False, stop_after_first: bool = False
+) -> Optional[Dict[str, Any]]:
+    try:
+        mem = program.getMemory()
+        buf = bytearray(max(1, max_len))
+        read = mem.getBytes(addr, buf)
+        if not isinstance(read, (int, float)) or read <= 0:
+            return None
+        trimmed = bytes(buf[: int(read)])
+    except Exception:
+        return None
+    codecs = (("utf-16-le", b"\x00\x00"), ("utf-8", b"\x00"), ("latin-1", b"\x00"))
+    if stop_after_first:
+        for codec, terminator in codecs:
+            try:
+                segment = trimmed.split(terminator)[0]
+                if strip_leading_nulls:
+                    segment = segment.lstrip(b"\x00")
+                if not segment:
+                    continue
+                sval = segment.decode(codec, errors="ignore")
+                if not sval:
+                    continue
+                meta = parse_registry_string(sval)
+                if meta:
+                    return meta
+                return None
+            except Exception:
+                continue
+        return None
+    candidates: List[str] = []
+    for codec, terminator in codecs:
+        try:
+            segment = trimmed.split(terminator)[0]
+            if strip_leading_nulls:
+                segment = segment.lstrip(b"\x00")
+            if not segment:
+                continue
+            sval = segment.decode(codec, errors="ignore")
+            if sval:
+                candidates.append(sval)
+        except Exception:
+            continue
+    for sval in candidates:
+        meta = parse_registry_string(sval)
+        if meta:
+            return meta
+    return None
+
+
 def collect_registry_string_candidates(program, scan_limit: Optional[int] = None) -> Dict[str, Dict[str, Any]]:
     listing = program.getListing()
     candidates: Dict[str, Dict[str, Any]] = {}
@@ -715,34 +766,23 @@ def collect_registry_string_candidates(program, scan_limit: Optional[int] = None
             break
         try:
             sval: Optional[str] = None
+            meta: Optional[Dict[str, Any]] = None
             if data.hasStringValue():
                 try:
                     val_obj = data.getValue()
                     sval = val_obj.getString() if hasattr(val_obj, "getString") else str(val_obj)
+                    if sval is not None:
+                        meta = parse_registry_string(sval)
                 except Exception:
                     sval = None
-            if sval is None:
-                try:
-                    mem = program.getMemory()
-                    buf = bytearray(max(16, data.getLength()))
-                    read = mem.getBytes(data.getAddress(), buf)
-                    if read:
-                        trimmed = bytes(buf[: int(read) if isinstance(read, (int, float)) else len(buf)])
-                        for codec, terminator in (("utf-16-le", b"\x00\x00"), ("utf-8", b"\x00"), ("latin-1", b"\x00")):
-                            try:
-                                segment = trimmed.split(terminator)[0]
-                                if not segment:
-                                    continue
-                                sval = segment.decode(codec, errors="ignore")
-                                if sval:
-                                    break
-                            except Exception:
-                                continue
-                except Exception:
-                    sval = None
-            if not sval:
-                continue
-            meta = parse_registry_string(sval)
+            if sval is None and meta is None:
+                meta = _decode_registry_string_from_memory(
+                    program,
+                    data.getAddress(),
+                    max_len=max(16, data.getLength()),
+                    strip_leading_nulls=False,
+                    stop_after_first=True,
+                )
             if meta:
                 candidates[str(data.getAddress())] = meta
         except Exception as e:
@@ -797,9 +837,6 @@ class FunctionAnalyzer:
             except Exception as e:
                 if DEBUG_ENABLED:
                     log_debug(f"[debug] error resolving string value at {addr_str}: {e!r}")
-                decoded = self._decode_string_at_address(addr, addr_str)
-                if decoded:
-                    return decoded
         return self._decode_string_at_address(addr, addr_str)
 
     def _resolve_string_from_vn(self, vn, states: Optional[Dict[Tuple, AbstractValue]] = None) -> Optional[Dict[str, Any]]:
@@ -834,28 +871,16 @@ class FunctionAnalyzer:
 
     def _decode_string_at_address(self, addr, addr_str: str) -> Optional[Dict[str, Any]]:
         try:
-            mem = self.program.getMemory()
-            buf = bytearray(512)
-            read = mem.getBytes(addr, buf)
-            if read is None:
-                return None
-            trimmed = bytes(buf[: int(read) if isinstance(read, (int, float)) else len(buf)])
-            candidates: List[str] = []
-            for codec, terminator in (("utf-16-le", b"\x00\x00"), ("utf-8", b"\x00"), ("latin-1", b"\x00")):
-                try:
-                    segment = trimmed.split(terminator)[0].lstrip(b"\x00")
-                    if not segment:
-                        continue
-                    sval = segment.decode(codec, errors="ignore")
-                    if sval:
-                        candidates.append(sval)
-                except Exception:
-                    continue
-            for sval in candidates:
-                meta = parse_registry_string(sval)
-                if meta:
-                    self.global_state.registry_strings[addr_str] = meta
-                    return meta
+            meta = _decode_registry_string_from_memory(
+                self.program,
+                addr,
+                max_len=512,
+                strip_leading_nulls=True,
+                stop_after_first=False,
+            )
+            if meta:
+                self.global_state.registry_strings[addr_str] = meta
+                return meta
         except Exception as e:
             if DEBUG_ENABLED:
                 log_debug(f"[debug] error decoding string at {addr_str}: {e!r}")
