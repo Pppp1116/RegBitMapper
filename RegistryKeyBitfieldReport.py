@@ -566,6 +566,40 @@ def opcode_name(op: PcodeOp) -> str:
 REGISTRY_PREFIXES = ["Reg", "Zw", "Nt", "Cm", "Rtl"]
 REGISTRY_RTL_REGISTRY_RE = re.compile(r"(?i)^rtl.*registry")
 
+# Curated registry API names help avoid accidental matches against local
+# functions with Reg*/Zw*/Nt*/Rtl*/Cm* prefixes that have nothing to do with
+# the Windows registry.
+CURATED_REGISTRY_APIS = {
+    "regopenkeyexa",
+    "regopenkeyexw",
+    "regcreatekeyexa",
+    "regcreatekeyexw",
+    "regqueryvalueexa",
+    "regqueryvalueexw",
+    "regsetvalueexa",
+    "regsetvalueexw",
+    "regclosekey",
+    "ntopenkey",
+    "ntqueryvaluekey",
+    "ntsetvaluekey",
+    "rtlqueryregistryvalues",
+}
+
+# Imported registry APIs gathered from the binary's externals. Filled in at
+# runtime inside main().
+IMPORTED_REGISTRY_API_NAMES: Set[str] = set()
+IMPORTED_REGISTRY_API_ADDRS: Dict[int, str] = {}
+
+# HKEY_* handle constants and their logical hive names/kernels-style roots for
+# combining with "SOFTWARE\\RegTestMatrix\\..." suffixes.
+HKEY_HANDLE_MAP: Dict[int, Dict[str, str]] = {
+    0x80000000: {"hive": "HKCR", "nt_root": "\\Registry\\Machine"},
+    0x80000001: {"hive": "HKCU", "nt_root": "\\Registry\\User"},
+    0x80000002: {"hive": "HKLM", "nt_root": "\\Registry\\Machine"},
+    0x80000003: {"hive": "HKU", "nt_root": "\\Registry\\User"},
+    0x80000005: {"hive": "HKCC", "nt_root": "\\Registry\\Machine"},
+}
+
 REGISTRY_HIVE_ALIASES = {
     "HKLM": ["HKLM", "HKEY_LOCAL_MACHINE", "\\Registry\\Machine"],
     "HKCU": ["HKCU", "HKEY_CURRENT_USER", "\\Registry\\User"],
@@ -618,15 +652,30 @@ def is_registry_api(name: str) -> bool:
         return False
 
     normalized = normalize_registry_label(name)
-    if normalized:
-        lowered = normalized.lower()
-        prefixes = [p.lower() for p in REGISTRY_PREFIXES if p.lower() != "rtl"]
-        if any(lowered.startswith(pref) for pref in prefixes):
-            return True
-        if lowered.startswith("rtl"):
-            return bool(REGISTRY_RTL_REGISTRY_RE.match(lowered))
+    if not normalized:
+        return False
+
+    lowered = normalized.lower()
+    if lowered in CURATED_REGISTRY_APIS:
+        return True
+
+    if lowered in IMPORTED_REGISTRY_API_NAMES:
+        return True
+
+    prefixes = [p.lower() for p in REGISTRY_PREFIXES if p.lower() != "rtl"]
+    if any(lowered.startswith(pref) for pref in prefixes):
+        return False
+    if lowered.startswith("rtl"):
+        return bool(REGISTRY_RTL_REGISTRY_RE.match(lowered))
 
     return False
+
+
+def registry_api_for_address(addr: int) -> Optional[str]:
+    try:
+        return IMPORTED_REGISTRY_API_ADDRS.get(int(addr))
+    except Exception:
+        return None
 
 
 def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
@@ -794,6 +843,52 @@ def collect_registry_string_candidates(program, scan_limit: Optional[int] = None
                 log_debug(f"[debug] error in collect_registry_string_candidates at {addr_str}: {e!r}")
             continue
     return candidates
+
+
+def collect_imported_registry_apis(program) -> Tuple[Set[str], Dict[int, str]]:
+    names: Set[str] = set()
+    addr_map: Dict[int, str] = {}
+
+    def _record_symbol(sym_name: Optional[str], addr_obj) -> None:
+        normalized = normalize_registry_label(sym_name)
+        if not normalized:
+            return
+        lowered = normalized.lower()
+        if lowered not in CURATED_REGISTRY_APIS:
+            prefixes = [p.lower() for p in REGISTRY_PREFIXES]
+            if not any(lowered.startswith(pref) for pref in prefixes):
+                return
+        names.add(lowered)
+        try:
+            if addr_obj is not None and hasattr(addr_obj, "getOffset"):
+                addr_map[int(addr_obj.getOffset())] = sym_name or normalized
+        except Exception:
+            pass
+
+    try:
+        symtab = program.getSymbolTable()
+        ext_syms = symtab.getExternalSymbols() if symtab else None
+        if ext_syms:
+            for sym in ext_syms:
+                try:
+                    _record_symbol(sym.getName(True) if hasattr(sym, "getName") else str(sym), sym.getAddress())
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    try:
+        fm = program.getFunctionManager()
+        for f in fm.getFunctions(True):
+            try:
+                if getattr(f, "isExternal", lambda: False)():
+                    _record_symbol(f.getName(), f.getEntryPoint())
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return names, addr_map
 
 
 # ---------------------------------------------------------------------------
@@ -1344,6 +1439,21 @@ class FunctionAnalyzer:
 
         def _derive_registry_fields() -> Tuple[Optional[str], Optional[str], Optional[str]]:
             hive = path = value_name = None
+            hkey_meta: Optional[Dict[str, str]] = None
+            for idx, arg in enumerate(call_args[:2]):
+                try:
+                    val = self._get_val(arg, states)
+                except Exception:
+                    val = AbstractValue()
+                off = vn_get_offset(arg)
+                if off is None:
+                    for tgt in sorted(val.pointer_targets):
+                        if tgt in HKEY_HANDLE_MAP:
+                            off = tgt
+                            break
+                if off is not None and off in HKEY_HANDLE_MAP:
+                    hkey_meta = HKEY_HANDLE_MAP.get(off)
+                    break
             if string_args:
                 hive = string_args[0].get("hive")
                 path = string_args[0].get("path")
@@ -1356,6 +1466,17 @@ class FunctionAnalyzer:
                     value_candidate = string_args[1].get("value_name") or string_args[1].get("raw")
                     if value_candidate:
                         value_name = value_candidate
+            if hkey_meta and not hive:
+                hive = hkey_meta.get("hive")
+            if hkey_meta and path:
+                clean = str(path).lstrip("\\/")
+                lowered_clean = clean.lower()
+                has_prefix = bool(REGISTRY_STRING_PREFIX_RE.match(clean)) or lowered_clean.startswith("registry\\")
+                if not has_prefix:
+                    nt_root = hkey_meta.get("nt_root")
+                    prefix = nt_root or hive
+                    if prefix:
+                        path = f"{prefix}\\{clean}"
             return hive, path, value_name
 
         def _pointerish_argument(vn, val: AbstractValue) -> bool:
@@ -1487,6 +1608,21 @@ class FunctionAnalyzer:
                         log_debug(f"[debug] error inferring call target at {inst.getAddress()}: {e!r}")
                     pass
 
+        if callee_name is None and inputs:
+            try:
+                val = self._get_val(inputs[0], states)
+            except Exception:
+                val = AbstractValue()
+            for tgt in sorted(val.pointer_targets):
+                mapped = registry_api_for_address(tgt)
+                if mapped:
+                    try:
+                        callee_func = fm.getFunctionAt(self.api.toAddr(tgt)) or callee_func
+                    except Exception:
+                        pass
+                    callee_name = mapped
+                    break
+
         if DEBUG_ENABLED:
             log_debug(
                 f"[debug] call at {inst.getAddress()} opname={opcode_name(op)} "
@@ -1532,7 +1668,7 @@ class FunctionAnalyzer:
                 # Prefer the resolved callee entrypoint when tying registry roots to call sites.
                 entry_point = str(callee_func.getEntryPoint()) if callee_func else None
                 _seed_root(root_id, api_label, entry_point)
-            elif string_args:
+            elif string_args and (callee_func is None or getattr(callee_func, "isExternal", lambda: False)()):
                 root_id = f"api_like_{safe_label}_{inst.getAddress()}"
                 # Prefer the resolved callee entrypoint when available; otherwise fall back to the call site.
                 entry_point = str(callee_func.getEntryPoint()) if callee_func else None
@@ -1691,6 +1827,11 @@ def main():
     )
     if INVOCATION_CONTEXT == "script_manager":
         log_info("[info] Script Manager detected; NDJSON output will appear in the Ghidra console.")
+    global IMPORTED_REGISTRY_API_NAMES, IMPORTED_REGISTRY_API_ADDRS
+    IMPORTED_REGISTRY_API_NAMES, IMPORTED_REGISTRY_API_ADDRS = collect_imported_registry_apis(program)
+    log_debug(
+        f"[debug] imported registry candidates: names={len(IMPORTED_REGISTRY_API_NAMES)} addresses={len(IMPORTED_REGISTRY_API_ADDRS)}"
+    )
     global_state = GlobalState()
     # ensure call_depth_limit is explicitly initialized (future use)
     global_state.analysis_stats["call_depth_limit"] = False
