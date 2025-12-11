@@ -128,6 +128,9 @@ def parse_args(raw_args: List[str], context_hint: str) -> Dict[str, Any]:
         except Exception:
             print("[warn] registry_scan_limit is not an integer; using default", file=sys.stderr)
             parsed.pop("registry_scan_limit", None)
+    parsed["enable_string_seeds"] = _parse_bool(parsed.get("enable_string_seeds", "true"))
+    parsed["enable_indirect_roots"] = _parse_bool(parsed.get("enable_indirect_roots", "true"))
+    parsed["enable_synthetic_full_root"] = _parse_bool(parsed.get("enable_synthetic_full_root", "true"))
     return parsed
 
 
@@ -179,6 +182,8 @@ else:
     args = {"mode": "taint", "debug": False, "trace": False}
 DEBUG_ENABLED = args.get("debug", False)
 TRACE_ENABLED = args.get("trace", False)
+for _flag in ["enable_string_seeds", "enable_indirect_roots", "enable_synthetic_full_root"]:
+    args.setdefault(_flag, True)
 
 
 DEFAULT_POINTER_BIT_WIDTH = 32
@@ -612,6 +617,36 @@ def _maybe_bits(val: AbstractValue) -> Set[int]:
     return bits
 
 
+def _fallback_bits_from_value(val: AbstractValue) -> Set[int]:
+    width = max(1, int(val.bit_width or DEFAULT_POINTER_BIT_WIDTH))
+    bits: Set[int] = set()
+    for entry in val.mask_history or []:
+        try:
+            mask_val = int(entry.get("mask", 0))
+        except Exception:
+            continue
+        bits |= _mask_to_bits(mask_val, width)
+    compare_meta = val.compare_details or {}
+    const_mask_bits = compare_meta.get("constant_mask_bits")
+    if const_mask_bits:
+        try:
+            bits |= {int(b) for b in const_mask_bits}
+        except Exception:
+            pass
+    approx_range = compare_meta.get("approx_bit_range")
+    if approx_range and len(approx_range) >= 2:
+        try:
+            start = max(0, int(approx_range[0]))
+            end = min(width - 1, int(approx_range[1]))
+            if end >= start:
+                bits |= set(range(start, end + 1))
+        except Exception:
+            pass
+    if not bits:
+        return set(range(width))
+    return bits
+
+
 def _mask_to_bits(mask: int, width: int) -> Set[int]:
     try:
         return {i for i in range(width) if mask & (1 << i)}
@@ -1007,7 +1042,9 @@ def _decode_registry_string_from_memory(
 def collect_registry_string_candidates(program, scan_limit: Optional[int] = None) -> Dict[str, Dict[str, Any]]:
     listing = program.getListing()
     candidates: Dict[str, Dict[str, Any]] = {}
-    max_scan = None if scan_limit == 0 else scan_limit
+    if scan_limit == 0:
+        return {}
+    max_scan = scan_limit
     scanned = 0
     monitor = ACTIVE_MONITOR or DUMMY_MONITOR
     for data in listing.getDefinedData(True):
@@ -1154,9 +1191,18 @@ class FunctionAnalyzer:
         return False
 
     def _mark_all_bits_used_degraded(self, val: AbstractValue) -> None:
+        original_used = set(val.used_bits)
+        original_candidates = set(val.candidate_bits)
         if not val.used_bits and not val.candidate_bits:
-            val.mark_all_bits_used(degraded=True)
+            fallback_bits = _fallback_bits_from_value(val)
+            val.used_bits |= set(fallback_bits)
+            val.definitely_used_bits |= set(fallback_bits)
+            val.maybe_used_bits |= set(fallback_bits)
+            val.candidate_bits |= set(fallback_bits)
+            val.bit_usage_degraded = True
         else:
+            val.bit_usage_degraded = True
+        if val.used_bits != original_used or val.candidate_bits != original_candidates:
             val.bit_usage_degraded = True
         self.global_state.analysis_stats["bit_precision_degraded"] = True
 
@@ -1486,7 +1532,12 @@ class FunctionAnalyzer:
 
     def analyze_all(self) -> None:
         fm = self.program.getFunctionManager()
-        worklist = deque((func, 0) for func in fm.getFunctions(True))
+        worklist = deque()
+        queued: Set[str] = set()
+        for func in fm.getFunctions(True):
+            key = str(func.getEntryPoint()) if hasattr(func, "getEntryPoint") else func.getName()
+            worklist.append((func, 0))
+            queued.add(key)
         iteration_guard = 0
         while worklist and iteration_guard < self.max_function_iterations:
             try:
@@ -1508,10 +1559,18 @@ class FunctionAnalyzer:
             existing = self.global_state.function_summaries.get(func.getName())
             if existing is None:
                 self.global_state.function_summaries[func.getName()] = summary
-                worklist.extend((callee, depth + 1) for callee in func.getCalledFunctions(self.monitor))
+                for callee in func.getCalledFunctions(self.monitor):
+                    callee_key = str(callee.getEntryPoint()) if hasattr(callee, "getEntryPoint") else callee.getName()
+                    if callee_key not in queued:
+                        queued.add(callee_key)
+                        worklist.append((callee, depth + 1))
             else:
                 if existing.merge_from(summary):
-                    worklist.extend((callee, depth + 1) for callee in func.getCalledFunctions(self.monitor))
+                    for callee in func.getCalledFunctions(self.monitor):
+                        callee_key = str(callee.getEntryPoint()) if hasattr(callee, "getEntryPoint") else callee.getName()
+                        if callee_key not in queued:
+                            queued.add(callee_key)
+                            worklist.append((callee, depth + 1))
         if iteration_guard >= self.max_function_iterations:
             log_debug("[warn] function iteration limit hit")
             self.global_state.analysis_stats["function_iterations_limit"] = True
@@ -1811,10 +1870,13 @@ class FunctionAnalyzer:
         val.pointer_targets = set(base.pointer_targets)
         shift = vn_get_offset(amt)
         if shift is None:
-            val.maybe_used_bits |= _definitely_bits(base) | _maybe_bits(base)
+            fallback_bits = _fallback_bits_from_value(base)
+            val.definitely_used_bits = set(_definitely_bits(base))
+            val.maybe_used_bits = set(fallback_bits) | set(val.definitely_used_bits)
             val.candidate_bits = set(val.maybe_used_bits)
             val.used_bits = set(val.definitely_used_bits)
             val.bit_usage_degraded = True
+            self.global_state.analysis_stats["bit_precision_degraded"] = True
         else:
             base_def = _definitely_bits(base) or set()
             base_maybe = _maybe_bits(base) or set(range(base.bit_width))
@@ -1889,6 +1951,13 @@ class FunctionAnalyzer:
         }:
             compare_meta["compare_kind"] = op_tag.lower()
             sign_sensitive = op_tag in {"INT_SLESS", "INT_SLESSEQUAL"}
+            if sign_sensitive:
+                try:
+                    sign_bit = max(a.bit_width, b.bit_width, 1) - 1
+                except Exception:
+                    sign_bit = max(a.bit_width, b.bit_width) - 1 if a.bit_width or b.bit_width else 0
+                compare_meta["sign_sensitive"] = True
+                compare_meta["sign_bit"] = sign_bit
             if const_side and const_val is not None:
                 var_val = b if const_side == "left" else a
                 var_maybe = _maybe_bits(var_val) or set(range(var_val.bit_width))
@@ -2047,11 +2116,20 @@ class FunctionAnalyzer:
         if not used_bits and maybe_bits:
             used_bits = set(maybe_bits)
         if not used_bits and not maybe_bits:
-            self._mark_all_bits_used_degraded(cond_val)
-            used_bits = set(cond_val.used_bits)
-            branch_detail["bit_heuristic"] = "all_bits_fallback"
-            if DEBUG_ENABLED:
-                log_debug(f"[debug] heuristic bit usage applied at {inst.getAddress()} (all bits fallback)")
+            fallback_bits = _fallback_bits_from_value(cond_val)
+            if fallback_bits:
+                used_bits = set(fallback_bits)
+                branch_detail["bit_heuristic"] = "fallback_bits_from_history"
+                cond_val.used_bits |= set(used_bits)
+                cond_val.maybe_used_bits |= set(used_bits)
+                cond_val.candidate_bits |= set(used_bits)
+                cond_val.bit_usage_degraded = True
+            else:
+                self._mark_all_bits_used_degraded(cond_val)
+                used_bits = set(cond_val.used_bits)
+                branch_detail["bit_heuristic"] = "all_bits_fallback"
+                if DEBUG_ENABLED:
+                    log_debug(f"[debug] heuristic bit usage applied at {inst.getAddress()} (all bits fallback)")
         if cond_val.bit_usage_degraded:
             self.global_state.analysis_stats["bit_precision_degraded"] = True
         if cond_val.compare_details:
@@ -2107,6 +2185,8 @@ class FunctionAnalyzer:
         self._set_val(out, val, states)
 
     def _handle_call(self, func, inst, op: PcodeOp, inputs, states, summary: FunctionSummary):
+        string_seeds_enabled = args.get("enable_string_seeds", True)
+        indirect_roots_enabled = args.get("enable_indirect_roots", True)
         call_args = inputs[1:] if inputs else []
         string_args: List[Dict[str, Any]] = []
         for inp in call_args:
@@ -2271,7 +2351,7 @@ class FunctionAnalyzer:
                     log_debug(
                         f"[debug] registry root seeded: id={root_id} api={api_label} at={inst.getAddress()} entry={entry_point}"
                     )
-            elif string_args and (
+            elif string_seeds_enabled and indirect_roots_enabled and string_args and (
                 string_has_registry_prefix
                 or self._function_has_registry_calls(func)
                 or self._pointer_args_from_registry(pointer_like_args, states)
@@ -2287,13 +2367,13 @@ class FunctionAnalyzer:
                         f"at={inst.getAddress()}"
                     )
         else:
-            string_seed_allowed = (
+            string_seed_allowed = string_seeds_enabled and (
                 string_has_registry_prefix
                 or self._function_has_registry_calls(func)
                 or self._pointer_args_from_registry(pointer_like_args, states)
                 or hkey_handle_present
             )
-            if string_args and string_seed_allowed:
+            if string_args and string_seed_allowed and indirect_roots_enabled:
                 root_id = f"indirect_{inst.getAddress()}"
                 _seed_root(root_id, "<indirect>", str(inst.getAddress()))
                 if DEBUG_ENABLED:
@@ -2302,7 +2382,13 @@ class FunctionAnalyzer:
                         f"path={self.global_state.roots[root_id].get('path')} value={self.global_state.roots[root_id].get('value_name')} "
                         f"at={inst.getAddress()}"
                     )
-            elif uses_registry_strings and pointer_like_args and string_seed_allowed:
+            elif (
+                string_seeds_enabled
+                and indirect_roots_enabled
+                and uses_registry_strings
+                and pointer_like_args
+                and string_seed_allowed
+            ):
                 caller_name = func.getName() if func else "<unknown>"
                 api_label = f"<string_seed:{caller_name}>"
                 root_id = f"string_seed_{inst.getAddress()}"
@@ -2324,7 +2410,21 @@ class FunctionAnalyzer:
     def _handle_return(self, inputs, states, summary: FunctionSummary):
         if not inputs:
             return
-        ret_source = inputs[-1] if len(inputs) > 1 else inputs[0]
+        ret_source = None
+        for vn in reversed(inputs):
+            if vn is None:
+                continue
+            if vn_is_constant(vn):
+                continue
+            try:
+                if hasattr(vn, "isAddress") and vn.isAddress():
+                    continue
+            except Exception:
+                pass
+            ret_source = vn
+            break
+        if ret_source is None:
+            ret_source = inputs[-1]
         ret_val = self._get_val(ret_source, states)
         summary.return_influence |= set(ret_val.origins)
 
@@ -2332,12 +2432,22 @@ class FunctionAnalyzer:
         if out is None:
             return
         val = AbstractValue(bit_width=out.getSize() * 8)
+        def_union: Set[int] = set()
+        maybe_union: Set[int] = set()
+        tainted_input = False
         for inp in inputs:
-            val = val.merge(self._get_val(inp, states))
-        if not val.maybe_used_bits:
-            val.maybe_used_bits |= _maybe_bits(val)
+            inp_val = self._get_val(inp, states)
+            val = val.merge(inp_val)
+            def_union |= _definitely_bits(inp_val)
+            maybe_union |= _maybe_bits(inp_val)
+            tainted_input = tainted_input or inp_val.tainted
+        val.definitely_used_bits = set(def_union)
+        val.maybe_used_bits = set(maybe_union | def_union)
         val.candidate_bits = set(val.maybe_used_bits)
         val.used_bits = set(val.definitely_used_bits)
+        if tainted_input:
+            val.bit_usage_degraded = True
+            self.global_state.analysis_stats["bit_precision_degraded"] = True
         self._set_val(out, val, states)
 
     def _finalize_summary_from_slots(self, summary: FunctionSummary) -> None:
@@ -2396,6 +2506,17 @@ def build_root_records(global_state: GlobalState) -> List[Dict[str, Any]]:
             },
             "decisions": decisions,
             "overrides": overrides,
+            "decision_count": len(global_state.root_decision_index.get(root_id, [])),
+            "slot_count": len(global_state.root_slot_index.get(root_id, set())),
+            "root_kind": (
+                "api"
+                if str(root_id).startswith("api_")
+                else "indirect"
+                if str(root_id).startswith("indirect_") or str(root_id).startswith("string_seed_")
+                else "synthetic"
+                if str(root_id) == "synthetic_full_mode_root" or meta.get("type") == "synthetic"
+                else "unknown"
+            ),
         }
         records.append(record)
     return records
@@ -2491,7 +2612,8 @@ def main():
     global_state.analysis_stats["call_depth_limit"] = False
     scan_limit = args.get("registry_scan_limit")
     if scan_limit is not None and scan_limit < 0:
-        scan_limit = None
+        log_debug("[debug] registry_scan_limit negative; disabling pre-scan")
+        scan_limit = 0
     global_state.registry_strings = collect_registry_string_candidates(program, scan_limit)
     log_debug(
         f"[debug] initial registry roots={len(global_state.roots)} registry-like strings={len(global_state.registry_strings)}"
@@ -2506,7 +2628,7 @@ def main():
         analyzer.max_function_iterations = max(1, int(args.get("max_function_iterations")))
     analyzer.analyze_all()
     # Synthetic root for full mode when no registry APIs are detected
-    if mode == "full" and not global_state.roots:
+    if mode == "full" and not global_state.roots and args.get("enable_synthetic_full_root", True):
         synthetic_id = "synthetic_full_mode_root"
         global_state.roots[synthetic_id] = {
             "id": synthetic_id,
