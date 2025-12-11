@@ -51,7 +51,7 @@ try:  # pragma: no cover - executed inside Ghidra
     from ghidra.program.model.listing import Instruction
     from ghidra.program.model.address import AddressSet
     from ghidra.program.model.pcode import PcodeOp
-    from ghidra.program.model.symbol import RefType
+    from ghidra.program.model.symbol import RefType, SourceType
     from ghidra.util.task import TaskMonitor
 except Exception:  # pragma: no cover
     FlatProgramAPI = None
@@ -59,6 +59,7 @@ except Exception:  # pragma: no cover
     Instruction = None
     PcodeOp = None
     RefType = None
+    SourceType = None
     TaskMonitor = None
     AddressSet = None
 
@@ -1488,6 +1489,55 @@ class FunctionAnalyzer:
         callee = None
         callee_func = None
         target_addr = None
+        try:
+            def_op = target_vn.getDef() if target_vn is not None else None
+        except Exception:
+            def_op = None
+        if def_op is not None and def_op.getOpcode() == PcodeOp.LOAD:
+            try:
+                load_addr_vn = def_op.getInput(1)
+            except Exception:
+                load_addr_vn = None
+            if load_addr_vn and vn_is_constant(load_addr_vn):
+                load_offset = vn_get_offset(load_addr_vn)
+                if load_offset is not None:
+                    try:
+                        callee_addr = self.api.toAddr(load_offset)
+                    except Exception:
+                        callee_addr = None
+                    try:
+                        sym = getattr(self.api, "getSymbolAt", lambda a: None)(callee_addr)
+                    except Exception:
+                        sym = None
+                    if sym is not None:
+                        callee = sym.getName()
+                        try:
+                            if SourceType is not None and getattr(sym, "getSource", lambda: None)() == SourceType.IMPORTED:
+                                ext_loc = sym.getExternalLocation()
+                                if ext_loc and ext_loc.getLabel():
+                                    callee = ext_loc.getLabel()
+                        except Exception:
+                            pass
+                        try:
+                            callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(callee_addr))
+                        except Exception:
+                            pass
+                    if callee is None:
+                        mapped = None
+                        if callee_addr is not None:
+                            mapped = IMPORTED_REGISTRY_API_ADDRS.get(str(callee_addr))
+                        if mapped is None and load_offset is not None:
+                            try:
+                                mapped = IMPORTED_REGISTRY_API_ADDRS.get(int(load_offset))
+                            except Exception:
+                                mapped = None
+                        if mapped:
+                            callee = mapped
+                            if callee_addr is not None:
+                                try:
+                                    callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(callee_addr))
+                                except Exception:
+                                    pass
         if target_vn is not None:
             try:
                 if hasattr(target_vn, "getAddress"):
