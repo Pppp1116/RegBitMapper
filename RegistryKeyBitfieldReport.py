@@ -1344,6 +1344,19 @@ class FunctionAnalyzer:
         if ref_mgr is None:
             return None
         try:
+            addr_space = addr.getAddressSpace() if addr is not None else None
+            if addr_space and str(addr_space).lower().startswith("external"):
+                symtab = getattr(self.program, "getSymbolTable", lambda: None)()
+                if symtab:
+                    try:
+                        sym = symtab.getPrimarySymbol(addr)
+                        if sym and sym.getName():
+                            return sym.getName()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
             refs_from = list(ref_mgr.getReferencesFrom(addr))
         except Exception:
             refs_from = []
@@ -1369,9 +1382,67 @@ class FunctionAnalyzer:
                 thunk_target = getattr(func, "getThunkedFunction", lambda: None)()
                 if thunk_target:
                     return thunk_target
+            # Manual thunk resolution: some headless analyses never promote IAT
+            # jump stubs to real thunk functions, so inspect the first
+            # instruction for a direct/indirect jump to an external target.
+            listing = getattr(self.program, "getListing", lambda: None)()
+            if listing and func is not None:
+                try:
+                    inst = listing.getInstructionAt(func.getEntryPoint())
+                except Exception:
+                    inst = None
+                if inst and inst.getMnemonicString().upper().startswith("JMP"):
+                    try:
+                        flows = list(inst.getFlows())
+                    except Exception:
+                        flows = []
+                    fm = self.program.getFunctionManager()
+                    for dest in flows:
+                        ext_label = self._external_label_for_address(dest)
+                        if ext_label:
+                            followed = getattr(fm, "getFunctionAt", lambda a: None)(dest)
+                            return followed or func
+                        mapped = IMPORTED_REGISTRY_API_ADDRS.get(str(dest)) or IMPORTED_REGISTRY_API_ADDRS.get(dest)
+                        if mapped:
+                            followed = getattr(fm, "getFunctionAt", lambda a: None)(dest)
+                            return followed or func
         except Exception:
             pass
         return func
+
+    def _read_pointer_value(self, addr) -> Optional[int]:
+        try:
+            mem = self.program.getMemory()
+            if mem is None:
+                return None
+            width_bytes = max(1, DEFAULT_POINTER_BIT_WIDTH // 8)
+            buf = bytearray(width_bytes)
+            read = mem.getBytes(addr, buf)
+            if not isinstance(read, (int, float)) or read <= 0:
+                return None
+            return int.from_bytes(bytes(buf[: int(read)]), byteorder="little", signed=False)
+        except Exception:
+            return None
+
+    def _resolve_import_from_pointer(self, ptr_addr) -> Optional[str]:
+        if ptr_addr is None:
+            return None
+        pointee = self._read_pointer_value(ptr_addr)
+        if pointee is None:
+            return None
+        mapped = IMPORTED_REGISTRY_API_ADDRS.get(pointee) or IMPORTED_REGISTRY_API_ADDRS.get(str(pointee))
+        if mapped:
+            return mapped
+        try:
+            target_addr = self.api.toAddr(pointee)
+        except Exception:
+            target_addr = None
+        if target_addr:
+            mapped = IMPORTED_REGISTRY_API_ADDRS.get(str(target_addr))
+            if mapped:
+                return mapped
+            return self._external_label_for_address(target_addr)
+        return None
 
     def _find_hkey_meta(self, call_args: List[Any], states: Dict[Tuple, AbstractValue]) -> Optional[Dict[str, str]]:
         for arg in call_args[:2]:
@@ -1567,6 +1638,14 @@ class FunctionAnalyzer:
                     callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(target_addr))
                 except Exception:
                     pass
+            if callee is None:
+                ext_label = self._external_label_for_address(target_addr)
+                if ext_label:
+                    callee = ext_label
+            if callee is None:
+                manual = self._resolve_import_from_pointer(target_addr)
+                if manual:
+                    callee = manual
         try:
             target = target_vn.getOffset() if target_vn is not None and hasattr(target_vn, "getOffset") else None
         except Exception:
@@ -1577,6 +1656,11 @@ class FunctionAnalyzer:
                 callee = mapped
                 try:
                     callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(self.api.toAddr(target)))
+                except Exception:
+                    pass
+            if callee is None:
+                try:
+                    callee = self._resolve_import_from_pointer(self.api.toAddr(target))
                 except Exception:
                     pass
         if callee is None:
@@ -1600,6 +1684,11 @@ class FunctionAnalyzer:
                     ext_label = self._external_label_for_address(addr_obj)
                     if ext_label:
                         callee = ext_label
+                        callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(addr_obj))
+                        break
+                    manual = self._resolve_import_from_pointer(addr_obj)
+                    if manual:
+                        callee = manual
                         callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(addr_obj))
                         break
                 except Exception:
@@ -2504,6 +2593,8 @@ class FunctionAnalyzer:
                         callee_name = IMPORTED_REGISTRY_API_ADDRS.get(str(offset))
                     elif to_addr and str(to_addr) in IMPORTED_REGISTRY_API_ADDRS:
                         callee_name = IMPORTED_REGISTRY_API_ADDRS.get(str(to_addr))
+                    if callee_name is None:
+                        callee_name = self._resolve_import_from_pointer(to_addr)
                     if callee_name:
                         try:
                             callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(to_addr))
@@ -2517,6 +2608,21 @@ class FunctionAnalyzer:
                 except Exception as e:
                     if DEBUG_ENABLED:
                         log_debug(f"[debug] error during fallback external resolution at {inst.getAddress()}: {e!r}")
+
+        if callee_name is None and inputs:
+            try:
+                ptr_addr = inputs[0].getAddress() if hasattr(inputs[0], "getAddress") else None
+            except Exception:
+                ptr_addr = None
+            if ptr_addr is None and vn_is_constant(inputs[0]):
+                try:
+                    off = vn_get_offset(inputs[0])
+                    ptr_addr = self.api.toAddr(off) if off is not None else None
+                except Exception:
+                    ptr_addr = None
+            manual = self._resolve_import_from_pointer(ptr_addr) if ptr_addr is not None else None
+            if manual:
+                callee_name = manual
 
         if DEBUG_ENABLED:
             log_debug(
