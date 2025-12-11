@@ -914,30 +914,36 @@ def normalize_registry_label(raw: Optional[str]) -> Optional[str]:
     if not cleaned:
         return None
     cleaned = re.sub(r"(?i)^(?:j__|__imp__?|imp_|__imported_|imported_)", "", cleaned)
-    cleaned = cleaned.strip("@ !:\\/")
+    cleaned = cleaned.strip(r"@ !:\/")
     # Keep suffixes that look registry-like, handling common separators and
     # mangled import labels such as ADVAPI32.dll::RegOpenKeyExA@16 or
     # ADVAPI32.dll_RegQueryValueExW. We also want to gracefully accept
     # decorations like "__imp__RegOpenKeyExA@16" and thunks that carry module
     # qualifiers.
-    split_re = r"[.:@!\\/]|::"
+    split_re = r"[.:@!\/]|::"
+    registry_re = re.compile(r"(?i)^(reg|zw|nt|cm|rtl)[a-z0-9_@]*$")
+
+    def _normalize_token(tok: str) -> Optional[str]:
+        tok = tok.strip("_").strip()
+        if not tok:
+            return None
+        tok = re.sub(r"@[0-9]+$", "", tok)
+        tok = re.sub(r"\$[A-Za-z0-9_]+$", "", tok)
+        if registry_re.match(tok):
+            return tok
+        return None
+
     tokens: List[str] = []
     for part in re.split(split_re, cleaned):
         for seg in part.split("_"):
-            seg = seg.strip()
-            if seg:
-                tokens.append(seg)
-    tokens = tokens or [cleaned]
-    # strip leftover decoration like @NN or trailing digits
-    cleaned = re.sub(r"@[0-9]+$", "", cleaned)
-    cleaned = re.sub(r"\$[A-Za-z0-9_]+$", "", cleaned)
-    registry_re = re.compile(r"(?i)(reg|zw|nt|cm|rtl)[a-z0-9_@]*")
-    for tok in reversed(tokens):
-        m = registry_re.search(tok)
-        if m:
-            return m.group(0)
-    m = registry_re.search(cleaned)
-    return m.group(0) if m else None
+            norm = _normalize_token(seg)
+            if norm:
+                tokens.append(norm)
+
+    if tokens:
+        return tokens[-1]
+
+    return _normalize_token(cleaned)
 
 
 def is_registry_api(name: str) -> bool:
