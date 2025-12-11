@@ -560,6 +560,42 @@ def varnode_key(vn) -> Tuple:
     return ("unk", str(vn), vn.getSize())
 
 
+_BASE_ID_STORAGE_META: Dict[str, Dict[str, Any]] = {}
+
+
+def _record_storage_metadata(base_id: Optional[str], vn, program) -> None:
+    if not base_id or vn is None or program is None:
+        return
+    meta = _BASE_ID_STORAGE_META.get(base_id, {})
+    try:
+        addr = vn.getAddress()
+    except Exception:
+        addr = None
+    space_name = None
+    block_name = None
+    if addr is not None:
+        try:
+            space = addr.getAddressSpace()
+            if space:
+                space_name = space.getName()
+        except Exception:
+            space_name = None
+        try:
+            mem = program.getMemory()
+            if mem:
+                block = mem.getBlock(addr)
+                if block:
+                    block_name = block.getName()
+        except Exception:
+            block_name = None
+    if space_name:
+        meta["space_name"] = space_name
+    if block_name:
+        meta["block_name"] = block_name
+    if meta:
+        _BASE_ID_STORAGE_META[base_id] = meta
+
+
 def _definitely_bits(val: AbstractValue) -> Set[int]:
     bits = set(val.definitely_used_bits or val.used_bits)
     if not bits and val.used_bits:
@@ -604,13 +640,13 @@ def slot_key_from_pattern(ptr: Optional[PointerPattern]) -> Optional[Tuple[str, 
 def classify_storage(base_id: Optional[str]) -> str:
     if not base_id:
         return "heap_or_unknown"
-    lowered = str(base_id).lower()
-    if "stack" in lowered:
+    meta = _BASE_ID_STORAGE_META.get(base_id, {})
+    space_name = str(meta.get("space_name") or "").lower()
+    block_name = str(meta.get("block_name") or "").lower()
+    if space_name == "stack":
         return "stack"
-    if any(seg in lowered for seg in [".data", ".rdata", ".bss", "global"]):
+    if space_name == "ram" and block_name in {".data", ".rdata", ".bss"}:
         return "global"
-    if "mem" in lowered:
-        return "heap_or_unknown"
     return "heap_or_unknown"
 
 
@@ -869,13 +905,6 @@ def is_registry_api(name: str) -> bool:
     return matched
 
 
-def registry_api_for_address(addr: int) -> Optional[str]:
-    try:
-        return IMPORTED_REGISTRY_API_ADDRS.get(int(addr))
-    except Exception:
-        return None
-
-
 def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
     if not raw:
         return None
@@ -1095,6 +1124,7 @@ class FunctionAnalyzer:
         self.block_model = BasicBlockModel(self.program)
         self.monitor = ACTIVE_MONITOR or DUMMY_MONITOR
         self._registry_string_usage_cache: Dict[str, bool] = {}
+        self._functions_with_registry_calls: Set[str] = set()
 
     def _get_function_for_inst(self, inst: Instruction):
         try:
@@ -1102,6 +1132,33 @@ class FunctionAnalyzer:
             return fm.getFunctionContaining(inst.getAddress())
         except Exception:
             return None
+
+    def _record_base_id_metadata(self, base_id: Optional[str], vn) -> None:
+        _record_storage_metadata(base_id, vn, self.program)
+
+    def _function_has_registry_calls(self, func) -> bool:
+        if func is None:
+            return False
+        try:
+            return func.getName() in self._functions_with_registry_calls
+        except Exception:
+            return False
+
+    def _pointer_args_from_registry(self, pointer_args: List[Any], states: Dict[Tuple, AbstractValue]) -> bool:
+        for arg in pointer_args:
+            try:
+                if self._get_val(arg, states).origins:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _mark_all_bits_used_degraded(self, val: AbstractValue) -> None:
+        if not val.used_bits and not val.candidate_bits:
+            val.mark_all_bits_used(degraded=True)
+        else:
+            val.bit_usage_degraded = True
+        self.global_state.analysis_stats["bit_precision_degraded"] = True
 
     def _resolve_string_at_address(self, addr, addr_str: str) -> Optional[Dict[str, Any]]:
         if addr_str in self.global_state.registry_strings:
@@ -1180,6 +1237,187 @@ class FunctionAnalyzer:
             except Exception:
                 continue
         return None
+
+    def _follow_thunk(self, func):
+        try:
+            if func and getattr(func, "isThunk", lambda: False)():
+                thunk_target = getattr(func, "getThunkedFunction", lambda: None)()
+                if thunk_target:
+                    return thunk_target
+        except Exception:
+            pass
+        return func
+
+    def _find_hkey_meta(self, call_args: List[Any], states: Dict[Tuple, AbstractValue]) -> Optional[Dict[str, str]]:
+        for arg in call_args[:2]:
+            try:
+                val = self._get_val(arg, states)
+            except Exception:
+                val = AbstractValue()
+            off = vn_get_offset(arg)
+            if off is None:
+                for tgt in sorted(val.pointer_targets):
+                    if tgt in HKEY_HANDLE_MAP:
+                        off = tgt
+                        break
+            if off is not None and off in HKEY_HANDLE_MAP:
+                return HKEY_HANDLE_MAP.get(off)
+        return None
+
+    def _derive_registry_fields(
+        self, string_args: List[Dict[str, Any]], call_args: List[Any], detected_hkey_meta: Optional[Dict[str, str]]
+    ) -> Tuple[Optional[str], Optional[str], Optional[str], Dict[str, Any]]:
+        hive = path = value_name = None
+        detail_meta: Dict[str, Any] = {"inferred_hive": False, "inference_reason": None}
+        hkey_meta = detected_hkey_meta
+        if string_args:
+            hive = string_args[0].get("hive")
+            path = string_args[0].get("path")
+            value_name = string_args[0].get("value_name")
+            if hive:
+                detail_meta["inferred_hive"] = True
+                detail_meta["inference_reason"] = detail_meta.get("inference_reason") or "registry_prefix"
+            if len(string_args) > 1:
+                value_candidate = string_args[1].get("value_name") or string_args[1].get("raw")
+                if value_candidate:
+                    value_name = value_candidate
+        if hkey_meta and not hive:
+            hive = hkey_meta.get("hive")
+            if hive:
+                detail_meta["inferred_hive"] = True
+                detail_meta["inference_reason"] = detail_meta.get("inference_reason") or "has_hkey_handle"
+        if hkey_meta and path:
+            clean = str(path).lstrip("\\/")
+            lowered_clean = clean.lower()
+            has_prefix = bool(REGISTRY_STRING_PREFIX_RE.match(clean)) or lowered_clean.startswith("registry\\")
+            if not has_prefix:
+                nt_root = hkey_meta.get("nt_root")
+                if nt_root:
+                    path = f"{nt_root}\\{clean}"
+                    detail_meta["inferred_hive"] = True
+                    detail_meta["inference_reason"] = detail_meta.get("inference_reason") or "hkey_path_join"
+        return hive, path, value_name, detail_meta
+
+    def _taint_registry_outputs(
+        self, func, call_args: List[Any], states: Dict[Tuple, AbstractValue], label: Optional[str], root_id: Optional[str]
+    ) -> None:
+        if label is None or root_id is None:
+            return
+        lowered = label.lower()
+        buffer_indices: Set[int] = set()
+        if "queryvalueex" in lowered:
+            buffer_indices.update([3, 4])
+        if lowered.startswith("regqueryvalue") and "ex" not in lowered:
+            buffer_indices.update([2])
+        if "rtlqueryregistryvalues" in lowered:
+            buffer_indices.update(range(len(call_args)))
+        if "queryvaluekey" in lowered:
+            buffer_indices.update([3, 5])
+        if not buffer_indices and "query" in lowered and "value" in lowered:
+            buffer_indices.update([len(call_args) - 1])
+        for idx in sorted(buffer_indices):
+            if idx < 0 or idx >= len(call_args):
+                continue
+            val = self._get_val(call_args[idx], states)
+            val.tainted = True
+            val.origins.add(root_id)
+            base_id = pointer_base_identifier(func, call_args[idx])
+            if base_id is not None:
+                self._record_base_id_metadata(base_id, call_args[idx])
+                self.global_state.root_slot_index[root_id].add((base_id, 0))
+            self._set_val(call_args[idx], val, states)
+
+    def _resolve_callee_from_refs(self, inst: Instruction, refs_list) -> Tuple[Optional[str], Optional[Any]]:
+        fm = self.program.getFunctionManager()
+        for r in refs_list:
+            try:
+                to_addr = r.getToAddress()
+                if to_addr is None:
+                    continue
+                f = self._follow_thunk(fm.getFunctionAt(to_addr))
+                if f is not None:
+                    return f.getName(), f
+                external_label = self._external_label_for_address(to_addr)
+                if external_label:
+                    return external_label, fm.getFunctionAt(to_addr)
+            except Exception as e:
+                if DEBUG_ENABLED:
+                    log_debug(f"[debug] error resolving call reference at {inst.getAddress()}: {e!r}")
+        return None, None
+
+    def _resolve_callee_from_external_refs(self, inst: Instruction, refs_list) -> Optional[str]:
+        for r in refs_list:
+            try:
+                if hasattr(r, "isExternalReference") and r.isExternalReference():
+                    ext_loc = r.getExternalLocation()
+                    if ext_loc:
+                        label = ext_loc.getLabel() or ext_loc.getOriginalImportedName()
+                        if label:
+                            return label
+            except Exception as e:
+                if DEBUG_ENABLED:
+                    log_debug(f"[debug] error resolving external reference at {inst.getAddress()}: {e!r}")
+        return None
+
+    def _resolve_callee_from_pcode_target(self, target_vn, states: Dict[Tuple, AbstractValue]) -> Tuple[Optional[str], Optional[Any]]:
+        fm = self.program.getFunctionManager()
+        callee = None
+        callee_func = None
+        target_addr = None
+        if target_vn is not None:
+            try:
+                if hasattr(target_vn, "getAddress"):
+                    target_addr = target_vn.getAddress()
+                if target_addr is None and vn_is_constant(target_vn):
+                    off = vn_get_offset(target_vn)
+                    if off is not None:
+                        target_addr = self.api.toAddr(off)
+            except Exception:
+                target_addr = None
+        try:
+            val = self._get_val(target_vn, states) if target_vn is not None else AbstractValue()
+        except Exception:
+            val = AbstractValue()
+        if val.function_pointer_labels:
+            callee = sorted(val.function_pointer_labels)[0]
+        if target_addr is not None:
+            func_at_target = self._follow_thunk(fm.getFunctionAt(target_addr))
+            if func_at_target:
+                callee_func = func_at_target
+                if callee is None:
+                    callee = func_at_target.getName()
+        try:
+            target = target_vn.getOffset() if target_vn is not None and hasattr(target_vn, "getOffset") else None
+        except Exception:
+            target = None
+        if callee is None and target is not None:
+            mapped = IMPORTED_REGISTRY_API_ADDRS.get(int(target))
+            if mapped:
+                callee = mapped
+                try:
+                    callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(self.api.toAddr(target)))
+                except Exception:
+                    pass
+        if callee is None:
+            for tgt in sorted(val.pointer_targets):
+                mapped = IMPORTED_REGISTRY_API_ADDRS.get(tgt)
+                if mapped:
+                    callee = mapped
+                    try:
+                        callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(self.api.toAddr(tgt)))
+                    except Exception:
+                        pass
+                    break
+                try:
+                    addr_obj = self.api.toAddr(tgt)
+                    ext_label = self._external_label_for_address(addr_obj)
+                    if ext_label:
+                        callee = ext_label
+                        callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(addr_obj))
+                        break
+                except Exception:
+                    continue
+        return callee, callee_func
 
     def _resolve_string_from_vn(self, vn, states: Optional[Dict[Tuple, AbstractValue]] = None) -> Optional[Dict[str, Any]]:
         try:
@@ -1608,17 +1846,6 @@ class FunctionAnalyzer:
         val = AbstractValue(bit_width=out.getSize() * 8)
         val.tainted = a.tainted or b.tainted
         val.origins = set(a.origins | b.origins)
-        opname = None
-        try:
-            opname = opcode_name(inputs[0].getDef()) if hasattr(inputs[0], "getDef") else None
-        except Exception:
-            opname = None
-        compare_kind = None
-        if opname is None:
-            try:
-                compare_kind = opcode_name(inputs[0]) if hasattr(inputs[0], "getOpcode") else None
-            except Exception:
-                compare_kind = None
         def_bits_a = _definitely_bits(a)
         def_bits_b = _definitely_bits(b)
         maybe_bits_a = _maybe_bits(a) or set(range(a.bit_width))
@@ -1770,8 +1997,11 @@ class FunctionAnalyzer:
         base = self._get_val(inputs[0], states)
         offset = inputs[1]
         val = base.clone()
+        val.bit_width = out.getSize() * 8
         if val.pointer_pattern is None:
-            val.pointer_pattern = PointerPattern(base_id=pointer_base_identifier(func, inputs[0]))
+            base_id = pointer_base_identifier(func, inputs[0])
+            val.pointer_pattern = PointerPattern(base_id=base_id)
+            self._record_base_id_metadata(base_id, inputs[0])
         if vn_is_constant(offset):
             val.pointer_pattern.adjust_offset(vn_get_offset(offset) or 0)
         else:
@@ -1788,8 +2018,11 @@ class FunctionAnalyzer:
         base = self._get_val(inputs[0], states)
         offset = inputs[1]
         val = base.clone()
+        val.bit_width = out.getSize() * 8
         if val.pointer_pattern is None:
-            val.pointer_pattern = PointerPattern(base_id=pointer_base_identifier(func, inputs[0]))
+            base_id = pointer_base_identifier(func, inputs[0])
+            val.pointer_pattern = PointerPattern(base_id=base_id)
+            self._record_base_id_metadata(base_id, inputs[0])
         if vn_is_constant(offset):
             delta = vn_get_offset(offset) or 0
             val.pointer_pattern.adjust_offset(-delta)
@@ -1814,12 +2047,11 @@ class FunctionAnalyzer:
         if not used_bits and maybe_bits:
             used_bits = set(maybe_bits)
         if not used_bits and not maybe_bits:
-            cond_val.mark_all_bits_used(degraded=True)
+            self._mark_all_bits_used_degraded(cond_val)
             used_bits = set(cond_val.used_bits)
             branch_detail["bit_heuristic"] = "all_bits_fallback"
             if DEBUG_ENABLED:
                 log_debug(f"[debug] heuristic bit usage applied at {inst.getAddress()} (all bits fallback)")
-            self.global_state.analysis_stats["bit_precision_degraded"] = True
         if cond_val.bit_usage_degraded:
             self.global_state.analysis_stats["bit_precision_degraded"] = True
         if cond_val.compare_details:
@@ -1882,58 +2114,7 @@ class FunctionAnalyzer:
             if meta:
                 string_args.append(meta)
         uses_registry_strings = self._function_uses_registry_strings(func)
-        detected_hkey_meta: Optional[Dict[str, str]] = None
-
-        def _find_hkey_meta() -> Optional[Dict[str, str]]:
-            nonlocal detected_hkey_meta
-            if detected_hkey_meta is not None:
-                return detected_hkey_meta
-            for idx, arg in enumerate(call_args[:2]):
-                try:
-                    val = self._get_val(arg, states)
-                except Exception:
-                    val = AbstractValue()
-                off = vn_get_offset(arg)
-                if off is None:
-                    for tgt in sorted(val.pointer_targets):
-                        if tgt in HKEY_HANDLE_MAP:
-                            off = tgt
-                            break
-                if off is not None and off in HKEY_HANDLE_MAP:
-                    detected_hkey_meta = HKEY_HANDLE_MAP.get(off)
-                    break
-            return detected_hkey_meta
-
-        def _derive_registry_fields() -> Tuple[Optional[str], Optional[str], Optional[str], Dict[str, Any]]:
-            hive = path = value_name = None
-            detail_meta: Dict[str, Any] = {"inferred_hive": False, "inference_reason": None}
-            hkey_meta: Optional[Dict[str, str]] = _find_hkey_meta()
-            if string_args:
-                hive = string_args[0].get("hive")
-                path = string_args[0].get("path")
-                value_name = string_args[0].get("value_name")
-                if hive:
-                    detail_meta["inferred_hive"] = True
-                    detail_meta["inference_reason"] = detail_meta.get("inference_reason") or "registry_prefix"
-                if len(string_args) > 1:
-                    value_candidate = string_args[1].get("value_name") or string_args[1].get("raw")
-                    if value_candidate:
-                        value_name = value_candidate
-            if hkey_meta and not hive:
-                hive = hkey_meta.get("hive")
-                if hive:
-                    detail_meta["inferred_hive"] = True
-                    detail_meta["inference_reason"] = detail_meta.get("inference_reason") or "has_hkey_handle"
-            if hkey_meta and path:
-                clean = str(path).lstrip("\\/")
-                lowered_clean = clean.lower()
-                has_prefix = bool(REGISTRY_STRING_PREFIX_RE.match(clean)) or lowered_clean.startswith("registry\\")
-                if not has_prefix:
-                    nt_root = hkey_meta.get("nt_root")
-                    prefix = nt_root or hive
-                    if prefix:
-                        path = f"{prefix}\\{clean}"
-            return hive, path, value_name, detail_meta
+        detected_hkey_meta: Optional[Dict[str, str]] = self._find_hkey_meta(call_args, states)
 
         def _pointerish_argument(vn, val: AbstractValue) -> bool:
             try:
@@ -1951,7 +2132,9 @@ class FunctionAnalyzer:
             return False
 
         def _seed_root(root_id: str, api_label: str, entry_point: Optional[str]) -> None:
-            hive, path, value_name, derivation_meta = _derive_registry_fields()
+            hive, path, value_name, derivation_meta = self._derive_registry_fields(
+                string_args, call_args, detected_hkey_meta
+            )
             if path is None:
                 path = f"unknown_path_{inst.getAddress()}"
             root_meta = self.global_state.roots.setdefault(
@@ -1989,6 +2172,9 @@ class FunctionAnalyzer:
                 if _pointerish_argument(arg, arg_val):
                     arg_val.tainted = True
                     arg_val.origins.add(root_id)
+                    base_id = pointer_base_identifier(func, arg)
+                    if base_id:
+                        self._record_base_id_metadata(base_id, arg)
                     self._set_val(arg, arg_val, states)
         pointer_like_args: List[Any] = []
         for idx, inp in enumerate(call_args):
@@ -2000,125 +2186,7 @@ class FunctionAnalyzer:
         string_has_registry_prefix = any(
             REGISTRY_STRING_PREFIX_RE.search(meta.get("raw") or meta.get("path") or "") for meta in string_args
         )
-        hkey_handle_present = _find_hkey_meta() is not None
-
-        # Special-case registry read APIs to ensure output buffers are tainted.
-        def _taint_registry_outputs(label: Optional[str], root_id: Optional[str]) -> None:
-            if label is None or root_id is None:
-                return
-            lowered = label.lower()
-            buffer_indices: Set[int] = set()
-            if "queryvalueex" in lowered:
-                buffer_indices.update([3, 4])
-            if lowered.startswith("regqueryvalue") and "ex" not in lowered:
-                buffer_indices.update([2])
-            if "rtlqueryregistryvalues" in lowered:
-                buffer_indices.update(range(len(call_args)))
-            if "queryvaluekey" in lowered:
-                buffer_indices.update([3, 5])
-            if not buffer_indices and "query" in lowered and "value" in lowered:
-                buffer_indices.update([len(call_args) - 1])
-            for idx in sorted(buffer_indices):
-                if idx < 0 or idx >= len(call_args):
-                    continue
-                val = self._get_val(call_args[idx], states)
-                val.tainted = True
-                val.origins.add(root_id)
-                base_id = pointer_base_identifier(func, call_args[idx])
-                if base_id is not None:
-                    self.global_state.root_slot_index[root_id].add((base_id, 0))
-                self._set_val(call_args[idx], val, states)
-
-        def _follow_thunk(f):
-            try:
-                if f and getattr(f, "isThunk", lambda: False)():
-                    thunk_target = getattr(f, "getThunkedFunction", lambda: None)()
-                    if thunk_target:
-                        return thunk_target
-            except Exception:
-                pass
-            return f
-
-        def _resolve_callee_from_refs(refs_list) -> Tuple[Optional[str], Optional[Any]]:
-            fm = self.program.getFunctionManager()
-            for r in refs_list:
-                try:
-                    to_addr = r.getToAddress()
-                    if to_addr is None:
-                        continue
-                    f = _follow_thunk(fm.getFunctionAt(to_addr))
-                    if f is not None:
-                        return f.getName(), f
-                    external_label = self._external_label_for_address(to_addr)
-                    if external_label:
-                        return external_label, fm.getFunctionAt(to_addr)
-                except Exception as e:
-                    if DEBUG_ENABLED:
-                        log_debug(f"[debug] error resolving call reference at {inst.getAddress()}: {e!r}")
-            return None, None
-
-        def _resolve_callee_from_external_refs(refs_list) -> Optional[str]:
-            for r in refs_list:
-                try:
-                    if hasattr(r, "isExternalReference") and r.isExternalReference():
-                        ext_loc = r.getExternalLocation()
-                        if ext_loc:
-                            label = ext_loc.getLabel() or ext_loc.getOriginalImportedName()
-                            if label:
-                                return label
-                except Exception as e:
-                    if DEBUG_ENABLED:
-                        log_debug(f"[debug] error resolving external reference at {inst.getAddress()}: {e!r}")
-            return None
-
-        def _resolve_callee_from_pcode_target(target_vn) -> Tuple[Optional[str], Optional[Any]]:
-            fm = self.program.getFunctionManager()
-            callee = None
-            callee_func = None
-            target_addr = None
-            if target_vn is not None:
-                try:
-                    if hasattr(target_vn, "getAddress"):
-                        target_addr = target_vn.getAddress()
-                    if target_addr is None and vn_is_constant(target_vn):
-                        off = vn_get_offset(target_vn)
-                        if off is not None:
-                            target_addr = self.api.toAddr(off)
-                except Exception:
-                    target_addr = None
-            try:
-                val = self._get_val(target_vn, states) if target_vn is not None else AbstractValue()
-            except Exception:
-                val = AbstractValue()
-            if val.function_pointer_labels:
-                callee = sorted(val.function_pointer_labels)[0]
-            if target_addr is not None:
-                func_at_target = _follow_thunk(fm.getFunctionAt(target_addr))
-                if func_at_target:
-                    callee_func = func_at_target
-                    if callee is None:
-                        callee = func_at_target.getName()
-            for tgt in sorted(val.pointer_targets):
-                if callee:
-                    break
-                mapped = registry_api_for_address(tgt)
-                if mapped:
-                    callee = mapped
-                    try:
-                        callee_func = callee_func or _follow_thunk(fm.getFunctionAt(self.api.toAddr(tgt)))
-                    except Exception:
-                        pass
-                    break
-                try:
-                    addr_obj = self.api.toAddr(tgt)
-                    ext_label = self._external_label_for_address(addr_obj)
-                    if ext_label:
-                        callee = ext_label
-                        callee_func = callee_func or _follow_thunk(fm.getFunctionAt(addr_obj))
-                        break
-                except Exception:
-                    continue
-            return callee, callee_func
+        hkey_handle_present = detected_hkey_meta is not None
 
         # Be liberal: for imported functions the reference type may not report
         # isCall(), so scan all refs and ask FunctionManager if the target is
@@ -2130,11 +2198,11 @@ class FunctionAnalyzer:
         except Exception:
             refs = []
 
-        callee_name, callee_func = _resolve_callee_from_refs(refs)
+        callee_name, callee_func = self._resolve_callee_from_refs(inst, refs)
         if callee_name is None:
-            callee_name = _resolve_callee_from_external_refs(refs)
+            callee_name = self._resolve_callee_from_external_refs(inst, refs)
         if callee_name is None and inputs:
-            alt_name, alt_func = _resolve_callee_from_pcode_target(inputs[0])
+            alt_name, alt_func = self._resolve_callee_from_pcode_target(inputs[0], states)
             callee_name = alt_name
             callee_func = callee_func or alt_func
 
@@ -2190,15 +2258,25 @@ class FunctionAnalyzer:
                                 self.global_state.root_slot_index[origin].add(key)
             api_label = normalized_api_label or callee_name
             if is_registry_api(callee_name):
+                if func is not None:
+                    try:
+                        self._functions_with_registry_calls.add(func.getName())
+                    except Exception:
+                        pass
                 root_id = f"api_{safe_label}_{inst.getAddress()}"
                 entry_point = str(callee_func.getEntryPoint()) if callee_func else str(inst.getAddress())
                 _seed_root(root_id, api_label, entry_point)
-                _taint_registry_outputs(api_label, root_id)
+                self._taint_registry_outputs(func, call_args, states, api_label, root_id)
                 if DEBUG_ENABLED:
                     log_debug(
                         f"[debug] registry root seeded: id={root_id} api={api_label} at={inst.getAddress()} entry={entry_point}"
                     )
-            elif string_args:
+            elif string_args and (
+                string_has_registry_prefix
+                or self._function_has_registry_calls(func)
+                or self._pointer_args_from_registry(pointer_like_args, states)
+                or hkey_handle_present
+            ):
                 root_id = f"indirect_{inst.getAddress()}"
                 entry_point = str(callee_func.getEntryPoint()) if callee_func else str(inst.getAddress())
                 _seed_root(root_id, api_label or "<indirect>", entry_point)
@@ -2209,7 +2287,13 @@ class FunctionAnalyzer:
                         f"at={inst.getAddress()}"
                     )
         else:
-            if string_args:
+            string_seed_allowed = (
+                string_has_registry_prefix
+                or self._function_has_registry_calls(func)
+                or self._pointer_args_from_registry(pointer_like_args, states)
+                or hkey_handle_present
+            )
+            if string_args and string_seed_allowed:
                 root_id = f"indirect_{inst.getAddress()}"
                 _seed_root(root_id, "<indirect>", str(inst.getAddress()))
                 if DEBUG_ENABLED:
@@ -2218,9 +2302,7 @@ class FunctionAnalyzer:
                         f"path={self.global_state.roots[root_id].get('path')} value={self.global_state.roots[root_id].get('value_name')} "
                         f"at={inst.getAddress()}"
                     )
-            elif uses_registry_strings and pointer_like_args and (
-                string_has_registry_prefix or (callee_name and is_registry_api(callee_name)) or hkey_handle_present
-            ):
+            elif uses_registry_strings and pointer_like_args and string_seed_allowed:
                 caller_name = func.getName() if func else "<unknown>"
                 api_label = f"<string_seed:{caller_name}>"
                 root_id = f"string_seed_{inst.getAddress()}"
