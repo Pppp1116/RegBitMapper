@@ -337,12 +337,14 @@ class AbstractValue:
     candidate_bits: Set[int] = field(default_factory=set)
     definitely_used_bits: Set[int] = field(default_factory=set)
     maybe_used_bits: Set[int] = field(default_factory=set)
+    forbidden_bits: Set[int] = field(default_factory=set)
     pointer_pattern: Optional[PointerPattern] = None
     pointer_targets: Set[int] = field(default_factory=set)
     function_pointer_labels: Set[str] = field(default_factory=set)
     compare_details: Dict[str, Any] = field(default_factory=dict)
     mask_history: List[Dict[str, Any]] = field(default_factory=list)
     bit_usage_degraded: bool = False
+    slot_sources: Set[Tuple[str, int]] = field(default_factory=set)
 
     def clone(self) -> "AbstractValue":
         return AbstractValue(
@@ -353,12 +355,14 @@ class AbstractValue:
             candidate_bits=set(self.candidate_bits),
             definitely_used_bits=set(self.definitely_used_bits),
             maybe_used_bits=set(self.maybe_used_bits),
+            forbidden_bits=set(self.forbidden_bits),
             pointer_pattern=self.pointer_pattern.clone() if self.pointer_pattern else None,
             pointer_targets=set(self.pointer_targets),
             function_pointer_labels=set(self.function_pointer_labels),
             compare_details=dict(self.compare_details),
             mask_history=list(self.mask_history),
             bit_usage_degraded=self.bit_usage_degraded,
+            slot_sources=set(self.slot_sources),
         )
 
     def mark_bits_used(self, mask: int) -> None:
@@ -389,6 +393,7 @@ class AbstractValue:
         merged.definitely_used_bits = set(self.definitely_used_bits | other.definitely_used_bits | merged.used_bits)
         merged.maybe_used_bits = set(self.maybe_used_bits | other.maybe_used_bits | merged.definitely_used_bits)
         merged.candidate_bits = set(self.candidate_bits | other.candidate_bits | merged.maybe_used_bits)
+        merged.forbidden_bits = set(self.forbidden_bits | other.forbidden_bits)
         merged.pointer_targets = set(self.pointer_targets | other.pointer_targets)
         merged.function_pointer_labels = set(self.function_pointer_labels | other.function_pointer_labels)
         if self.pointer_pattern and other.pointer_pattern:
@@ -404,6 +409,7 @@ class AbstractValue:
             merged.compare_details.update(other.compare_details)
         merged.mask_history = list(self.mask_history or []) + list(other.mask_history or [])
         merged.bit_usage_degraded = self.bit_usage_degraded or other.bit_usage_degraded
+        merged.slot_sources = set(self.slot_sources | other.slot_sources)
         return merged
 
     def state_signature(self) -> Tuple:
@@ -470,6 +476,8 @@ class FunctionSummary:
     return_influence: Set[str] = field(default_factory=set)
     slot_writes: List[Dict[str, Any]] = field(default_factory=list)
     decisions: List[Decision] = field(default_factory=list)
+    uses_registry: bool = False
+    registry_decision_roots: Set[str] = field(default_factory=set)
     _decision_signatures: Set[Tuple] = field(default_factory=set, init=False, repr=False)
 
     @staticmethod
@@ -487,6 +495,9 @@ class FunctionSummary:
             return
         self._decision_signatures.add(sig)
         self.decisions.append(decision)
+        if decision.origins:
+            self.uses_registry = True
+            self.registry_decision_roots |= set(decision.origins)
 
     def merge_from(self, other: "FunctionSummary") -> bool:
         changed = False
@@ -511,6 +522,13 @@ class FunctionSummary:
                 self._decision_signatures.add(sig)
                 self.decisions.append(dec)
                 changed = True
+        if other.uses_registry and not self.uses_registry:
+            self.uses_registry = True
+            changed = True
+        merged_roots = set(self.registry_decision_roots | other.registry_decision_roots)
+        if merged_roots != self.registry_decision_roots:
+            self.registry_decision_roots = merged_roots
+            changed = True
         return changed
 
 
@@ -652,6 +670,17 @@ def _mask_to_bits(mask: int, width: int) -> Set[int]:
         return {i for i in range(width) if mask & (1 << i)}
     except Exception:
         return set()
+
+
+def _bits_from_mask_history(val: AbstractValue) -> Set[int]:
+    bits: Set[int] = set()
+    for entry in val.mask_history:
+        try:
+            mask = int(entry.get("mask", 0))
+            bits |= _mask_to_bits(mask, val.bit_width)
+        except Exception:
+            continue
+    return bits
 
 
 def pointer_base_identifier(func, vn) -> str:
@@ -940,6 +969,29 @@ def is_registry_api(name: str) -> bool:
     return matched
 
 
+def classify_registry_api_kind(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+    lowered = (normalize_registry_label(name) or name).lower()
+    if "querymultiplevalue" in lowered or "queryregistryvalues" in lowered:
+        return "rtl_query_table"
+    if "queryvalue" in lowered or "getvalue" in lowered:
+        return "query_value"
+    if "setvalue" in lowered:
+        return "set_value"
+    if "createkey" in lowered:
+        return "create_key"
+    if "openkey" in lowered or "connectregistry" in lowered:
+        return "open_key"
+    if "delete" in lowered and "value" in lowered:
+        return "delete_value"
+    if "delete" in lowered and "key" in lowered:
+        return "delete_key"
+    if lowered.startswith("rtl"):
+        return "rtl_query_table"
+    return None
+
+
 def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
     if not raw:
         return None
@@ -984,6 +1036,7 @@ def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
         "path": path,
         "key_path": key_path,
         "value_name": value_name,
+        "has_prefix": bool(hive_key),
         "raw": raw,
     }
 
@@ -1177,7 +1230,11 @@ class FunctionAnalyzer:
         if func is None:
             return False
         try:
-            return func.getName() in self._functions_with_registry_calls
+            if func.getName() in self._functions_with_registry_calls:
+                return True
+            summary = self.global_state.function_summaries.get(func.getName())
+            if summary and summary.uses_registry:
+                return True
         except Exception:
             return False
 
@@ -1763,6 +1820,7 @@ class FunctionAnalyzer:
         val = AbstractValue()
         val.tainted = a.tainted or b.tainted
         val.origins = set(a.origins | b.origins)
+        val.slot_sources = set(a.slot_sources | b.slot_sources)
         val.bit_width = out.getSize() * 8
         val.definitely_used_bits = _definitely_bits(a) | _definitely_bits(b)
         val.maybe_used_bits = _maybe_bits(a) | _maybe_bits(b) | set(val.definitely_used_bits)
@@ -1804,6 +1862,7 @@ class FunctionAnalyzer:
         val = AbstractValue()
         val.tainted = a.tainted or b.tainted
         val.origins = set(a.origins | b.origins)
+        val.slot_sources = set(a.slot_sources | b.slot_sources)
         val.bit_width = out.getSize() * 8
         val.definitely_used_bits = _definitely_bits(a) | _definitely_bits(b)
         val.maybe_used_bits = _maybe_bits(a) | _maybe_bits(b) | set(val.definitely_used_bits)
@@ -1821,6 +1880,7 @@ class FunctionAnalyzer:
         val = AbstractValue()
         val.tainted = a.tainted or b.tainted
         val.origins = set(a.origins | b.origins)
+        val.slot_sources = set(a.slot_sources | b.slot_sources)
         val.bit_width = out.getSize() * 8
         val.definitely_used_bits = _definitely_bits(a) | _definitely_bits(b)
         val.maybe_used_bits = _maybe_bits(a) | _maybe_bits(b) | set(val.definitely_used_bits)
@@ -1837,14 +1897,19 @@ class FunctionAnalyzer:
             other = a
         if mask_src is not None and other is not None:
             mask_val = vn_get_offset(mask_src) or 0
-            mask_bits = _mask_to_bits(mask_val, val.bit_width)
+            full_mask = (1 << val.bit_width) - 1
+            clean_mask = mask_val & full_mask
+            mask_bits = _mask_to_bits(clean_mask, val.bit_width)
             other_def = _definitely_bits(other) & mask_bits
             other_maybe = _maybe_bits(other) & mask_bits if _maybe_bits(other) else set(mask_bits)
+            if not other_def and mask_bits:
+                other_def = set(mask_bits)
             val.definitely_used_bits |= other_def
-            val.maybe_used_bits |= other_maybe | other_def
+            val.maybe_used_bits |= other_maybe | other_def | mask_bits
             val.used_bits = set(val.definitely_used_bits)
             val.candidate_bits = set(val.maybe_used_bits)
-            val.mask_history.append({"op": "and", "mask": mask_val})
+            val.forbidden_bits |= set(range(val.bit_width)) - set(mask_bits)
+            val.mask_history.append({"op": "and", "mask": clean_mask})
         self._set_val(out, val, states)
 
     def _handle_orxor(self, out, inputs, states, opname):
@@ -1855,6 +1920,7 @@ class FunctionAnalyzer:
         val = AbstractValue()
         val.tainted = a.tainted or b.tainted
         val.origins = set(a.origins | b.origins)
+        val.slot_sources = set(a.slot_sources | b.slot_sources)
         val.bit_width = out.getSize() * 8
         val.definitely_used_bits = _definitely_bits(a) | _definitely_bits(b)
         val.maybe_used_bits = _maybe_bits(a) | _maybe_bits(b) | set(val.definitely_used_bits)
@@ -1882,8 +1948,11 @@ class FunctionAnalyzer:
         val = AbstractValue()
         val.tainted = base.tainted or self._get_val(amt, states).tainted
         val.origins = set(base.origins | self._get_val(amt, states).origins)
+        val.slot_sources = set(base.slot_sources | self._get_val(amt, states).slot_sources)
         val.bit_width = out.getSize() * 8
         val.pointer_targets = set(base.pointer_targets)
+        val.mask_history = list(base.mask_history)
+        val.forbidden_bits = set(base.forbidden_bits)
         shift = vn_get_offset(amt)
         if shift is None:
             fallback_bits = _fallback_bits_from_value(base)
@@ -1914,6 +1983,7 @@ class FunctionAnalyzer:
             val.candidate_bits = set(val.maybe_used_bits)
             if shift != 0:
                 val.pointer_targets = set()
+            val.mask_history.append({"op": "shift", "direction": opname.lower(), "amount": shift})
         self._set_val(out, val, states)
 
     def _handle_compare(self, out, inputs, states):
@@ -1924,6 +1994,7 @@ class FunctionAnalyzer:
         val = AbstractValue(bit_width=out.getSize() * 8)
         val.tainted = a.tainted or b.tainted
         val.origins = set(a.origins | b.origins)
+        val.slot_sources = set(a.slot_sources | b.slot_sources)
         def_bits_a = _definitely_bits(a)
         def_bits_b = _definitely_bits(b)
         maybe_bits_a = _maybe_bits(a) or set(range(a.bit_width))
@@ -1945,8 +2016,9 @@ class FunctionAnalyzer:
             if const_side and const_val is not None:
                 var_val = b if const_side == "left" else a
                 var_maybe = _maybe_bits(var_val) or set(range(var_val.bit_width))
+                mask_bits = _bits_from_mask_history(var_val)
                 highest_bit = max(0, int(const_val).bit_length() - 1)
-                mask_bits = set(range(0, min(var_val.bit_width, max(1, highest_bit + 1))))
+                mask_bits |= set(range(0, min(var_val.bit_width, max(1, highest_bit + 1))))
                 if var_maybe:
                     mask_bits &= set(var_maybe) or mask_bits
                 if not mask_bits:
@@ -2014,6 +2086,7 @@ class FunctionAnalyzer:
             slot = self.global_state.struct_slots.get(key)
             if slot:
                 val = slot.value.clone()
+                val.slot_sources.add(key)
         self._set_val(out, val, states)
 
     def _handle_store(self, inst, inputs, states):
@@ -2037,6 +2110,7 @@ class FunctionAnalyzer:
             else:
                 old_value = slot.value.clone()
                 slot.value = old_value.merge(src_val)
+            slot.value.slot_sources.add(key)
             inst_func = self._get_function_for_inst(inst)
             func_name = inst_func.getName() if inst_func else "unknown"
             if inst_func is not None:
@@ -2132,6 +2206,12 @@ class FunctionAnalyzer:
         if not used_bits and maybe_bits:
             used_bits = set(maybe_bits)
         if not used_bits and not maybe_bits:
+            history_bits = _bits_from_mask_history(cond_val)
+            if history_bits:
+                used_bits = set(history_bits)
+                cond_val.definitely_used_bits |= used_bits
+                cond_val.maybe_used_bits |= used_bits
+                cond_val.candidate_bits |= used_bits
             fallback_bits = _fallback_bits_from_value(cond_val)
             if fallback_bits:
                 used_bits = set(fallback_bits)
@@ -2150,6 +2230,8 @@ class FunctionAnalyzer:
             self.global_state.analysis_stats["bit_precision_degraded"] = True
         if cond_val.compare_details:
             branch_detail.update(cond_val.compare_details)
+        if cond_val.origins or cond_val.slot_sources:
+            summary.uses_registry = summary.uses_registry or bool(cond_val.origins)
         decision = Decision(
             address=str(inst.getAddress()),
             mnemonic=inst.getMnemonicString(),
@@ -2159,6 +2241,10 @@ class FunctionAnalyzer:
             details=branch_detail,
         )
         decision.details["branch_kind"] = "conditional"
+        if cond_val.slot_sources:
+            decision.details["slots"] = [
+                {"base_id": base, "offset": offset} for base, offset in sorted(cond_val.slot_sources)
+            ]
         summary.add_decision(decision)
         self.global_state.decisions.append(decision)
         for origin in decision.origins:
@@ -2227,7 +2313,14 @@ class FunctionAnalyzer:
                     log_debug(f"[debug] error checking pointer-like argument at {inst.getAddress()}: {e!r}")
             return False
 
-        def _seed_root(root_id: str, api_label: str, entry_point: Optional[str]) -> None:
+        def _seed_root(
+            root_id: str,
+            api_label: str,
+            entry_point: Optional[str],
+            api_kind: Optional[str] = None,
+            indirect_reason: Optional[str] = None,
+        ) -> None:
+            summary.uses_registry = True
             hive, path, value_name, derivation_meta = self._derive_registry_fields(
                 string_args, call_args, detected_hkey_meta
             )
@@ -2238,17 +2331,21 @@ class FunctionAnalyzer:
                 {
                     "id": root_id,
                     "type": "registry",
-                    "api_name": api_label,
+                    "api_name": normalize_registry_label(api_label) or api_label,
+                    "api_kind": api_kind,
                     "address": str(inst.getAddress()),
                     "entry": entry_point,
                     "hive": hive,
                     "path": path,
                     "value_name": value_name,
+                    "indirect_reason": indirect_reason,
                 },
             )
             analysis_meta = root_meta.setdefault("analysis_meta", {})
             if derivation_meta:
                 analysis_meta.update(derivation_meta)
+            if indirect_reason:
+                analysis_meta.setdefault("indirect_reason", indirect_reason)
             if entry_point and not root_meta.get("entry"):
                 root_meta["entry"] = entry_point
             if hive and not root_meta.get("hive"):
@@ -2257,6 +2354,10 @@ class FunctionAnalyzer:
                 root_meta["path"] = path
             if value_name and not root_meta.get("value_name"):
                 root_meta["value_name"] = value_name
+            if api_kind and not root_meta.get("api_kind"):
+                root_meta["api_kind"] = api_kind
+            if indirect_reason and not root_meta.get("indirect_reason"):
+                root_meta["indirect_reason"] = indirect_reason
             if op.getOutput() is not None:
                 val = self._get_val(op.getOutput(), states)
                 val.tainted = True
@@ -2277,6 +2378,7 @@ class FunctionAnalyzer:
             arg_val = self._get_val(inp, states)
             if arg_val.origins:
                 summary.param_influence[idx] |= set(arg_val.origins)
+                summary.uses_registry = summary.uses_registry or bool(arg_val.origins)
             if _pointerish_argument(inp, arg_val):
                 pointer_like_args.append(inp)
         string_has_registry_prefix = any(
@@ -2330,6 +2432,7 @@ class FunctionAnalyzer:
                         summary.param_influence[idx] |= set(roots)
                         val.origins |= roots
                         val.tainted = val.tainted or bool(roots)
+                        summary.uses_registry = summary.uses_registry or bool(roots)
                 if callee_summary.return_influence and op.getOutput() is not None:
                     val = AbstractValue(
                         tainted=True,
@@ -2337,6 +2440,7 @@ class FunctionAnalyzer:
                         bit_width=op.getOutput().getSize() * 8,
                     )
                     self._set_val(op.getOutput(), val, states)
+                    summary.uses_registry = summary.uses_registry or bool(val.origins)
                 for slot in callee_summary.slot_writes:
                     key = (slot.get("base_id"), slot.get("offset"))
                     slot_val = self.global_state.struct_slots.get(key)
@@ -2352,8 +2456,18 @@ class FunctionAnalyzer:
                             )
                             for origin in origins:
                                 self.global_state.root_slot_index[origin].add(key)
+                    if slot.get("origins"):
+                        summary.uses_registry = True
+                if callee_summary.registry_decision_roots:
+                    summary.uses_registry = True
+                    summary.registry_decision_roots |= set(callee_summary.registry_decision_roots)
             api_label = normalized_api_label or callee_name
-            if is_registry_api(callee_name):
+            api_kind = classify_registry_api_kind(api_label)
+            callee_is_registry = is_registry_api(callee_name)
+            wrapper_registry = callee_summary.uses_registry if callee_summary else False
+            registry_like = callee_is_registry or wrapper_registry
+            summary.uses_registry = summary.uses_registry or registry_like
+            if callee_is_registry:
                 if func is not None:
                     try:
                         self._functions_with_registry_calls.add(func.getName())
@@ -2361,27 +2475,40 @@ class FunctionAnalyzer:
                         pass
                 root_id = f"api_{safe_label}_{inst.getAddress()}"
                 entry_point = str(callee_func.getEntryPoint()) if callee_func else str(inst.getAddress())
-                _seed_root(root_id, api_label, entry_point)
+                _seed_root(root_id, api_label, entry_point, api_kind=api_kind)
                 self._taint_registry_outputs(func, call_args, states, api_label, root_id)
                 if DEBUG_ENABLED:
                     log_debug(
                         f"[debug] registry root seeded: id={root_id} api={api_label} at={inst.getAddress()} entry={entry_point}"
                     )
-            elif string_seeds_enabled and indirect_roots_enabled and string_args and (
-                string_has_registry_prefix
-                or self._function_has_registry_calls(func)
-                or self._pointer_args_from_registry(pointer_like_args, states)
-                or hkey_handle_present
-            ):
-                root_id = f"indirect_{inst.getAddress()}"
+            elif wrapper_registry and indirect_roots_enabled:
+                root_id = f"wrapper_{safe_label}_{inst.getAddress()}"
                 entry_point = str(callee_func.getEntryPoint()) if callee_func else str(inst.getAddress())
-                _seed_root(root_id, api_label or "<indirect>", entry_point)
+                _seed_root(root_id, api_label, entry_point, api_kind=api_kind, indirect_reason="registry_wrapper")
                 if DEBUG_ENABLED:
                     log_debug(
-                        f"[debug] string-based root seeded: id={root_id} hive={self.global_state.roots[root_id].get('hive')} "
-                        f"path={self.global_state.roots[root_id].get('path')} value={self.global_state.roots[root_id].get('value_name')} "
-                        f"at={inst.getAddress()}"
+                        f"[debug] wrapper-based registry root seeded: id={root_id} api={api_label} at={inst.getAddress()}"
                     )
+            if string_args and string_seeds_enabled and indirect_roots_enabled:
+                indirect_reason = None
+                if string_has_registry_prefix:
+                    indirect_reason = "string_prefix"
+                elif hkey_handle_present:
+                    indirect_reason = "hkey_handle"
+                elif registry_like:
+                    indirect_reason = "registry_wrapper"
+                elif self._pointer_args_from_registry(pointer_like_args, states):
+                    indirect_reason = "registry_string_in_function"
+                if indirect_reason:
+                    root_id = f"indirect_{inst.getAddress()}"
+                    entry_point = str(callee_func.getEntryPoint()) if callee_func else str(inst.getAddress())
+                    _seed_root(root_id, api_label or "<indirect>", entry_point, api_kind=api_kind, indirect_reason=indirect_reason)
+                    if DEBUG_ENABLED:
+                        log_debug(
+                            f"[debug] string-based root seeded: id={root_id} hive={self.global_state.roots[root_id].get('hive')} "
+                            f"path={self.global_state.roots[root_id].get('path')} value={self.global_state.roots[root_id].get('value_name')} "
+                            f"at={inst.getAddress()} reason={indirect_reason}"
+                        )
         else:
             string_seed_allowed = string_seeds_enabled and (
                 string_has_registry_prefix
@@ -2389,14 +2516,17 @@ class FunctionAnalyzer:
                 or self._pointer_args_from_registry(pointer_like_args, states)
                 or hkey_handle_present
             )
-            if string_args and string_seed_allowed and indirect_roots_enabled:
+            if string_args and indirect_roots_enabled and string_seed_allowed:
+                indirect_reason = "string_prefix" if string_has_registry_prefix else "registry_string_in_function"
+                if hkey_handle_present and indirect_reason != "string_prefix":
+                    indirect_reason = "hkey_handle"
                 root_id = f"indirect_{inst.getAddress()}"
-                _seed_root(root_id, "<indirect>", str(inst.getAddress()))
+                _seed_root(root_id, "<indirect>", str(inst.getAddress()), indirect_reason=indirect_reason)
                 if DEBUG_ENABLED:
                     log_debug(
                         f"[debug] string-based root seeded: id={root_id} hive={self.global_state.roots[root_id].get('hive')} "
                         f"path={self.global_state.roots[root_id].get('path')} value={self.global_state.roots[root_id].get('value_name')} "
-                        f"at={inst.getAddress()}"
+                        f"at={inst.getAddress()} reason={indirect_reason}"
                     )
             elif (
                 string_seeds_enabled
@@ -2408,12 +2538,12 @@ class FunctionAnalyzer:
                 caller_name = func.getName() if func else "<unknown>"
                 api_label = f"<string_seed:{caller_name}>"
                 root_id = f"string_seed_{inst.getAddress()}"
-                _seed_root(root_id, api_label, str(inst.getAddress()))
+                _seed_root(root_id, api_label, str(inst.getAddress()), api_kind="open_key", indirect_reason="registry_string_in_function")
                 if DEBUG_ENABLED:
                     log_debug(
                         f"[debug] string-based root seeded: id={root_id} hive={self.global_state.roots[root_id].get('hive')} "
                         f"path={self.global_state.roots[root_id].get('path')} value={self.global_state.roots[root_id].get('value_name')} "
-                        f"at={inst.getAddress()}"
+                        f"at={inst.getAddress()} reason=registry_string_in_function"
                     )
             if op.getOutput() is not None:
                 out_val = self._get_val(op.getOutput(), states).clone()
@@ -2468,6 +2598,8 @@ class FunctionAnalyzer:
 
     def _finalize_summary_from_slots(self, summary: FunctionSummary) -> None:
         existing = self.global_state.function_summaries.get(summary.name)
+        if any(slot.get("origins") for slot in summary.slot_writes):
+            summary.uses_registry = True
         if existing:
             summary.merge_from(existing)
 
@@ -2490,6 +2622,8 @@ def build_root_records(global_state: GlobalState) -> List[Dict[str, Any]]:
                 continue
             base_id, offset = key
             storage = classify_storage(base_id)
+            slot_bits_def = sorted(_definitely_bits(slot.value))
+            slot_bits_maybe = sorted(_maybe_bits(slot.value))
             slot_entries.append(
                 {
                     "base_id": base_id,
@@ -2498,6 +2632,8 @@ def build_root_records(global_state: GlobalState) -> List[Dict[str, Any]]:
                     "stride": slot.stride,
                     "index_based": bool(slot.index_var),
                     "storage": storage,
+                    "slot_priority": storage,
+                    "slot_bits": {"definitely": slot_bits_def, "maybe": slot_bits_maybe} if slot_bits_def or slot_bits_maybe else None,
                     "notes": "struct slot",
                 }
             )
