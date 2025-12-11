@@ -570,19 +570,104 @@ REGISTRY_RTL_REGISTRY_RE = re.compile(r"(?i)^rtl.*registry")
 # functions with Reg*/Zw*/Nt*/Rtl*/Cm* prefixes that have nothing to do with
 # the Windows registry.
 CURATED_REGISTRY_APIS = {
-    "regopenkeyexa",
-    "regopenkeyexw",
+    "cmcreatekey",
+    "cmdeletekey",
+    "cmdeletevaluekey",
+    "cmenumeratekey",
+    "cmenumeratevaluekey",
+    "cmopenkey",
+    "cmquerykey",
+    "cmquerykeysecurity",
+    "cmqueryvaluekey",
+    "cmrenamekey",
+    "cmsetkeysecurity",
+    "cmsetvaluekey",
+    "ntcreatekey",
+    "ntdeletekey",
+    "ntdeletevaluekey",
+    "ntopenkey",
+    "ntopenkeyex",
+    "ntqueryattributesfile",
+    "ntquerykey",
+    "ntquerymultiplevaluekey",
+    "ntqueryvaluekey",
+    "ntsetinformationkey",
+    "ntsetvaluekey",
+    "rtlcheckregistrykey",
+    "rtlcreateregistrykey",
+    "rtldeleteregistryvalue",
+    "rtlqueryregistryvalues",
+    "rtlwriteregistryvalue",
+    "regclosekey",
+    "regconnectregistrya",
+    "regconnectregistryw",
+    "regcreatekeya",
     "regcreatekeyexa",
     "regcreatekeyexw",
+    "regcreatekeytransacteda",
+    "regcreatekeytransactedw",
+    "regcreatekeyw",
+    "regdeletekey",
+    "regdeletekeyexa",
+    "regdeletekeyexw",
+    "regdeletekeytransacteda",
+    "regdeletekeytransactedw",
+    "regdeletevaluea",
+    "regdeletevaluew",
+    "regdisablepredefinedcache",
+    "regdisablepredefinedcacheex",
+    "regdisablereflectionkey",
+    "regenablereflectionkey",
+    "regenumkeyexa",
+    "regenumkeyexw",
+    "regenumvaluea",
+    "regenumvaluew",
+    "regflushkey",
+    "reggetvaluea",
+    "reggetvaluew",
+    "regloadkeya",
+    "regloadkeyw",
+    "regnotifychangekeyvalue",
+    "regopenkeya",
+    "regopenkeyexa",
+    "regopenkeyexw",
+    "regopenkeytransacteda",
+    "regopenkeytransactedw",
+    "regopenkeyw",
+    "regqueryinfokey",
+    "regqueryvaluea",
     "regqueryvalueexa",
     "regqueryvalueexw",
+    "regqueryvaluew",
+    "regrestorekeya",
+    "regrestorekeyw",
+    "regsavekeya",
+    "regsavekeyex",
+    "regsavekeyexw",
+    "regsavekeyw",
+    "regsetkeysecurity",
+    "regsetvaluea",
     "regsetvalueexa",
     "regsetvalueexw",
-    "regclosekey",
-    "ntopenkey",
-    "ntqueryvaluekey",
-    "ntsetvaluekey",
-    "rtlqueryregistryvalues",
+    "regsetvaluew",
+    "regunloadkey",
+    "zwcreatekey",
+    "zwdeletekey",
+    "zwdeletevaluekey",
+    "zwenumeratekey",
+    "zwenumeratevaluekey",
+    "zwflushkey",
+    "zwloadkey",
+    "zwnotifychangekey",
+    "zwopenkey",
+    "zwopenkeyex",
+    "zwquerykey",
+    "zwquerymultiplevaluekey",
+    "zwqueryvaluekey",
+    "zwrestorekey",
+    "zwsavekey",
+    "zwsetinformationkey",
+    "zwsetvaluekey",
 }
 
 # Imported registry APIs gathered from the binary's externals. Filled in at
@@ -908,6 +993,8 @@ class FunctionAnalyzer:
         # Reuse a single BasicBlockModel for the program (safe for Ghidra 12).
         self.block_model = BasicBlockModel(self.program)
         self.monitor = ACTIVE_MONITOR or DUMMY_MONITOR
+        self._registry_string_usage_cache: Dict[str, bool] = {}
+        self._registry_string_addrs: Optional[Set[str]] = None
 
     def _get_function_for_inst(self, inst: Instruction):
         try:
@@ -933,6 +1020,67 @@ class FunctionAnalyzer:
                 if DEBUG_ENABLED:
                     log_debug(f"[debug] error resolving string value at {addr_str}: {e!r}")
         return self._decode_string_at_address(addr, addr_str)
+
+    def _registry_string_addresses(self) -> Set[str]:
+        if self._registry_string_addrs is None:
+            self._registry_string_addrs = set(self.global_state.registry_strings.keys())
+        return self._registry_string_addrs
+
+    def _function_uses_registry_strings(self, func) -> bool:
+        if func is None:
+            return False
+        key = str(func.getEntryPoint()) if hasattr(func, "getEntryPoint") else func.getName()
+        if key in self._registry_string_usage_cache:
+            return self._registry_string_usage_cache[key]
+        ref_mgr = getattr(self.program, "getReferenceManager", lambda: None)()
+        listing = self.program.getListing()
+        addr_set = self._registry_string_addresses()
+        uses_strings = False
+        try:
+            it = listing.getInstructions(func.getBody(), True)
+            for inst in it:
+                try:
+                    refs = list(ref_mgr.getReferencesFrom(inst.getAddress())) if ref_mgr else []
+                except Exception:
+                    refs = []
+                for ref in refs:
+                    to_addr = getattr(ref, "getToAddress", lambda: None)()
+                    if to_addr is None:
+                        continue
+                    if str(to_addr) in addr_set:
+                        uses_strings = True
+                        break
+                if uses_strings:
+                    break
+        except Exception as e:
+            if DEBUG_ENABLED:
+                log_debug(f"[debug] error checking registry strings in {func.getName()}: {e!r}")
+        self._registry_string_usage_cache[key] = uses_strings
+        return uses_strings
+
+    def _external_label_for_address(self, addr) -> Optional[str]:
+        ref_mgr = getattr(self.program, "getReferenceManager", lambda: None)()
+        if ref_mgr is None:
+            return None
+        try:
+            refs_from = list(ref_mgr.getReferencesFrom(addr))
+        except Exception:
+            refs_from = []
+        try:
+            refs_to = list(ref_mgr.getReferencesTo(addr))
+        except Exception:
+            refs_to = []
+        for ref in refs_from + refs_to:
+            try:
+                if hasattr(ref, "isExternalReference") and ref.isExternalReference():
+                    ext_loc = ref.getExternalLocation()
+                    if ext_loc:
+                        label = ext_loc.getLabel() or ext_loc.getOriginalImportedName()
+                        if label:
+                            return label
+            except Exception:
+                continue
+        return None
 
     def _resolve_string_from_vn(self, vn, states: Optional[Dict[Tuple, AbstractValue]] = None) -> Optional[Dict[str, Any]]:
         try:
@@ -1436,6 +1584,7 @@ class FunctionAnalyzer:
             meta = self._resolve_string_from_vn(inp, states)
             if meta:
                 string_args.append(meta)
+        uses_registry_strings = self._function_uses_registry_strings(func)
 
         def _derive_registry_fields() -> Tuple[Optional[str], Optional[str], Optional[str]]:
             hive = path = value_name = None
@@ -1529,10 +1678,13 @@ class FunctionAnalyzer:
                     arg_val.tainted = True
                     arg_val.origins.add(root_id)
                     self._set_val(arg, arg_val, states)
+        pointer_like_args: List[Any] = []
         for idx, inp in enumerate(call_args):
             arg_val = self._get_val(inp, states)
             if arg_val.origins:
                 summary.param_influence[idx] |= set(arg_val.origins)
+            if _pointerish_argument(inp, arg_val):
+                pointer_like_args.append(inp)
         callee_name = None
         callee_func = None
 
@@ -1560,6 +1712,10 @@ class FunctionAnalyzer:
                             f = thunk_target
                     callee_func = f
                     callee_name = f.getName()
+                    break
+                external_label = self._external_label_for_address(to_addr)
+                if external_label:
+                    callee_name = external_label
                     break
             except Exception as e:
                 if DEBUG_ENABLED:
@@ -1622,6 +1778,16 @@ class FunctionAnalyzer:
                         pass
                     callee_name = mapped
                     break
+                if callee_name is None:
+                    try:
+                        addr_obj = self.api.toAddr(tgt)
+                        ext_label = self._external_label_for_address(addr_obj)
+                        if ext_label:
+                            callee_name = ext_label
+                            callee_func = fm.getFunctionAt(addr_obj) or callee_func
+                            break
+                    except Exception:
+                        continue
 
         if DEBUG_ENABLED:
             log_debug(
@@ -1674,6 +1840,9 @@ class FunctionAnalyzer:
                 entry_point = str(callee_func.getEntryPoint()) if callee_func else None
                 _seed_root(root_id, api_label or "<unknown>", entry_point)
         else:
+            if not string_args and uses_registry_strings and pointer_like_args:
+                root_id = f"string_seed_{inst.getAddress()}"
+                _seed_root(root_id, "<string_seed>", None)
             if string_args:
                 root_id = f"indirect_{inst.getAddress()}"
                 _seed_root(root_id, "<indirect>", None)
