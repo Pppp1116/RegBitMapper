@@ -2417,6 +2417,36 @@ class FunctionAnalyzer:
             alt_name, alt_func = self._resolve_callee_from_pcode_target(inputs[0], states)
             callee_name = alt_name
             callee_func = callee_func or alt_func
+        if callee_name is None:
+            try:
+                ref_mgr = self.program.getReferenceManager()
+                ref_candidates = list(ref_mgr.getReferencesFrom(inst.getAddress())) if ref_mgr else []
+            except Exception:
+                ref_candidates = []
+            fm = self.program.getFunctionManager()
+            for ref in ref_candidates:
+                try:
+                    to_addr = ref.getToAddress()
+                    offset = to_addr.getOffset() if to_addr else None
+                    if offset in IMPORTED_REGISTRY_API_ADDRS:
+                        callee_name = IMPORTED_REGISTRY_API_ADDRS.get(offset)
+                    elif str(offset) in IMPORTED_REGISTRY_API_ADDRS:
+                        callee_name = IMPORTED_REGISTRY_API_ADDRS.get(str(offset))
+                    elif to_addr and str(to_addr) in IMPORTED_REGISTRY_API_ADDRS:
+                        callee_name = IMPORTED_REGISTRY_API_ADDRS.get(str(to_addr))
+                    if callee_name:
+                        try:
+                            callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(to_addr))
+                        except Exception:
+                            pass
+                        if DEBUG_ENABLED:
+                            log_debug(
+                                f"[debug] fallback resolved registry callee from EXTERNAL import: {callee_name} at {inst.getAddress()}"
+                            )
+                        break
+                except Exception as e:
+                    if DEBUG_ENABLED:
+                        log_debug(f"[debug] error during fallback external resolution at {inst.getAddress()}: {e!r}")
 
         if DEBUG_ENABLED:
             log_debug(
