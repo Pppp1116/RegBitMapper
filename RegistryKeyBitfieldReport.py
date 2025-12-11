@@ -710,19 +710,23 @@ def normalize_registry_label(raw: Optional[str]) -> Optional[str]:
     cleaned = raw.strip()
     if not cleaned:
         return None
-    cleaned = re.sub(r"(?i)^(?:__imp__?|imp_)", "", cleaned)
+    cleaned = re.sub(r"(?i)^(?:j__|__imp__?|imp_|__imported_|imported_)", "", cleaned)
+    cleaned = cleaned.strip("@ !:\\/")
     # Keep suffixes that look registry-like, handling common separators and
     # mangled import labels such as ADVAPI32.dll::RegOpenKeyExA@16 or
-    # ADVAPI32.dll_RegQueryValueExW.
+    # ADVAPI32.dll_RegQueryValueExW. We also want to gracefully accept
+    # decorations like "__imp__RegOpenKeyExA@16" and thunks that carry module
+    # qualifiers.
+    split_re = r"[.:@!\\/]|::"
     tokens: List[str] = []
-    for part in re.split(r"[.:@!_\\/]", cleaned):
-        for sub in part.split("::"):
-            for seg in sub.split("_"):
-                if seg:
-                    tokens.append(seg)
+    for part in re.split(split_re, cleaned):
+        for seg in part.split("_"):
+            seg = seg.strip()
+            if seg:
+                tokens.append(seg)
     tokens = tokens or [cleaned]
     registry_re = re.compile(r"(?i)(reg|zw|nt|cm|rtl)[a-z0-9_@]*")
-    for tok in tokens[::-1]:
+    for tok in reversed(tokens):
         m = registry_re.search(tok)
         if m:
             return m.group(0)
@@ -746,19 +750,24 @@ def is_registry_api(name: str) -> bool:
         return False
 
     lowered = normalized.lower()
+    matched = False
+
     if lowered in CURATED_REGISTRY_APIS:
-        return True
+        matched = True
 
     if lowered in IMPORTED_REGISTRY_API_NAMES:
-        return True
+        matched = True
 
-    prefixes = [p.lower() for p in REGISTRY_PREFIXES if p.lower() != "rtl"]
-    if any(lowered.startswith(pref) for pref in prefixes):
-        return False
-    if lowered.startswith("rtl"):
-        return bool(REGISTRY_RTL_REGISTRY_RE.match(lowered))
+    if not matched:
+        if lowered.startswith("rtl"):
+            matched = bool(REGISTRY_RTL_REGISTRY_RE.match(lowered))
+        elif any(lowered.startswith(pref.lower()) for pref in REGISTRY_PREFIXES):
+            matched = True
 
-    return False
+    if matched and DEBUG_ENABLED:
+        log_debug(f"[debug] registry API matched: callee_name={name!r} normalized={normalized!r}")
+
+    return matched
 
 
 def registry_api_for_address(addr: int) -> Optional[str]:
@@ -932,7 +941,11 @@ def collect_imported_registry_apis(program) -> Tuple[Set[str], Dict[int, str]]:
         names.add(lowered)
         try:
             if addr_obj is not None and hasattr(addr_obj, "getOffset"):
-                addr_map[int(addr_obj.getOffset())] = sym_name or normalized
+                addr_map[int(addr_obj.getOffset())] = normalized
+                if DEBUG_ENABLED:
+                    log_debug(
+                        f"[debug] registry import detected: raw={sym_name!r} normalized={normalized!r} addr={addr_obj}"
+                    )
         except Exception:
             pass
 
@@ -1592,6 +1605,8 @@ class FunctionAnalyzer:
         if not cond_val.candidate_bits and not cond_val.used_bits:
             cond_val.mark_all_bits_used()
             branch_detail["bit_heuristic"] = "all_bits_marked"
+            if DEBUG_ENABLED:
+                log_debug(f"[debug] heuristic bit usage applied at {inst.getAddress()} (all bits marked)")
         decision = Decision(
             address=str(inst.getAddress()),
             mnemonic=inst.getMnemonicString(),
@@ -1733,25 +1748,124 @@ class FunctionAnalyzer:
                 summary.param_influence[idx] |= set(arg_val.origins)
             if _pointerish_argument(inp, arg_val):
                 pointer_like_args.append(inp)
+
         # Special-case registry read APIs to ensure output buffers are tainted.
-        def _taint_registry_outputs(label: Optional[str]) -> None:
-            if label is None:
+        def _taint_registry_outputs(label: Optional[str], root_id: Optional[str]) -> None:
+            if label is None or root_id is None:
                 return
             lowered = label.lower()
-            buffer_indices = []
+            buffer_indices: Set[int] = set()
             if "queryvalueex" in lowered:
-                buffer_indices = [3, 4]
-            elif "rtlqueryregistryvalues" in lowered:
-                buffer_indices = list(range(len(call_args)))
-            for idx in buffer_indices:
-                if idx < len(call_args):
-                    val = self._get_val(call_args[idx], states)
-                    val.tainted = True
-                    for origin in val.origins:
-                        self.global_state.root_slot_index[origin].add((pointer_base_identifier(func, call_args[idx]), 0))
-                    self._set_val(call_args[idx], val, states)
-        callee_name = None
-        callee_func = None
+                buffer_indices.update([3, 4])
+            if lowered.startswith("regqueryvalue") and "ex" not in lowered:
+                buffer_indices.update([2])
+            if "rtlqueryregistryvalues" in lowered:
+                buffer_indices.update(range(len(call_args)))
+            if "queryvaluekey" in lowered:
+                buffer_indices.update([3, 5])
+            if not buffer_indices and "query" in lowered and "value" in lowered:
+                buffer_indices.update([len(call_args) - 1])
+            for idx in sorted(buffer_indices):
+                if idx < 0 or idx >= len(call_args):
+                    continue
+                val = self._get_val(call_args[idx], states)
+                val.tainted = True
+                val.origins.add(root_id)
+                base_id = pointer_base_identifier(func, call_args[idx])
+                if base_id is not None:
+                    self.global_state.root_slot_index[root_id].add((base_id, 0))
+                self._set_val(call_args[idx], val, states)
+
+        def _follow_thunk(f):
+            try:
+                if f and getattr(f, "isThunk", lambda: False)():
+                    thunk_target = getattr(f, "getThunkedFunction", lambda: None)()
+                    if thunk_target:
+                        return thunk_target
+            except Exception:
+                pass
+            return f
+
+        def _resolve_callee_from_refs(refs_list) -> Tuple[Optional[str], Optional[Any]]:
+            fm = self.program.getFunctionManager()
+            for r in refs_list:
+                try:
+                    to_addr = r.getToAddress()
+                    if to_addr is None:
+                        continue
+                    f = _follow_thunk(fm.getFunctionAt(to_addr))
+                    if f is not None:
+                        return f.getName(), f
+                    external_label = self._external_label_for_address(to_addr)
+                    if external_label:
+                        return external_label, fm.getFunctionAt(to_addr)
+                except Exception as e:
+                    if DEBUG_ENABLED:
+                        log_debug(f"[debug] error resolving call reference at {inst.getAddress()}: {e!r}")
+            return None, None
+
+        def _resolve_callee_from_external_refs(refs_list) -> Optional[str]:
+            for r in refs_list:
+                try:
+                    if hasattr(r, "isExternalReference") and r.isExternalReference():
+                        ext_loc = r.getExternalLocation()
+                        if ext_loc:
+                            label = ext_loc.getLabel() or ext_loc.getOriginalImportedName()
+                            if label:
+                                return label
+                except Exception as e:
+                    if DEBUG_ENABLED:
+                        log_debug(f"[debug] error resolving external reference at {inst.getAddress()}: {e!r}")
+            return None
+
+        def _resolve_callee_from_pcode_target(target_vn) -> Tuple[Optional[str], Optional[Any]]:
+            fm = self.program.getFunctionManager()
+            callee = None
+            callee_func = None
+            target_addr = None
+            if target_vn is not None:
+                try:
+                    if hasattr(target_vn, "getAddress"):
+                        target_addr = target_vn.getAddress()
+                    if target_addr is None and vn_is_constant(target_vn):
+                        off = vn_get_offset(target_vn)
+                        if off is not None:
+                            target_addr = self.api.toAddr(off)
+                except Exception:
+                    target_addr = None
+            try:
+                val = self._get_val(target_vn, states) if target_vn is not None else AbstractValue()
+            except Exception:
+                val = AbstractValue()
+            if val.function_pointer_labels:
+                callee = sorted(val.function_pointer_labels)[0]
+            if target_addr is not None:
+                func_at_target = _follow_thunk(fm.getFunctionAt(target_addr))
+                if func_at_target:
+                    callee_func = func_at_target
+                    if callee is None:
+                        callee = func_at_target.getName()
+            for tgt in sorted(val.pointer_targets):
+                if callee:
+                    break
+                mapped = registry_api_for_address(tgt)
+                if mapped:
+                    callee = mapped
+                    try:
+                        callee_func = callee_func or _follow_thunk(fm.getFunctionAt(self.api.toAddr(tgt)))
+                    except Exception:
+                        pass
+                    break
+                try:
+                    addr_obj = self.api.toAddr(tgt)
+                    ext_label = self._external_label_for_address(addr_obj)
+                    if ext_label:
+                        callee = ext_label
+                        callee_func = callee_func or _follow_thunk(fm.getFunctionAt(addr_obj))
+                        break
+                except Exception:
+                    continue
+            return callee, callee_func
 
         # Be liberal: for imported functions the reference type may not report
         # isCall(), so scan all refs and ask FunctionManager if the target is
@@ -1762,101 +1876,14 @@ class FunctionAnalyzer:
             refs = list(ref_mgr.getReferencesFrom(inst.getAddress())) if ref_mgr else []
         except Exception:
             refs = []
-        fm = self.program.getFunctionManager()
-        for r in refs:
-            try:
-                to_addr = r.getToAddress()
-                if to_addr is None:
-                    continue
-                f = fm.getFunctionAt(to_addr)
-                if f is not None:
-                    # Resolve through thunk if needed.
-                    if getattr(f, "isThunk", lambda: False)():
-                        thunk_target = getattr(f, "getThunkedFunction", lambda: None)()
-                        if thunk_target:
-                            f = thunk_target
-                    callee_func = f
-                    callee_name = f.getName()
-                    break
-                external_label = self._external_label_for_address(to_addr)
-                if external_label:
-                    callee_name = external_label
-                    break
-            except Exception as e:
-                if DEBUG_ENABLED:
-                    log_debug(f"[debug] error resolving call reference at {inst.getAddress()}: {e!r}")
-                continue
 
-        # Fallback: external location label if no direct function was found.
+        callee_name, callee_func = _resolve_callee_from_refs(refs)
         if callee_name is None:
-            for r in refs:
-                try:
-                    if hasattr(r, "isExternalReference") and r.isExternalReference():
-                        ext_loc = r.getExternalLocation()
-                        if ext_loc:
-                            callee_name = ext_loc.getLabel() or ext_loc.getOriginalImportedName()
-                            if callee_name:
-                                break
-                except Exception as e:
-                    if DEBUG_ENABLED:
-                        log_debug(f"[debug] error resolving external reference at {inst.getAddress()}: {e!r}")
-                    continue
-
-        # P-code input 0 often carries the callee address for direct CALL
-        # sites. Use it as another hint when reference metadata is sparse.
+            callee_name = _resolve_callee_from_external_refs(refs)
         if callee_name is None and inputs:
-            target_vn = inputs[0]
-            if target_vn is not None:
-                try:
-                    target_addr = None
-                    if hasattr(target_vn, "getAddress"):
-                        target_addr = target_vn.getAddress()
-                    if target_addr is None and vn_is_constant(target_vn):
-                        off = vn_get_offset(target_vn)
-                        if off is not None:
-                            target_addr = self.api.toAddr(off)
-                    if callee_name is None:
-                        val = self._get_val(target_vn, states)
-                        if val.function_pointer_labels:
-                            callee_name = sorted(val.function_pointer_labels)[0]
-                    if target_addr is not None:
-                        func_at_target = fm.getFunctionAt(target_addr)
-                        if func_at_target:
-                            if getattr(func_at_target, "isThunk", lambda: False)():
-                                thunk_target = getattr(func_at_target, "getThunkedFunction", lambda: None)()
-                                if thunk_target:
-                                    func_at_target = thunk_target
-                            callee_func = func_at_target
-                            callee_name = func_at_target.getName()
-                except Exception as e:
-                    if DEBUG_ENABLED:
-                        log_debug(f"[debug] error inferring call target at {inst.getAddress()}: {e!r}")
-                    pass
-
-        if callee_name is None and inputs:
-            try:
-                val = self._get_val(inputs[0], states)
-            except Exception:
-                val = AbstractValue()
-            for tgt in sorted(val.pointer_targets):
-                mapped = registry_api_for_address(tgt)
-                if mapped:
-                    try:
-                        callee_func = fm.getFunctionAt(self.api.toAddr(tgt)) or callee_func
-                    except Exception:
-                        pass
-                    callee_name = mapped
-                    break
-                if callee_name is None:
-                    try:
-                        addr_obj = self.api.toAddr(tgt)
-                        ext_label = self._external_label_for_address(addr_obj)
-                        if ext_label:
-                            callee_name = ext_label
-                            callee_func = fm.getFunctionAt(addr_obj) or callee_func
-                            break
-                    except Exception:
-                        continue
+            alt_name, alt_func = _resolve_callee_from_pcode_target(inputs[0])
+            callee_name = alt_name
+            callee_func = callee_func or alt_func
 
         if DEBUG_ENABLED:
             log_debug(
@@ -1911,22 +1938,42 @@ class FunctionAnalyzer:
             api_label = normalized_api_label or callee_name
             if is_registry_api(callee_name):
                 root_id = f"api_{safe_label}_{inst.getAddress()}"
-                # Prefer the resolved callee entrypoint when tying registry roots to call sites.
-                entry_point = str(callee_func.getEntryPoint()) if callee_func else None
+                entry_point = str(callee_func.getEntryPoint()) if callee_func else str(inst.getAddress())
                 _seed_root(root_id, api_label, entry_point)
-                _taint_registry_outputs(api_label)
-            elif string_args and (callee_func is None or getattr(callee_func, "isExternal", lambda: False)()):
-                root_id = f"api_like_{safe_label}_{inst.getAddress()}"
-                # Prefer the resolved callee entrypoint when available; otherwise fall back to the call site.
-                entry_point = str(callee_func.getEntryPoint()) if callee_func else None
-                _seed_root(root_id, api_label or "<unknown>", entry_point)
+                _taint_registry_outputs(api_label, root_id)
+                if DEBUG_ENABLED:
+                    log_debug(
+                        f"[debug] registry root seeded: id={root_id} api={api_label} at={inst.getAddress()} entry={entry_point}"
+                    )
+            elif string_args:
+                root_id = f"indirect_{inst.getAddress()}"
+                entry_point = str(callee_func.getEntryPoint()) if callee_func else str(inst.getAddress())
+                _seed_root(root_id, api_label or "<indirect>", entry_point)
+                if DEBUG_ENABLED:
+                    log_debug(
+                        f"[debug] string-based root seeded: id={root_id} hive={self.global_state.roots[root_id].get('hive')} "
+                        f"path={self.global_state.roots[root_id].get('path')} value={self.global_state.roots[root_id].get('value_name')} "
+                        f"at={inst.getAddress()}"
+                    )
         else:
-            if not string_args and uses_registry_strings and pointer_like_args:
-                root_id = f"string_seed_{inst.getAddress()}"
-                _seed_root(root_id, "<string_seed>", None)
             if string_args:
                 root_id = f"indirect_{inst.getAddress()}"
-                _seed_root(root_id, "<indirect>", None)
+                _seed_root(root_id, "<indirect>", str(inst.getAddress()))
+                if DEBUG_ENABLED:
+                    log_debug(
+                        f"[debug] string-based root seeded: id={root_id} hive={self.global_state.roots[root_id].get('hive')} "
+                        f"path={self.global_state.roots[root_id].get('path')} value={self.global_state.roots[root_id].get('value_name')} "
+                        f"at={inst.getAddress()}"
+                    )
+            elif uses_registry_strings and pointer_like_args:
+                root_id = f"string_seed_{inst.getAddress()}"
+                _seed_root(root_id, "<string_seed>", str(inst.getAddress()))
+                if DEBUG_ENABLED:
+                    log_debug(
+                        f"[debug] string-based root seeded: id={root_id} hive={self.global_state.roots[root_id].get('hive')} "
+                        f"path={self.global_state.roots[root_id].get('path')} value={self.global_state.roots[root_id].get('value_name')} "
+                        f"at={inst.getAddress()}"
+                    )
             if op.getOutput() is not None:
                 out_val = self._get_val(op.getOutput(), states).clone()
                 out_val.bit_width = op.getOutput().getSize() * 8
