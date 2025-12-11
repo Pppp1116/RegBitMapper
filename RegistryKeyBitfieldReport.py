@@ -274,12 +274,28 @@ class PointerPattern:
     stride: Optional[int] = None
     index_var: Optional[Any] = None
     unknown: bool = False
+    offset_history: Set[int] = field(default_factory=set)
 
     def adjust_offset(self, delta: int) -> None:
         if self.offset is None:
             self.offset = delta
         else:
             self.offset += delta
+        try:
+            self.offset_history.add(self.offset)
+            if len(self.offset_history) >= 2:
+                sorted_offsets = sorted(self.offset_history)
+                deltas = [b - a for a, b in zip(sorted_offsets, sorted_offsets[1:]) if b - a > 0]
+                if deltas:
+                    stride_candidate = deltas[0]
+                    for d in deltas[1:]:
+                        if d != stride_candidate:
+                            stride_candidate = None
+                            break
+                    if stride_candidate:
+                        self.stride = stride_candidate
+        except Exception:
+            pass
 
     def clone(self) -> "PointerPattern":
         return PointerPattern(
@@ -288,6 +304,7 @@ class PointerPattern:
             stride=self.stride,
             index_var=self.index_var,
             unknown=self.unknown,
+            offset_history=set(self.offset_history),
         )
 
     def merge(self, other: "PointerPattern") -> "PointerPattern":
@@ -302,6 +319,7 @@ class PointerPattern:
         merged.stride = self.stride if self.stride == other.stride else None
         merged.index_var = self.index_var if self.index_var == other.index_var else None
         merged.unknown = merged.offset is None or merged.stride is None or merged.index_var is None
+        merged.offset_history = set(self.offset_history | other.offset_history)
         return merged
 
 
@@ -312,9 +330,14 @@ class AbstractValue:
     bit_width: int = 32
     used_bits: Set[int] = field(default_factory=set)
     candidate_bits: Set[int] = field(default_factory=set)
+    definitely_used_bits: Set[int] = field(default_factory=set)
+    maybe_used_bits: Set[int] = field(default_factory=set)
     pointer_pattern: Optional[PointerPattern] = None
     pointer_targets: Set[int] = field(default_factory=set)
     function_pointer_labels: Set[str] = field(default_factory=set)
+    compare_details: Dict[str, Any] = field(default_factory=dict)
+    mask_history: List[Dict[str, Any]] = field(default_factory=list)
+    bit_usage_degraded: bool = False
 
     def clone(self) -> "AbstractValue":
         return AbstractValue(
@@ -323,9 +346,14 @@ class AbstractValue:
             bit_width=self.bit_width,
             used_bits=set(self.used_bits),
             candidate_bits=set(self.candidate_bits),
+            definitely_used_bits=set(self.definitely_used_bits),
+            maybe_used_bits=set(self.maybe_used_bits),
             pointer_pattern=self.pointer_pattern.clone() if self.pointer_pattern else None,
             pointer_targets=set(self.pointer_targets),
             function_pointer_labels=set(self.function_pointer_labels),
+            compare_details=dict(self.compare_details),
+            mask_history=list(self.mask_history),
+            bit_usage_degraded=self.bit_usage_degraded,
         )
 
     def mark_bits_used(self, mask: int) -> None:
@@ -333,11 +361,17 @@ class AbstractValue:
             if mask & (1 << i):
                 self.candidate_bits.add(i)
                 self.used_bits.add(i)
+                self.definitely_used_bits.add(i)
+                self.maybe_used_bits.add(i)
 
-    def mark_all_bits_used(self) -> None:
+    def mark_all_bits_used(self, degraded: bool = False) -> None:
         for i in range(self.bit_width):
             self.candidate_bits.add(i)
             self.used_bits.add(i)
+            self.definitely_used_bits.add(i)
+            self.maybe_used_bits.add(i)
+        if degraded:
+            self.bit_usage_degraded = True
 
     def merge(self, other: "AbstractValue") -> "AbstractValue":
         if other is None:
@@ -347,7 +381,9 @@ class AbstractValue:
         merged.origins = set(self.origins | other.origins)
         merged.bit_width = max(self.bit_width, other.bit_width)
         merged.used_bits = set(self.used_bits | other.used_bits)
-        merged.candidate_bits = set(self.candidate_bits | other.candidate_bits)
+        merged.definitely_used_bits = set(self.definitely_used_bits | other.definitely_used_bits | merged.used_bits)
+        merged.maybe_used_bits = set(self.maybe_used_bits | other.maybe_used_bits | merged.definitely_used_bits)
+        merged.candidate_bits = set(self.candidate_bits | other.candidate_bits | merged.maybe_used_bits)
         merged.pointer_targets = set(self.pointer_targets | other.pointer_targets)
         merged.function_pointer_labels = set(self.function_pointer_labels | other.function_pointer_labels)
         if self.pointer_pattern and other.pointer_pattern:
@@ -358,6 +394,11 @@ class AbstractValue:
             merged.pointer_pattern = other.pointer_pattern.clone()
         else:
             merged.pointer_pattern = None
+        merged.compare_details = dict(self.compare_details or {})
+        if other.compare_details:
+            merged.compare_details.update(other.compare_details)
+        merged.mask_history = list(self.mask_history or []) + list(other.mask_history or [])
+        merged.bit_usage_degraded = self.bit_usage_degraded or other.bit_usage_degraded
         return merged
 
     def state_signature(self) -> Tuple:
@@ -375,10 +416,15 @@ class AbstractValue:
             frozenset(self.origins),
             self.bit_width,
             frozenset(self.used_bits),
+            frozenset(self.definitely_used_bits),
+            frozenset(self.maybe_used_bits),
             frozenset(self.candidate_bits),
             pointer_sig,
             frozenset(self.pointer_targets),
             frozenset(self.function_pointer_labels),
+            frozenset(self.compare_details.items()),
+            tuple(sorted([tuple(sorted(m.items())) for m in self.mask_history])) if self.mask_history else (),
+            self.bit_usage_degraded,
         )
 
 
@@ -514,10 +560,58 @@ def varnode_key(vn) -> Tuple:
     return ("unk", str(vn), vn.getSize())
 
 
+def _definitely_bits(val: AbstractValue) -> Set[int]:
+    bits = set(val.definitely_used_bits or val.used_bits)
+    if not bits and val.used_bits:
+        bits |= set(val.used_bits)
+    return bits
+
+
+def _maybe_bits(val: AbstractValue) -> Set[int]:
+    bits = set(val.maybe_used_bits or val.candidate_bits)
+    if not bits:
+        bits |= set(val.definitely_used_bits)
+    if not bits:
+        bits |= set(val.used_bits)
+    return bits
+
+
+def _mask_to_bits(mask: int, width: int) -> Set[int]:
+    try:
+        return {i for i in range(width) if mask & (1 << i)}
+    except Exception:
+        return set()
+
+
 def pointer_base_identifier(func, vn) -> str:
     key = varnode_key(vn)
     func_name = func.getName() if func else "<unknown>"
     return f"{func_name}::{key}"
+
+
+def slot_key_from_pattern(ptr: Optional[PointerPattern]) -> Optional[Tuple[str, int]]:
+    if ptr is None or ptr.base_id is None or ptr.offset is None:
+        return None
+    offset_val = ptr.offset
+    if ptr.index_var is not None and ptr.stride:
+        try:
+            offset_val = ptr.offset % ptr.stride
+        except Exception:
+            offset_val = ptr.offset
+    return (ptr.base_id, offset_val)
+
+
+def classify_storage(base_id: Optional[str]) -> str:
+    if not base_id:
+        return "heap_or_unknown"
+    lowered = str(base_id).lower()
+    if "stack" in lowered:
+        return "stack"
+    if any(seg in lowered for seg in [".data", ".rdata", ".bss", "global"]):
+        return "global"
+    if "mem" in lowered:
+        return "heap_or_unknown"
+    return "heap_or_unknown"
 
 
 def vn_is_constant(vn) -> bool:
@@ -762,9 +856,11 @@ def is_registry_api(name: str) -> bool:
         matched = True
 
     if not matched:
-        if lowered.startswith("rtl"):
-            matched = bool(REGISTRY_RTL_REGISTRY_RE.match(lowered))
-        elif any(lowered.startswith(pref.lower()) for pref in REGISTRY_PREFIXES):
+        likely_external = ("::" in name) or (normalized in IMPORTED_REGISTRY_API_NAMES)
+        prefix_hit = any(lowered.startswith(pref.lower()) for pref in REGISTRY_PREFIXES)
+        if lowered.startswith("rtl") and REGISTRY_RTL_REGISTRY_RE.match(lowered):
+            matched = likely_external or True
+        elif prefix_hit and likely_external:
             matched = True
 
     if matched and DEBUG_ENABLED:
@@ -1298,7 +1394,7 @@ class FunctionAnalyzer:
         elif opname == "INT_AND":
             self._handle_and(out, inputs, states)
         elif opname in {"INT_OR", "INT_XOR"}:
-            self._handle_orxor(out, inputs, states)
+            self._handle_orxor(out, inputs, states, opname)
         elif opname in {"INT_LEFT", "INT_RIGHT", "INT_SRIGHT"}:
             self._handle_shift(out, inputs, states, opname)
         elif opname == "LOAD":
@@ -1355,8 +1451,10 @@ class FunctionAnalyzer:
         val.tainted = a.tainted or b.tainted
         val.origins = set(a.origins | b.origins)
         val.bit_width = out.getSize() * 8
-        val.used_bits = set(a.used_bits | b.used_bits)
-        val.candidate_bits = set(a.candidate_bits | b.candidate_bits)
+        val.definitely_used_bits = _definitely_bits(a) | _definitely_bits(b)
+        val.maybe_used_bits = _maybe_bits(a) | _maybe_bits(b) | set(val.definitely_used_bits)
+        val.used_bits = set(val.definitely_used_bits)
+        val.candidate_bits = set(val.maybe_used_bits)
         val.pointer_targets = set(a.pointer_targets | b.pointer_targets)
         if a.pointer_pattern and vn_is_constant(inputs[1]):
             pp = a.pointer_pattern.clone()
@@ -1394,8 +1492,10 @@ class FunctionAnalyzer:
         val.tainted = a.tainted or b.tainted
         val.origins = set(a.origins | b.origins)
         val.bit_width = out.getSize() * 8
-        val.used_bits = set(a.used_bits | b.used_bits)
-        val.candidate_bits = set(a.candidate_bits | b.candidate_bits)
+        val.definitely_used_bits = _definitely_bits(a) | _definitely_bits(b)
+        val.maybe_used_bits = _maybe_bits(a) | _maybe_bits(b) | set(val.definitely_used_bits)
+        val.used_bits = set(val.definitely_used_bits)
+        val.candidate_bits = set(val.maybe_used_bits)
         val.pointer_pattern = PointerPattern(unknown=True) if (a.pointer_pattern or b.pointer_pattern) else None
         val.pointer_targets = set()
         self._set_val(out, val, states)
@@ -1409,8 +1509,10 @@ class FunctionAnalyzer:
         val.tainted = a.tainted or b.tainted
         val.origins = set(a.origins | b.origins)
         val.bit_width = out.getSize() * 8
-        val.used_bits = set(a.used_bits | b.used_bits)
-        val.candidate_bits = set(a.candidate_bits | b.candidate_bits)
+        val.definitely_used_bits = _definitely_bits(a) | _definitely_bits(b)
+        val.maybe_used_bits = _maybe_bits(a) | _maybe_bits(b) | set(val.definitely_used_bits)
+        val.used_bits = set(val.definitely_used_bits)
+        val.candidate_bits = set(val.maybe_used_bits)
         val.pointer_targets = set(a.pointer_targets | b.pointer_targets)
         mask_src = None
         other = None
@@ -1422,13 +1524,17 @@ class FunctionAnalyzer:
             other = a
         if mask_src is not None and other is not None:
             mask_val = vn_get_offset(mask_src) or 0
-            other_bits = AbstractValue(bit_width=other.bit_width)
-            other_bits.mark_bits_used(mask_val)
-            val.used_bits |= other_bits.used_bits
-            val.candidate_bits |= other_bits.candidate_bits
+            mask_bits = _mask_to_bits(mask_val, val.bit_width)
+            other_def = _definitely_bits(other) & mask_bits
+            other_maybe = _maybe_bits(other) & mask_bits if _maybe_bits(other) else set(mask_bits)
+            val.definitely_used_bits |= other_def
+            val.maybe_used_bits |= other_maybe | other_def
+            val.used_bits = set(val.definitely_used_bits)
+            val.candidate_bits = set(val.maybe_used_bits)
+            val.mask_history.append({"op": "and", "mask": mask_val})
         self._set_val(out, val, states)
 
-    def _handle_orxor(self, out, inputs, states):
+    def _handle_orxor(self, out, inputs, states, opname):
         if out is None or len(inputs) < 2:
             return
         a = self._get_val(inputs[0], states)
@@ -1437,9 +1543,22 @@ class FunctionAnalyzer:
         val.tainted = a.tainted or b.tainted
         val.origins = set(a.origins | b.origins)
         val.bit_width = out.getSize() * 8
-        val.used_bits = set(a.used_bits | b.used_bits)
-        val.candidate_bits = set(a.candidate_bits | b.candidate_bits)
+        val.definitely_used_bits = _definitely_bits(a) | _definitely_bits(b)
+        val.maybe_used_bits = _maybe_bits(a) | _maybe_bits(b) | set(val.definitely_used_bits)
+        val.used_bits = set(val.definitely_used_bits)
+        val.candidate_bits = set(val.maybe_used_bits)
         val.pointer_targets = set(a.pointer_targets | b.pointer_targets)
+        mask_src = None
+        if vn_is_constant(inputs[0]):
+            mask_src = inputs[0]
+        elif vn_is_constant(inputs[1]):
+            mask_src = inputs[1]
+        if mask_src is not None:
+            mask_val = vn_get_offset(mask_src) or 0
+            mask_bits = _mask_to_bits(mask_val, val.bit_width)
+            val.maybe_used_bits |= mask_bits
+            val.candidate_bits |= mask_bits
+            val.mask_history.append({"op": opname.lower() if opname else "orxor", "mask": mask_val})
         self._set_val(out, val, states)
 
     def _handle_shift(self, out, inputs, states, opname):
@@ -1454,17 +1573,29 @@ class FunctionAnalyzer:
         val.pointer_targets = set(base.pointer_targets)
         shift = vn_get_offset(amt)
         if shift is None:
-            val.mark_all_bits_used()
+            val.maybe_used_bits |= _definitely_bits(base) | _maybe_bits(base)
+            val.candidate_bits = set(val.maybe_used_bits)
+            val.used_bits = set(val.definitely_used_bits)
+            val.bit_usage_degraded = True
         else:
-            for b in base.candidate_bits or set(range(base.bit_width)):
+            base_def = _definitely_bits(base) or set()
+            base_maybe = _maybe_bits(base) or set(range(base.bit_width))
+            shifted_def: Set[int] = set()
+            shifted_maybe: Set[int] = set()
+            for b in base_def:
                 if opname == "INT_LEFT":
-                    val.candidate_bits.add(min(val.bit_width - 1, b + shift))
+                    shifted_def.add(min(val.bit_width - 1, b + shift))
                 else:
-                    new_b = b - shift
-                    if new_b < 0:
-                        new_b = 0
-                    val.candidate_bits.add(new_b)
-            val.used_bits |= set(val.candidate_bits)
+                    shifted_def.add(max(0, b - shift))
+            for b in base_maybe:
+                if opname == "INT_LEFT":
+                    shifted_maybe.add(min(val.bit_width - 1, b + shift))
+                else:
+                    shifted_maybe.add(max(0, b - shift))
+            val.definitely_used_bits = shifted_def
+            val.maybe_used_bits = shifted_maybe | shifted_def
+            val.used_bits = set(val.definitely_used_bits)
+            val.candidate_bits = set(val.maybe_used_bits)
             if shift != 0:
                 val.pointer_targets = set()
         self._set_val(out, val, states)
@@ -1477,16 +1608,88 @@ class FunctionAnalyzer:
         val = AbstractValue(bit_width=out.getSize() * 8)
         val.tainted = a.tainted or b.tainted
         val.origins = set(a.origins | b.origins)
-        # All bits used from both sides since comparison is full-width.
-        if a.candidate_bits:
-            val.used_bits |= set(a.candidate_bits)
+        opname = None
+        try:
+            opname = opcode_name(inputs[0].getDef()) if hasattr(inputs[0], "getDef") else None
+        except Exception:
+            opname = None
+        compare_kind = None
+        if opname is None:
+            try:
+                compare_kind = opcode_name(inputs[0]) if hasattr(inputs[0], "getOpcode") else None
+            except Exception:
+                compare_kind = None
+        def_bits_a = _definitely_bits(a)
+        def_bits_b = _definitely_bits(b)
+        maybe_bits_a = _maybe_bits(a) or set(range(a.bit_width))
+        maybe_bits_b = _maybe_bits(b) or set(range(b.bit_width))
+        const_side = None
+        const_val = None
+        compare_meta: Dict[str, Any] = {}
+        op_tag = opcode_name(out.getDef()) if hasattr(out, "getDef") else None
+        if op_tag:
+            compare_meta["compare_op"] = op_tag.lower()
+        if vn_is_constant(inputs[0]):
+            const_side = "left"
+            const_val = vn_get_offset(inputs[0]) or 0
+        elif vn_is_constant(inputs[1]):
+            const_side = "right"
+            const_val = vn_get_offset(inputs[1]) or 0
+        if op_tag in {"INT_EQUAL", "INT_NOTEQUAL"}:
+            compare_meta["compare_kind"] = "eq" if op_tag == "INT_EQUAL" else "neq"
+            if const_side and const_val is not None:
+                var_val = b if const_side == "left" else a
+                var_maybe = _maybe_bits(var_val) or set(range(var_val.bit_width))
+                highest_bit = max(0, int(const_val).bit_length() - 1)
+                mask_bits = set(range(0, min(var_val.bit_width, max(1, highest_bit + 1))))
+                if var_maybe:
+                    mask_bits &= set(var_maybe) or mask_bits
+                if not mask_bits:
+                    mask_bits = set(var_maybe or {0})
+                val.definitely_used_bits = set(mask_bits & _definitely_bits(var_val))
+                val.maybe_used_bits = set(mask_bits | val.definitely_used_bits)
+                compare_meta["constant_side"] = const_side
+                compare_meta["constant_value"] = const_val
+                compare_meta["constant_mask_bits"] = sorted(mask_bits)
+            else:
+                val.definitely_used_bits = def_bits_a | def_bits_b
+                val.maybe_used_bits = maybe_bits_a | maybe_bits_b | val.definitely_used_bits
+        elif op_tag in {
+            "INT_LESS",
+            "INT_LESSEQUAL",
+            "INT_SLESS",
+            "INT_SLESSEQUAL",
+        }:
+            compare_meta["compare_kind"] = op_tag.lower()
+            sign_sensitive = op_tag in {"INT_SLESS", "INT_SLESSEQUAL"}
+            if const_side and const_val is not None:
+                var_val = b if const_side == "left" else a
+                var_maybe = _maybe_bits(var_val) or set(range(var_val.bit_width))
+                max_bit = max(0, int(const_val).bit_length() - 1)
+                if sign_sensitive and var_val.bit_width:
+                    sign_bit = var_val.bit_width - 1
+                    val.definitely_used_bits.add(sign_bit)
+                    max_bit = max(max_bit, sign_bit)
+                bit_range = (0, min(max_bit, var_val.bit_width - 1))
+                approx_bits = set(range(bit_range[0], bit_range[1] + 1))
+                approx_bits &= set(var_maybe) or approx_bits
+                if not approx_bits and var_maybe:
+                    approx_bits = set(var_maybe)
+                val.maybe_used_bits |= approx_bits
+                val.definitely_used_bits |= _definitely_bits(var_val) & approx_bits
+                compare_meta["constant_side"] = const_side
+                compare_meta["constant_value"] = const_val
+                compare_meta["approx_bit_range"] = [bit_range[0], bit_range[1]]
+            else:
+                val.definitely_used_bits = def_bits_a | def_bits_b
+                val.maybe_used_bits = maybe_bits_a | maybe_bits_b | val.definitely_used_bits
         else:
-            val.used_bits |= set(range(a.bit_width))
-        if b.candidate_bits:
-            val.used_bits |= set(b.candidate_bits)
-        else:
-            val.used_bits |= set(range(b.bit_width))
-        val.candidate_bits = set(val.used_bits)
+            val.definitely_used_bits = def_bits_a | def_bits_b
+            val.maybe_used_bits = maybe_bits_a | maybe_bits_b | val.definitely_used_bits
+        val.used_bits = set(val.definitely_used_bits)
+        val.candidate_bits = set(val.maybe_used_bits)
+        if compare_meta:
+            val.compare_details = compare_meta
         self._set_val(out, val, states)
 
     def _handle_load(self, out, inputs, states):
@@ -1494,8 +1697,8 @@ class FunctionAnalyzer:
             return
         addr_val = self._get_val(inputs[1], states)
         val = AbstractValue(bit_width=out.getSize() * 8)
-        if addr_val.pointer_pattern and addr_val.pointer_pattern.base_id and addr_val.pointer_pattern.offset is not None:
-            key = (addr_val.pointer_pattern.base_id, addr_val.pointer_pattern.offset)
+        key = slot_key_from_pattern(addr_val.pointer_pattern)
+        if key:
             slot = self.global_state.struct_slots.get(key)
             if slot:
                 val = slot.value.clone()
@@ -1507,13 +1710,13 @@ class FunctionAnalyzer:
         addr_val = self._get_val(inputs[1], states)
         src_val = self._get_val(inputs[2], states)
         old_value = None
-        if addr_val.pointer_pattern and addr_val.pointer_pattern.base_id and addr_val.pointer_pattern.offset is not None:
-            key = (addr_val.pointer_pattern.base_id, addr_val.pointer_pattern.offset)
+        key = slot_key_from_pattern(addr_val.pointer_pattern)
+        if key:
             slot = self.global_state.struct_slots.get(key)
             if slot is None:
                 slot = StructSlot(
                     addr_val.pointer_pattern.base_id,
-                    addr_val.pointer_pattern.offset,
+                    key[1],
                     addr_val.pointer_pattern.stride,
                     addr_val.pointer_pattern.index_var,
                     value=src_val.clone(),
@@ -1606,17 +1809,27 @@ class FunctionAnalyzer:
             log_trace(f"[trace] skipping untainted branch at {inst.getAddress()}")
             return
         branch_detail = {"type": "branch"}
-        if not cond_val.candidate_bits and not cond_val.used_bits:
-            cond_val.mark_all_bits_used()
-            branch_detail["bit_heuristic"] = "all_bits_marked"
+        used_bits = set(_definitely_bits(cond_val))
+        maybe_bits = set(_maybe_bits(cond_val))
+        if not used_bits and maybe_bits:
+            used_bits = set(maybe_bits)
+        if not used_bits and not maybe_bits:
+            cond_val.mark_all_bits_used(degraded=True)
+            used_bits = set(cond_val.used_bits)
+            branch_detail["bit_heuristic"] = "all_bits_fallback"
             if DEBUG_ENABLED:
-                log_debug(f"[debug] heuristic bit usage applied at {inst.getAddress()} (all bits marked)")
+                log_debug(f"[debug] heuristic bit usage applied at {inst.getAddress()} (all bits fallback)")
+            self.global_state.analysis_stats["bit_precision_degraded"] = True
+        if cond_val.bit_usage_degraded:
+            self.global_state.analysis_stats["bit_precision_degraded"] = True
+        if cond_val.compare_details:
+            branch_detail.update(cond_val.compare_details)
         decision = Decision(
             address=str(inst.getAddress()),
             mnemonic=inst.getMnemonicString(),
             disasm=inst.toString(),
             origins=set(cond_val.origins),
-            used_bits=set(cond_val.used_bits or cond_val.candidate_bits),
+            used_bits=set(used_bits),
             details=branch_detail,
         )
         decision.details["branch_kind"] = "conditional"
@@ -1628,10 +1841,29 @@ class FunctionAnalyzer:
     def _handle_multiequal(self, out, inputs, states):
         if out is None:
             return
-        merged = AbstractValue()
+        merged = None
+        def_intersection: Optional[Set[int]] = None
+        maybe_union: Set[int] = set()
         for inp in inputs:
-            merged = merged.merge(self._get_val(inp, states))
+            val = self._get_val(inp, states)
+            if merged is None:
+                merged = val.clone()
+            else:
+                merged = merged.merge(val)
+            def_bits = _definitely_bits(val)
+            maybe_bits = _maybe_bits(val)
+            if def_intersection is None:
+                def_intersection = set(def_bits)
+            else:
+                def_intersection &= set(def_bits)
+            maybe_union |= set(maybe_bits) | set(def_bits)
+        if merged is None:
+            merged = AbstractValue()
         merged.bit_width = out.getSize() * 8
+        merged.definitely_used_bits = def_intersection or set()
+        merged.maybe_used_bits = maybe_union | merged.definitely_used_bits
+        merged.used_bits = set(merged.definitely_used_bits)
+        merged.candidate_bits = set(merged.maybe_used_bits)
         self._set_val(out, merged, states)
 
     def _handle_indirect(self, out, inputs, states):
@@ -1650,10 +1882,12 @@ class FunctionAnalyzer:
             if meta:
                 string_args.append(meta)
         uses_registry_strings = self._function_uses_registry_strings(func)
+        detected_hkey_meta: Optional[Dict[str, str]] = None
 
-        def _derive_registry_fields() -> Tuple[Optional[str], Optional[str], Optional[str]]:
-            hive = path = value_name = None
-            hkey_meta: Optional[Dict[str, str]] = None
+        def _find_hkey_meta() -> Optional[Dict[str, str]]:
+            nonlocal detected_hkey_meta
+            if detected_hkey_meta is not None:
+                return detected_hkey_meta
             for idx, arg in enumerate(call_args[:2]):
                 try:
                     val = self._get_val(arg, states)
@@ -1666,29 +1900,30 @@ class FunctionAnalyzer:
                             off = tgt
                             break
                 if off is not None and off in HKEY_HANDLE_MAP:
-                    hkey_meta = HKEY_HANDLE_MAP.get(off)
+                    detected_hkey_meta = HKEY_HANDLE_MAP.get(off)
                     break
+            return detected_hkey_meta
+
+        def _derive_registry_fields() -> Tuple[Optional[str], Optional[str], Optional[str], Dict[str, Any]]:
+            hive = path = value_name = None
+            detail_meta: Dict[str, Any] = {"inferred_hive": False, "inference_reason": None}
+            hkey_meta: Optional[Dict[str, str]] = _find_hkey_meta()
             if string_args:
                 hive = string_args[0].get("hive")
                 path = string_args[0].get("path")
                 value_name = string_args[0].get("value_name")
-                if hive is None and path is None:
-                    raw0 = string_args[0].get("raw")
-                    if raw0:
-                        # treat as relative path under HKLM (most Windows APIs default)
-                        hive = "HKLM"
-                        clean = raw0.strip("\\")
-                        path = clean
-                        # last component as value if applicable
-                        parts = clean.split("\\")
-                        if len(parts) > 1:
-                            value_name = parts[-1]
+                if hive:
+                    detail_meta["inferred_hive"] = True
+                    detail_meta["inference_reason"] = detail_meta.get("inference_reason") or "registry_prefix"
                 if len(string_args) > 1:
                     value_candidate = string_args[1].get("value_name") or string_args[1].get("raw")
                     if value_candidate:
                         value_name = value_candidate
             if hkey_meta and not hive:
                 hive = hkey_meta.get("hive")
+                if hive:
+                    detail_meta["inferred_hive"] = True
+                    detail_meta["inference_reason"] = detail_meta.get("inference_reason") or "has_hkey_handle"
             if hkey_meta and path:
                 clean = str(path).lstrip("\\/")
                 lowered_clean = clean.lower()
@@ -1698,7 +1933,7 @@ class FunctionAnalyzer:
                     prefix = nt_root or hive
                     if prefix:
                         path = f"{prefix}\\{clean}"
-            return hive, path, value_name
+            return hive, path, value_name, detail_meta
 
         def _pointerish_argument(vn, val: AbstractValue) -> bool:
             try:
@@ -1716,7 +1951,7 @@ class FunctionAnalyzer:
             return False
 
         def _seed_root(root_id: str, api_label: str, entry_point: Optional[str]) -> None:
-            hive, path, value_name = _derive_registry_fields()
+            hive, path, value_name, derivation_meta = _derive_registry_fields()
             if path is None:
                 path = f"unknown_path_{inst.getAddress()}"
             root_meta = self.global_state.roots.setdefault(
@@ -1732,6 +1967,9 @@ class FunctionAnalyzer:
                     "value_name": value_name,
                 },
             )
+            analysis_meta = root_meta.setdefault("analysis_meta", {})
+            if derivation_meta:
+                analysis_meta.update(derivation_meta)
             if entry_point and not root_meta.get("entry"):
                 root_meta["entry"] = entry_point
             if hive and not root_meta.get("hive"):
@@ -1759,6 +1997,10 @@ class FunctionAnalyzer:
                 summary.param_influence[idx] |= set(arg_val.origins)
             if _pointerish_argument(inp, arg_val):
                 pointer_like_args.append(inp)
+        string_has_registry_prefix = any(
+            REGISTRY_STRING_PREFIX_RE.search(meta.get("raw") or meta.get("path") or "") for meta in string_args
+        )
+        hkey_handle_present = _find_hkey_meta() is not None
 
         # Special-case registry read APIs to ensure output buffers are tainted.
         def _taint_registry_outputs(label: Optional[str], root_id: Optional[str]) -> None:
@@ -1976,7 +2218,9 @@ class FunctionAnalyzer:
                         f"path={self.global_state.roots[root_id].get('path')} value={self.global_state.roots[root_id].get('value_name')} "
                         f"at={inst.getAddress()}"
                     )
-            elif uses_registry_strings and pointer_like_args:
+            elif uses_registry_strings and pointer_like_args and (
+                string_has_registry_prefix or (callee_name and is_registry_api(callee_name)) or hkey_handle_present
+            ):
                 caller_name = func.getName() if func else "<unknown>"
                 api_label = f"<string_seed:{caller_name}>"
                 root_id = f"string_seed_{inst.getAddress()}"
@@ -2008,8 +2252,10 @@ class FunctionAnalyzer:
         val = AbstractValue(bit_width=out.getSize() * 8)
         for inp in inputs:
             val = val.merge(self._get_val(inp, states))
-        if not val.candidate_bits:
-            val.mark_all_bits_used()
+        if not val.maybe_used_bits:
+            val.maybe_used_bits |= _maybe_bits(val)
+        val.candidate_bits = set(val.maybe_used_bits)
+        val.used_bits = set(val.definitely_used_bits)
         self._set_val(out, val, states)
 
     def _finalize_summary_from_slots(self, summary: FunctionSummary) -> None:
@@ -2035,6 +2281,7 @@ def build_root_records(global_state: GlobalState) -> List[Dict[str, Any]]:
             if slot is None:
                 continue
             base_id, offset = key
+            storage = classify_storage(base_id)
             slot_entries.append(
                 {
                     "base_id": base_id,
@@ -2042,11 +2289,12 @@ def build_root_records(global_state: GlobalState) -> List[Dict[str, Any]]:
                     "offset_hex": hex(offset),
                     "stride": slot.stride,
                     "index_based": bool(slot.index_var),
+                    "storage": storage,
                     "notes": "struct slot",
                 }
             )
-            used_bits |= slot.value.used_bits
-            candidate_bits |= slot.value.candidate_bits
+            used_bits |= _definitely_bits(slot.value)
+            candidate_bits |= _maybe_bits(slot.value)
             slot_bit_widths.append(slot.value.bit_width)
         decisions = [d.to_dict() for d in global_state.root_decision_index.get(root_id, [])]
         overrides = list(global_state.root_override_index.get(root_id, []))
@@ -2085,6 +2333,20 @@ def emit_ndjson(global_state: GlobalState) -> None:
             "function_iterations": boolify(global_state.analysis_stats.get("function_iterations_limit")),
             "call_depth": boolify(global_state.analysis_stats.get("call_depth_limit")),
         },
+    }
+    roots_with_no_decisions = sum(1 for rid in global_state.roots if not global_state.root_decision_index.get(rid))
+    roots_with_overrides = sum(1 for rid in global_state.roots if global_state.root_override_index.get(rid))
+    bit_precision_degraded = bool(global_state.analysis_stats.get("bit_precision_degraded"))
+    if not bit_precision_degraded:
+        bit_precision_degraded = any(slot.value.bit_usage_degraded for slot in global_state.struct_slots.values())
+        if not bit_precision_degraded:
+            bit_precision_degraded = any(
+                d.details.get("bit_heuristic") == "all_bits_fallback" for d in global_state.decisions if d.details
+            )
+    summary["meta"] = {
+        "bit_precision_degraded": bool(bit_precision_degraded),
+        "roots_with_no_decisions": roots_with_no_decisions,
+        "roots_with_overrides": roots_with_overrides,
     }
     print(json.dumps(summary))
 
