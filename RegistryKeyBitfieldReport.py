@@ -1231,7 +1231,7 @@ class FunctionAnalyzer:
     def _function_uses_registry_strings(self, func) -> bool:
         if func is None:
             return False
-        key = str(func.getEntryPoint()) if hasattr(func, "getEntryPoint") else func.getName()
+        key = self._func_key(func)
         if key in self._registry_string_usage_cache:
             return self._registry_string_usage_cache[key]
         ref_mgr = getattr(self.program, "getReferenceManager", lambda: None)()
@@ -1530,12 +1530,26 @@ class FunctionAnalyzer:
             return None
         return None
 
+    def _func_key(self, func) -> str:
+        if hasattr(func, "getEntryPoint"):
+            try:
+                return str(func.getEntryPoint())
+            except Exception:
+                pass
+        return func.getName()
+
     def analyze_all(self) -> None:
+        """Global fixed-point over function summaries.
+
+        The worklist processes functions whose summaries might impact callers or callees.
+        ``queued`` only tracks functions currently scheduled (in ``worklist``), so a
+        function can be re-enqueued if its summary changes in a later iteration.
+        """
         fm = self.program.getFunctionManager()
         worklist = deque()
         queued: Set[str] = set()
         for func in fm.getFunctions(True):
-            key = str(func.getEntryPoint()) if hasattr(func, "getEntryPoint") else func.getName()
+            key = self._func_key(func)
             worklist.append((func, 0))
             queued.add(key)
         iteration_guard = 0
@@ -1548,6 +1562,8 @@ class FunctionAnalyzer:
             except Exception:
                 pass
             func, depth = worklist.popleft()
+            func_key = self._func_key(func)
+            queued.discard(func_key)
             iteration_guard += 1
             if self.max_call_depth is not None and depth > self.max_call_depth:
                 self.global_state.analysis_stats["call_depth_limit"] = True
@@ -1560,14 +1576,14 @@ class FunctionAnalyzer:
             if existing is None:
                 self.global_state.function_summaries[func.getName()] = summary
                 for callee in func.getCalledFunctions(self.monitor):
-                    callee_key = str(callee.getEntryPoint()) if hasattr(callee, "getEntryPoint") else callee.getName()
+                    callee_key = self._func_key(callee)
                     if callee_key not in queued:
                         queued.add(callee_key)
                         worklist.append((callee, depth + 1))
             else:
                 if existing.merge_from(summary):
                     for callee in func.getCalledFunctions(self.monitor):
-                        callee_key = str(callee.getEntryPoint()) if hasattr(callee, "getEntryPoint") else callee.getName()
+                        callee_key = self._func_key(callee)
                         if callee_key not in queued:
                             queued.add(callee_key)
                             worklist.append((callee, depth + 1))
