@@ -37,6 +37,7 @@ import sys
 import os
 from collections import defaultdict, deque
 import re
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -1751,9 +1752,7 @@ def _launch_via_pyghidra_bridge() -> None:
 if __name__ == "__main__":
     _REGKEYBITFIELDREPORT_RAN = True
     if currentProgram is None:
-        warnings.simplefilter("ignore", category=DeprecationWarning)
         warnings.filterwarnings("ignore", category=DeprecationWarning)
-        os.environ.setdefault("JAVA_TOOL_OPTIONS", _JAVA_UNSAFE_SUPPRESS_FLAG)
         _launch_via_pyghidra_bridge()
     else:
         main()
