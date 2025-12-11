@@ -725,6 +725,9 @@ def normalize_registry_label(raw: Optional[str]) -> Optional[str]:
             if seg:
                 tokens.append(seg)
     tokens = tokens or [cleaned]
+    # strip leftover decoration like @NN or trailing digits
+    cleaned = re.sub(r"@[0-9]+$", "", cleaned)
+    cleaned = re.sub(r"\$[A-Za-z0-9_]+$", "", cleaned)
     registry_re = re.compile(r"(?i)(reg|zw|nt|cm|rtl)[a-z0-9_@]*")
     for tok in reversed(tokens):
         m = registry_re.search(tok)
@@ -981,19 +984,21 @@ def collect_imported_registry_apis(program) -> Tuple[Set[str], Dict[int, str]]:
 
 
 class FunctionAnalyzer:
+    DEFAULT_MAX_STEPS = 5_000_000
+    DEFAULT_MAX_FUNCTION_ITERATIONS = 250_000
+
     def __init__(self, api: FlatProgramAPI, program, global_state: GlobalState, mode: str, max_call_depth: Optional[int] = None):
         self.api = api
         self.global_state = global_state
         self.mode = mode
-        self.max_steps = 5_000_000
-        self.max_function_iterations = 250_000
+        self.max_steps = self.DEFAULT_MAX_STEPS
+        self.max_function_iterations = self.DEFAULT_MAX_FUNCTION_ITERATIONS
         self.max_call_depth = max_call_depth
         self.program = program
         # Reuse a single BasicBlockModel for the program (safe for Ghidra 12).
         self.block_model = BasicBlockModel(self.program)
         self.monitor = ACTIVE_MONITOR or DUMMY_MONITOR
         self._registry_string_usage_cache: Dict[str, bool] = {}
-        self._registry_string_addrs: Optional[Set[str]] = None
 
     def _get_function_for_inst(self, inst: Instruction):
         try:
@@ -1021,9 +1026,8 @@ class FunctionAnalyzer:
         return self._decode_string_at_address(addr, addr_str)
 
     def _registry_string_addresses(self) -> Set[str]:
-        if self._registry_string_addrs is None:
-            self._registry_string_addrs = set(self.global_state.registry_strings.keys())
-        return self._registry_string_addrs
+        # do not cache — registry strings can be discovered dynamically during analysis
+        return set(self.global_state.registry_strings.keys())
 
     def _function_uses_registry_strings(self, func) -> bool:
         if func is None:
@@ -1668,10 +1672,17 @@ class FunctionAnalyzer:
                 hive = string_args[0].get("hive")
                 path = string_args[0].get("path")
                 value_name = string_args[0].get("value_name")
-                if hive is None and path is None and value_name is None:
+                if hive is None and path is None:
                     raw0 = string_args[0].get("raw")
                     if raw0:
-                        value_name = raw0
+                        # treat as relative path under HKLM (most Windows APIs default)
+                        hive = "HKLM"
+                        clean = raw0.strip("\\")
+                        path = clean
+                        # last component as value if applicable
+                        parts = clean.split("\\")
+                        if len(parts) > 1:
+                            value_name = parts[-1]
                 if len(string_args) > 1:
                     value_candidate = string_args[1].get("value_name") or string_args[1].get("raw")
                     if value_candidate:
@@ -1966,8 +1977,10 @@ class FunctionAnalyzer:
                         f"at={inst.getAddress()}"
                     )
             elif uses_registry_strings and pointer_like_args:
+                caller_name = func.getName() if func else "<unknown>"
+                api_label = f"<string_seed:{caller_name}>"
                 root_id = f"string_seed_{inst.getAddress()}"
-                _seed_root(root_id, "<string_seed>", str(inst.getAddress()))
+                _seed_root(root_id, api_label, str(inst.getAddress()))
                 if DEBUG_ENABLED:
                     log_debug(
                         f"[debug] string-based root seeded: id={root_id} hive={self.global_state.roots[root_id].get('hive')} "
