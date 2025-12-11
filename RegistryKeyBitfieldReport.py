@@ -564,7 +564,7 @@ def opcode_name(op: PcodeOp) -> str:
 
 
 REGISTRY_PREFIXES = ["Reg", "Zw", "Nt", "Cm", "Rtl"]
-REGISTRY_RTL_REGISTRY_RE = re.compile(r"(?i)^rtl(?:query|write|create|open|delete|check|enumerate)registry")
+REGISTRY_RTL_REGISTRY_RE = re.compile(r"(?i)^rtl.*registry")
 
 REGISTRY_HIVE_ALIASES = {
     "HKLM": ["HKLM", "HKEY_LOCAL_MACHINE", "\\Registry\\Machine"],
@@ -620,7 +620,8 @@ def is_registry_api(name: str) -> bool:
     normalized = normalize_registry_label(name)
     if normalized:
         lowered = normalized.lower()
-        if any(lowered.startswith(pref.lower()) for pref in ("reg", "zw", "nt", "cm")):
+        prefixes = [p.lower() for p in REGISTRY_PREFIXES if p.lower() != "rtl"]
+        if any(lowered.startswith(pref) for pref in prefixes):
             return True
         if lowered.startswith("rtl"):
             return bool(REGISTRY_RTL_REGISTRY_RE.match(lowered))
@@ -639,6 +640,7 @@ def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
     m = REGISTRY_STRING_PREFIX_RE.search(raw)
     hive_key = None
     path = None
+    key_path: Optional[str] = None
     value_name = None
     candidate_segment = raw
     if m:
@@ -676,18 +678,28 @@ def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
     if not path:
         return None
     path = path.strip("\0\r\n \t\"")
-    if path and "\\" in path:
-        parts = [p for p in path.split("\\") if p]
-        if parts:
+    parts = [p for p in path.split("\\") if p]
+    if parts:
+        if len(parts) > 1:
+            value_name = parts[-1]
+            key_path = "\\".join(parts[:-1])
+            path = "\\".join(parts)
+        elif "\\" in path:
             value_name = parts[-1]
             path = "\\".join(parts)
-    return {"hive": hive_key, "path": path, "value_name": value_name, "raw": raw}
+    return {
+        "hive": hive_key,
+        "path": path,
+        "key_path": key_path,
+        "value_name": value_name,
+        "raw": raw,
+    }
 
 
 def collect_registry_string_candidates(program, scan_limit: Optional[int] = None) -> Dict[str, Dict[str, Any]]:
     listing = program.getListing()
     candidates: Dict[str, Dict[str, Any]] = {}
-    max_scan = scan_limit if scan_limit is not None else 100_000
+    max_scan = None if scan_limit == 0 else scan_limit
     scanned = 0
     monitor = ACTIVE_MONITOR or DUMMY_MONITOR
     for data in listing.getDefinedData(True):
@@ -698,7 +710,7 @@ def collect_registry_string_candidates(program, scan_limit: Optional[int] = None
         except Exception:
             pass
         scanned += 1
-        if max_scan and scanned > max_scan:
+        if max_scan is not None and scanned > max_scan:
             log_debug("[debug] registry string candidate scan capped for performance")
             break
         try:
@@ -1311,6 +1323,10 @@ class FunctionAnalyzer:
                 hive = string_args[0].get("hive")
                 path = string_args[0].get("path")
                 value_name = string_args[0].get("value_name")
+                if hive is None and path is None and value_name is None:
+                    raw0 = string_args[0].get("raw")
+                    if raw0:
+                        value_name = raw0
                 if len(string_args) > 1:
                     value_candidate = string_args[1].get("value_name") or string_args[1].get("raw")
                     if value_candidate:
