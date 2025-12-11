@@ -885,16 +885,24 @@ HKEY_HANDLE_MAP: Dict[int, Dict[str, str]] = {
 }
 
 REGISTRY_HIVE_ALIASES = {
-    "HKLM": ["HKLM", "HKEY_LOCAL_MACHINE", "\\Registry\\Machine"],
-    "HKCU": ["HKCU", "HKEY_CURRENT_USER", "\\Registry\\User"],
+    "HKLM": ["HKLM", "HKEY_LOCAL_MACHINE", "\\Registry\\Machine", "Registry\\Machine"],
+    "HKCU": ["HKCU", "HKEY_CURRENT_USER", "\\Registry\\User", "Registry\\User"],
     "HKCR": ["HKCR", "HKEY_CLASSES_ROOT"],
-    "HKU": ["HKU", "HKEY_USERS"],
+    "HKU": ["HKU", "HKEY_USERS", "\\Registry\\Users", "Registry\\Users"],
     "HKCC": ["HKCC", "HKEY_CURRENT_CONFIG"],
 }
 
 REGISTRY_STRING_PREFIX_RE = re.compile(
-    r"(HKLM|HKCU|HKCR|HKU|HKCC|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER|HKEY_CLASSES_ROOT|HKEY_USERS|HKEY_CURRENT_CONFIG|\\\\Registry\\\\Machine|\\\\Registry\\\\User|\\\\Registry\\\\Users)",
+    r"(HKLM|HKCU|HKCR|HKU|HKCC|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER|HKEY_CLASSES_ROOT|HKEY_USERS|HKEY_CURRENT_CONFIG|\\\\?Registry\\\\Machine|\\\\?Registry\\\\User|\\\\?Registry\\\\Users)",
     re.IGNORECASE,
+)
+
+REGISTRY_LIKELY_PATH_RE = re.compile(
+    r"(?i)^(?:"
+    r"HKLM|HKCU|HKCR|HKU|HKCC|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER|HKEY_CLASSES_ROOT|HKEY_USERS|HKEY_CURRENT_CONFIG|"
+    r"(?:\\?Registry\\(?:Machine|User|Users))|"
+    r"software\\|system\\|hardware\\|sam\\|security\\|currentcontrolset\\|controlset[0-9]+\\"
+    r")",
 )
 
 
@@ -1022,15 +1030,27 @@ def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
     if not path:
         return None
     path = path.strip("\0\r\n \t\"")
+    lowered_path = path.lower()
+    if hive_key is None:
+        if lowered_path.startswith("registry\\"):
+            hive_key = "HKLM" if "\\machine\\" in lowered_path else None
+            hive_key = hive_key or ("HKU" if "\\user" in lowered_path or "\\users" in lowered_path else None)
+        if not REGISTRY_LIKELY_PATH_RE.match(path):
+            return None
+    elif lowered_path.startswith("registry\\"):
+        path = re.sub(r"(?i)^registry\\(?:machine|user|users)\\?", "", path)
+    if "\\" not in path:
+        return None
     parts = [p for p in path.split("\\") if p]
-    if parts:
-        if len(parts) > 1:
-            value_name = parts[-1]
-            key_path = "\\".join(parts[:-1])
-            path = "\\".join(parts)
-        elif "\\" in path:
-            value_name = parts[-1]
-            path = "\\".join(parts)
+    if not parts:
+        return None
+    if len(parts) > 1:
+        value_name = parts[-1]
+        key_path = "\\".join(parts[:-1])
+        path = "\\".join(parts)
+    elif "\\" in path:
+        value_name = parts[-1]
+        path = "\\".join(parts)
     return {
         "hive": hive_key,
         "path": path,
