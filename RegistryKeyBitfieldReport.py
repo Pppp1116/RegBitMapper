@@ -2059,31 +2059,76 @@ class FunctionAnalyzer:
     def _taint_registry_outputs(
         self, func, call_args: List["Varnode"], states: AnalysisState, label: Optional[str], root_id: Optional[str]
     ) -> None:
+        """
+        FIXED VERSION:
+        1. [span_5](start_span)Taints Argument 5 (Size) to catch logic checking returned data size[span_5](end_span).
+        2. [span_6](start_span)Dereferences pointers to taint the actual memory slots, not just the registers[span_6](end_span).
+        """
         if label is None or root_id is None:
             return
         lowered = label.lower()
+
         buffer_indices: Set[int] = set()
+
+        # --- FIX 1: Add Index 5 (Size) ---
         if "queryvalueex" in lowered:
-            buffer_indices.update([3, 4])
-        if lowered.startswith("regqueryvalue") and "ex" not in lowered:
+            # Args: 3=Type, 4=Data, 5=Size
+            buffer_indices.update([3, 4, 5])
+        elif lowered.startswith("regqueryvalue") and "ex" not in lowered:
             buffer_indices.update([2])
-        if "rtlqueryregistryvalues" in lowered:
+        elif "rtlqueryregistryvalues" in lowered:
             buffer_indices.update(range(len(call_args)))
-        if "queryvaluekey" in lowered:
+        elif "queryvaluekey" in lowered:
             buffer_indices.update([3, 5])
+
+        # Fallback for generic query functions
         if not buffer_indices and "query" in lowered and "value" in lowered:
             buffer_indices.update([len(call_args) - 1])
+
         for idx in sorted(buffer_indices):
             if idx < 0 or idx >= len(call_args):
                 continue
-            val = self._get_val(call_args[idx], states).clone()
+            
+            arg_vn = call_args[idx]
+            arg_val = self._get_val(arg_vn, states)
+            
+            # --- FIX 2: Taint-by-Indirection (Memory Taint) ---
+            # If the argument is a pointer, we must taint the memory locations it points to.
+            dereference_success = False
+            
+            # Case A: We know the pointer targets (e.g., Stack offsets)
+            if arg_val.pointer_targets:
+                for target_offset in arg_val.pointer_targets:
+                    # Retrieve the base ID (e.g., the function stack frame)
+                    base_id = arg_val.pointer_patterns[0].base_id if arg_val.pointer_patterns else None
+                    
+                    if base_id:
+                        # Taint a range of bytes (heuristic: 4 bytes/32-bits)
+                        for i in range(4): 
+                            mem_key = (base_id, target_offset + i)
+                            
+                            # Create or update the memory slot
+                            if mem_key not in states.memory.slots:
+                                states.memory.slots[mem_key] = StructSlot(
+                                    base_id, 
+                                    target_offset + i, 
+                                    value=AbstractValue(bit_width=8, tainted=True, origins={root_id})
+                                )
+                            else:
+                                slot = states.memory.slots[mem_key]
+                                slot.value.tainted = True
+                                slot.value.origins.add(root_id)
+                        dereference_success = True
+
+            # Case B: Taint the register itself as a fallback
+            # (Required if the binary checks the pointer value or if dereference failed)
+            val = arg_val.clone()
             val.tainted = True
             val.origins.add(root_id)
-            base_id = pointer_base_identifier(func, call_args[idx])
-            if base_id is not None:
-                self._record_base_id_metadata(base_id, call_args[idx])
-                self.global_state.root_slot_index[root_id].add((base_id, 0))
-            self._set_val(call_args[idx], val, states)
+            self._set_val(arg_vn, val, states)
+            
+            if DEBUG_ENABLED and dereference_success:
+                print(f"[debug] Applied memory taint to {len(arg_val.pointer_targets)} targets for root {root_id}")
 
     def _resolve_callee_from_refs(self, inst: Instruction, refs_list) -> Tuple[Optional[str], Optional[Any]]:
         fm = self.program.getFunctionManager()
