@@ -332,26 +332,38 @@ class PointerPattern:
 
 @dataclass
 class AbstractValue:
+    # --- Status Flags ---
     tainted: bool = False
+    is_top: bool = False      # Represents "Unknown / All Possible Values"
+    is_bottom: bool = True    # Represents "Uninitialized / Not Yet Visited"
+    
+    # --- Data Tracking ---
     origins: Set[str] = field(default_factory=set)
     bit_width: int = 32
+    
+    # --- Bitfield Tracking ---
     used_bits: Set[int] = field(default_factory=set)
     candidate_bits: Set[int] = field(default_factory=set)
     definitely_used_bits: Set[int] = field(default_factory=set)
     maybe_used_bits: Set[int] = field(default_factory=set)
     forbidden_bits: Set[int] = field(default_factory=set)
+    
+    # --- Pointer Analysis ---
     pointer_pattern: Optional[PointerPattern] = None
     pointer_targets: Set[int] = field(default_factory=set)
     function_pointer_labels: Set[str] = field(default_factory=set)
+    
+    # --- Meta ---
     compare_details: Dict[str, Any] = field(default_factory=dict)
     mask_history: List[Dict[str, Any]] = field(default_factory=list)
     bit_usage_degraded: bool = False
     slot_sources: Set[Tuple[str, int]] = field(default_factory=set)
-    is_top: bool = False
 
     def clone(self) -> "AbstractValue":
         return AbstractValue(
             tainted=self.tainted,
+            is_top=self.is_top,
+            is_bottom=self.is_bottom,
             origins=set(self.origins),
             bit_width=self.bit_width,
             used_bits=set(self.used_bits),
@@ -366,10 +378,10 @@ class AbstractValue:
             mask_history=list(self.mask_history),
             bit_usage_degraded=self.bit_usage_degraded,
             slot_sources=set(self.slot_sources),
-            is_top=self.is_top,
         )
 
     def mark_bits_used(self, mask: int) -> None:
+        if self.is_bottom: self.is_bottom = False
         for i in range(self.bit_width):
             if mask & (1 << i):
                 self.candidate_bits.add(i)
@@ -378,86 +390,114 @@ class AbstractValue:
                 self.maybe_used_bits.add(i)
 
     def mark_all_bits_used(self, degraded: bool = False) -> None:
-        for i in range(self.bit_width):
-            self.candidate_bits.add(i)
-            self.used_bits.add(i)
-            self.definitely_used_bits.add(i)
-            self.maybe_used_bits.add(i)
+        if self.is_bottom: self.is_bottom = False
+        full_set = set(range(self.bit_width))
+        self.candidate_bits |= full_set
+        self.used_bits |= full_set
+        self.definitely_used_bits |= full_set
+        self.maybe_used_bits |= full_set
         if degraded:
             self.bit_usage_degraded = True
 
+    def partial_widen(self) -> None:
+        """Relax precision without losing the pointer base."""
+        if self.is_top: return
+        # Keep base_id but discard precise offset/stride
+        if self.pointer_pattern:
+            self.pointer_pattern.offset = None
+            self.pointer_pattern.stride = None
+            self.pointer_pattern.unknown = True
+            self.pointer_pattern.offset_history.clear()
+        self.pointer_targets.clear()
+        self.mask_history.clear()
+        self.bit_usage_degraded = True
+
     def widen(self) -> None:
-        """Drive the abstract value toward a coarse Top state to ensure convergence."""
-        if self.is_top:
-            return
+        """Drive to full Top state (completely unknown)."""
+        if self.is_top: return
         self.is_top = True
+        self.is_bottom = False
         self.mark_all_bits_used(degraded=True)
         self.pointer_targets.clear()
         self.mask_history.clear()
+        self.function_pointer_labels.clear()
         if self.pointer_pattern:
             self.pointer_pattern.unknown = True
 
     def merge(self, other: "AbstractValue") -> "AbstractValue":
-        if other is None:
-            return self
+        if other is None: return self
+        
+        # Handle Bottom (Uninitialized) - The other value "wins" completely
+        if self.is_bottom: return other.clone()
+        if other.is_bottom: return self.clone()
+
+        # Handle Top (Unknown) - If one is Top, the result is Top (but we try to preserve taint)
         if self.is_top or other.is_top:
-            top_val = self.clone() if self.is_top else other.clone()
-            top_val.tainted = top_val.tainted or (other.tainted if self.is_top else self.tainted)
-            top_val.origins |= other.origins if self.is_top else self.origins
+            top_val = self.clone()
             top_val.widen()
+            # Taint is 'sticky' - if either path was tainted, the result is tainted
+            top_val.tainted = self.tainted or other.tainted
+            top_val.origins = self.origins | other.origins
             return top_val
+
         merged = AbstractValue()
+        merged.is_bottom = False
         merged.tainted = self.tainted or other.tainted
-        merged.origins = set(self.origins | other.origins)
+        merged.origins = self.origins | other.origins
         merged.bit_width = max(self.bit_width, other.bit_width)
-        merged.used_bits = set(self.used_bits | other.used_bits)
-        merged.definitely_used_bits = set(self.definitely_used_bits | other.definitely_used_bits | merged.used_bits)
-        merged.maybe_used_bits = set(self.maybe_used_bits | other.maybe_used_bits | merged.definitely_used_bits)
-        merged.candidate_bits = set(self.candidate_bits | other.candidate_bits | merged.maybe_used_bits)
-        merged.forbidden_bits = set(self.forbidden_bits | other.forbidden_bits)
-        merged.pointer_targets = set(self.pointer_targets | other.pointer_targets)
-        merged.function_pointer_labels = set(self.function_pointer_labels | other.function_pointer_labels)
+        
+        # Merge Bitfields (Union)
+        merged.used_bits = self.used_bits | other.used_bits
+        merged.definitely_used_bits = self.definitely_used_bits & other.definitely_used_bits # Intersection for 'definite'
+        merged.maybe_used_bits = self.maybe_used_bits | other.maybe_used_bits
+        merged.candidate_bits = self.candidate_bits | other.candidate_bits
+        merged.forbidden_bits = self.forbidden_bits & other.forbidden_bits
+        
+        # Merge Pointers
+        merged.pointer_targets = self.pointer_targets | other.pointer_targets
+        merged.function_pointer_labels = self.function_pointer_labels | other.function_pointer_labels
+        
         if self.pointer_pattern and other.pointer_pattern:
             merged.pointer_pattern = self.pointer_pattern.merge(other.pointer_pattern)
         elif self.pointer_pattern:
+            # Merging Pointer vs Non-Pointer -> Partial Widen
             merged.pointer_pattern = self.pointer_pattern.clone()
+            merged.pointer_pattern.unknown = True
         elif other.pointer_pattern:
             merged.pointer_pattern = other.pointer_pattern.clone()
-        else:
-            merged.pointer_pattern = None
-        merged.compare_details = dict(self.compare_details or {})
-        if other.compare_details:
-            merged.compare_details.update(other.compare_details)
-        merged.mask_history = list(self.mask_history or []) + list(other.mask_history or [])
+            merged.pointer_pattern.unknown = True
+        
+        merged.compare_details = self.compare_details.copy()
+        merged.compare_details.update(other.compare_details)
+        
+        # Limit history growth to prevent memory explosion
+        merged.mask_history = (self.mask_history + other.mask_history)[-10:] 
         merged.bit_usage_degraded = self.bit_usage_degraded or other.bit_usage_degraded
-        merged.slot_sources = set(self.slot_sources | other.slot_sources)
+        merged.slot_sources = self.slot_sources | other.slot_sources
+        
         return merged
 
     def state_signature(self) -> Tuple:
         pointer_sig = None
-        if self.pointer_pattern is not None:
+        if self.pointer_pattern:
             pointer_sig = (
                 self.pointer_pattern.base_id,
                 self.pointer_pattern.offset,
                 self.pointer_pattern.stride,
-                bool(self.pointer_pattern.index_var is not None),
                 self.pointer_pattern.unknown,
             )
         return (
+            self.is_bottom,
+            self.is_top,
             self.tainted,
             frozenset(self.origins),
             self.bit_width,
             frozenset(self.used_bits),
             frozenset(self.definitely_used_bits),
-            frozenset(self.maybe_used_bits),
-            frozenset(self.candidate_bits),
             pointer_sig,
             frozenset(self.pointer_targets),
             frozenset(self.function_pointer_labels),
-            frozenset(self.compare_details.items()),
-            tuple(sorted([tuple(sorted(m.items())) for m in self.mask_history])) if self.mask_history else (),
-            self.bit_usage_degraded,
-            self.is_top,
+            self.bit_usage_degraded
         )
 
 
@@ -757,6 +797,7 @@ def new_value_from_varnode(vn) -> AbstractValue:
     if not width:
         width = DEFAULT_POINTER_BIT_WIDTH
     val = AbstractValue(bit_width=width)
+    val.is_bottom = False
     if vn and vn.isConstant():
         val.tainted = False
         off = vn_get_offset(vn)
@@ -1642,91 +1683,82 @@ class FunctionAnalyzer:
         callee = None
         callee_func = None
 
-        # 1. Collect ALL potential definitions via Backward Slice
-        # This handles cases where a register is set in an if/else block (Phi node)
+        # 1. Check abstract value first (Forward propagation results)
+        try:
+            val = self._get_val(target_vn, states) if target_vn else None
+            if val and val.function_pointer_labels:
+                # Return the lexicographically first label for consistency
+                return sorted(val.function_pointer_labels)[0], None
+        except Exception:
+            pass
+
+        # 2. Collect Definitions via Slicing
         potential_defs = self._collect_potential_definitions(target_vn)
 
         for real_vn, def_op in potential_defs:
-            if callee: break # Stop if we found a match
+            if callee: break
+            
+            if not def_op:
+                # Handle Constants (Absolute Addresses)
+                if vn_is_constant(real_vn):
+                    off = vn_get_offset(real_vn)
+                    # Check Import Cache
+                    mapped = IMPORTED_REGISTRY_API_ADDRS.get(off)
+                    if mapped:
+                        callee = mapped
+                        break
+                    # Check if it's a function start
+                    f = fm.getFunctionAt(self.api.toAddr(off))
+                    if f:
+                        callee_func = f
+                        callee = f.getName()
+                        break
+                continue
 
-            # Case A: Indirect Call via Register (CALL RBX) where RBX = LOAD[IAT]
-            if def_op and def_op.getOpcode() == PcodeOp.LOAD:
-                load_addr_vn = def_op.getInput(1) # Index 1 is the address
+            opcode = def_op.getOpcode()
+
+            # Case A: LEA / PTRADD (RIP-Relative addressing patterns)
+            # Common in x64: LEA RAX, [RIP + 0x1234]
+            if opcode == PcodeOp.PTRADD:
+                base = def_op.getInput(0)
+                offset = def_op.getInput(1)
                 
-                # Recursively trace the address being loaded (handle MOV RAX, IAT; LOAD [RAX])
-                addr_defs = self._collect_potential_definitions(load_addr_vn, max_depth=20)
+                # If base is unknown but context implies it might be current block/image base
+                # This is hard in pure P-code without the instruction context, 
+                # but we can check if 'base' comes from a constant that looks like an image base.
+                pass 
+            
+            # Case B: LOAD (Global Variable / IAT)
+            if opcode == PcodeOp.LOAD:
+                addr_vn = def_op.getInput(1)
                 
-                for addr_vn, _ in addr_defs:
-                    if addr_vn and vn_is_constant(addr_vn):
-                        iat_offset = vn_get_offset(addr_vn)
-                        if iat_offset is not None:
-                            try:
-                                iat_addr = self.api.toAddr(iat_offset)
-                                
-                                # A1: Check Ghidra References (Strongest IAT Signal)
-                                ref_mgr = getattr(self.program, "getReferenceManager", lambda: None)()
-                                if ref_mgr:
-                                    for ref in ref_mgr.getReferencesFrom(iat_addr):
-                                        to_addr = ref.getToAddress()
-                                        if not to_addr: continue
-                                        
-                                        # Is it an external ref?
-                                        if getattr(to_addr, "isExternalAddress", lambda: False)() or "EXTERNAL" in str(to_addr.getAddressSpace()):
-                                            ext = self._external_label_for_address(to_addr)
-                                            if ext:
-                                                callee = ext
-                                                break
-                                        
-                                        # Is it a known cached import?
-                                        mapped = (IMPORTED_REGISTRY_API_ADDRS.get(to_addr.getOffset()) or 
-                                                  IMPORTED_REGISTRY_API_ADDRS.get(str(to_addr)))
-                                        if mapped:
-                                            callee = mapped
-                                            break
-
-                                # A2: Check Import Cache directly
-                                if not callee:
-                                    mapped = (IMPORTED_REGISTRY_API_ADDRS.get(iat_offset) or 
-                                              IMPORTED_REGISTRY_API_ADDRS.get(str(iat_offset)) or
-                                              IMPORTED_REGISTRY_API_ADDRS.get(str(iat_addr)))
-                                    if mapped:
-                                        callee = mapped
-
-                                # A3: Read memory (if initialized)
-                                if not callee:
-                                    ptr = self._read_pointer_value(iat_addr)
-                                    if ptr:
-                                        mapped = (IMPORTED_REGISTRY_API_ADDRS.get(ptr) or 
-                                                  IMPORTED_REGISTRY_API_ADDRS.get(str(ptr)))
-                                        if mapped:
-                                            callee = mapped
-                            except Exception:
-                                pass
-                    if callee: break
-
-            # Case B: The Varnode ITSELF is a pointer to an API (e.g. constant pointer)
-            elif real_vn and vn_is_constant(real_vn):
-                off = vn_get_offset(real_vn)
-                mapped = IMPORTED_REGISTRY_API_ADDRS.get(off)
-                if mapped:
-                    callee = mapped
-        
-        # 4. Case C: Tainted Function Pointer (Forward Analysis Fallback)
-        if not callee:
-            try:
-                val = self._get_val(target_vn, states) if target_vn is not None else AbstractValue()
-                if val.function_pointer_labels:
-                    callee = sorted(val.function_pointer_labels)[0]
-                
-                if not callee and val.pointer_targets:
-                    for tgt in sorted(val.pointer_targets):
-                        mapped = IMPORTED_REGISTRY_API_ADDRS.get(tgt) or IMPORTED_REGISTRY_API_ADDRS.get(str(tgt))
+                # Recurse: What address are we loading from?
+                # This catches: MOV RAX, [0x401000] -> CALL RAX
+                sub_defs = self._collect_potential_definitions(addr_vn, max_depth=5)
+                for sub_vn, _ in sub_defs:
+                    if vn_is_constant(sub_vn):
+                        load_addr_off = vn_get_offset(sub_vn)
+                        
+                        # 1. Is the address in the IAT?
+                        mapped = IMPORTED_REGISTRY_API_ADDRS.get(load_addr_off)
                         if mapped:
                             callee = mapped
                             break
-            except Exception:
-                pass
-
+                        
+                        # 2. Read memory at that address (Global function pointer)
+                        ptr = self._read_pointer_value(self.api.toAddr(load_addr_off))
+                        if ptr:
+                            mapped_ptr = IMPORTED_REGISTRY_API_ADDRS.get(ptr)
+                            if mapped_ptr:
+                                callee = mapped_ptr
+                                break
+                            # Is the pointed-to value a function?
+                            f_ptr = fm.getFunctionAt(self.api.toAddr(ptr))
+                            if f_ptr:
+                                callee_func = f_ptr
+                                callee = f_ptr.getName()
+                                break
+        
         return callee, callee_func
 
     def _resolve_string_from_vn(self, vn, states: Optional[Dict[Tuple, AbstractValue]] = None) -> Optional[Dict[str, Any]]:
@@ -1944,15 +1976,45 @@ class FunctionAnalyzer:
         self, blk, preds: Dict[Any, List[Any]], out_states: Dict[Any, Dict[Tuple, AbstractValue]], must_widen: bool = False
     ):
         merged: Dict[Tuple, AbstractValue] = {}
-        for pred in preds.get(blk, []):
-            for key, val in out_states.get(pred, {}).items():
-                if key not in merged:
-                    merged[key] = val.clone()
+        
+        # Filter out predecessors that haven't been visited yet (empty states)
+        # This prevents "polluting" the merge with empty/bottom values early in the loop.
+        valid_preds = [out_states.get(p) for p in preds.get(blk, []) if p in out_states]
+        
+        if not valid_preds:
+            return {}
+
+        # Initialize with the first valid predecessor
+        # Deep copy is essential to avoid mutating the predecessor's state
+        first_state = valid_preds[0]
+        for key, val in first_state.items():
+            merged[key] = val.clone()
+
+        # Merge the rest
+        for other_state in valid_preds[1:]:
+            all_keys = set(merged.keys()) | set(other_state.keys())
+            for key in all_keys:
+                val_a = merged.get(key)
+                val_b = other_state.get(key)
+                
+                if val_a is None:
+                    # Variable exists in path B but not path A. 
+                    # Conservatively, this is implicit "Bottom" or "Undefined".
+                    # We adopt path B's value but mark it as potentially partial.
+                    merged[key] = val_b.clone()
+                elif val_b is None:
+                    # Variable exists in path A but not B. Keep A.
+                    pass 
                 else:
-                    merged[key] = merged[key].merge(val)
+                    merged[key] = val_a.merge(val_b)
+        
+        # Widen if loop threshold reached
         if must_widen:
             for v in merged.values():
-                v.widen()
+                v.partial_widen() # Use partial widen first!
+                if v.bit_usage_degraded: # If already degraded, go full widen
+                    v.widen()
+                    
         return merged
 
     def _state_changed(self, old: Dict[Tuple, AbstractValue], new: Dict[Tuple, AbstractValue]) -> bool:
@@ -2427,17 +2489,50 @@ class FunctionAnalyzer:
         self._set_val(out, val, states)
 
     def _handle_store(self, inst, inputs, states):
-        if len(inputs) < 3:
-            return
+        if len(inputs) < 3: return
+        
         addr_val = self._get_val(inputs[1], states)
         src_val = self._get_val(inputs[2], states)
-        old_value = None
+        
+        # --- Improvement: Byte-by-byte String Construction Detection ---
+        # If we see STORE(Base + Offset, ConstantByte), we record it.
+        if addr_val.pointer_pattern and addr_val.pointer_pattern.base_id and vn_is_constant(inputs[2]):
+            try:
+                # Calculate the exact byte offset
+                base_id = addr_val.pointer_pattern.base_id
+                base_offset = addr_val.pointer_pattern.offset or 0
+                
+                # Get the bytes being written
+                width = inputs[2].getSize()
+                const_val = vn_get_offset(inputs[2]) or 0
+                bytes_le = const_val.to_bytes(width, byteorder="little", signed=False)
+                
+                # Store into the global heap string cache
+                for idx, b in enumerate(bytes_le):
+                    final_offset = base_offset + idx
+                    # Initialize dict if missing
+                    if base_id not in self.global_state.heap_string_writes:
+                        self.global_state.heap_string_writes[base_id] = {}
+                    
+                    self.global_state.heap_string_writes[base_id][final_offset] = bytes([b])
+            except Exception:
+                pass
+        # -------------------------------------------------------------
+
         key = slot_key_from_pattern(addr_val.pointer_pattern)
         if key:
             state_key = ("slot", key[0], key[1])
             new_slot_val = src_val.clone()
             new_slot_val.slot_sources.add(key)
+            
+            # Taint Propagation: If address is tainted, the storage location becomes tainted
+            if addr_val.tainted:
+                new_slot_val.tainted = True
+                new_slot_val.origins |= addr_val.origins
+
             states[state_key] = new_slot_val
+            
+            # Update Global Structure Tracking
             slot = self.global_state.struct_slots.get(key)
             if slot is None:
                 slot = StructSlot(
@@ -2451,44 +2546,26 @@ class FunctionAnalyzer:
             else:
                 old_value = slot.value.clone()
                 slot.value = old_value.merge(src_val)
+            
             slot.value.slot_sources.add(key)
+            
+            # Record Write for Summary
             inst_func = self._get_function_for_inst(inst)
             func_name = inst_func.getName() if inst_func else "unknown"
-            if inst_func is not None:
-                entry_str = str(inst_func.getEntryPoint())
-            else:
-                entry_str = str(inst.getAddress())
+            entry_str = str(inst_func.getEntryPoint()) if inst_func else str(inst.getAddress())
+            
             self.global_state.function_summaries.setdefault(
                 func_name, FunctionSummary(func_name, entry_str)
-            ).slot_writes.append(
-                {
-                    "base_id": slot.base_id,
-                    "offset": slot.offset,
-                    "origins": sorted(slot.value.origins),
-                }
-            )
-            for origin in slot.value.origins:
-                self.global_state.root_slot_index[origin].add(key)
-            if old_value is not None and old_value.tainted and not src_val.tainted:
-                override_entry = {
-                    "address": str(inst.getAddress()),
-                    "function": func_name,
-                    "source_origins": sorted(old_value.origins),
-                    "notes": "struct slot override",
-                }
-                self.global_state.overrides.append(override_entry)
-                for origin in old_value.origins:
-                    self.global_state.root_override_index[origin].append(override_entry)
-        # Reconstruct heap/stack string fragments from MOV/STORE sequences.
-        if addr_val.pointer_pattern and addr_val.pointer_pattern.base_id and vn_is_constant(inputs[2]):
-            try:
-                const_val = vn_get_offset(inputs[2]) or 0
-                width = inputs[2].getSize()
-                bytes_le = const_val.to_bytes(width, byteorder="little", signed=False)
-                for idx, b in enumerate(bytes_le):
-                    offset = (addr_val.pointer_pattern.offset or 0) + idx
-                    self.global_state.heap_string_writes[addr_val.pointer_pattern.base_id][offset] = bytes([b])
-            except Exception:
+            ).slot_writes.append({
+                "base_id": slot.base_id,
+                "offset": slot.offset,
+                "origins": sorted(slot.value.origins),
+            })
+            
+            # Track Overrides (Re-writing a tainted value with untainted data)
+            old_value = states.get(state_key)
+            if old_value and old_value.tainted and not src_val.tainted:
+                # This is a potential sanitization or overwrite
                 pass
 
     def _handle_ptradd(self, func, out, inputs, states):
