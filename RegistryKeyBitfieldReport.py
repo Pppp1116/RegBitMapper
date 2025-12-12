@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import sys
 import os
+import heapq
 from collections import defaultdict, deque
 import re
 from dataclasses import dataclass, field
@@ -346,6 +347,7 @@ class AbstractValue:
     mask_history: List[Dict[str, Any]] = field(default_factory=list)
     bit_usage_degraded: bool = False
     slot_sources: Set[Tuple[str, int]] = field(default_factory=set)
+    is_top: bool = False
 
     def clone(self) -> "AbstractValue":
         return AbstractValue(
@@ -364,6 +366,7 @@ class AbstractValue:
             mask_history=list(self.mask_history),
             bit_usage_degraded=self.bit_usage_degraded,
             slot_sources=set(self.slot_sources),
+            is_top=self.is_top,
         )
 
     def mark_bits_used(self, mask: int) -> None:
@@ -383,9 +386,26 @@ class AbstractValue:
         if degraded:
             self.bit_usage_degraded = True
 
+    def widen(self) -> None:
+        """Drive the abstract value toward a coarse Top state to ensure convergence."""
+        if self.is_top:
+            return
+        self.is_top = True
+        self.mark_all_bits_used(degraded=True)
+        self.pointer_targets.clear()
+        self.mask_history.clear()
+        if self.pointer_pattern:
+            self.pointer_pattern.unknown = True
+
     def merge(self, other: "AbstractValue") -> "AbstractValue":
         if other is None:
             return self
+        if self.is_top or other.is_top:
+            top_val = self.clone() if self.is_top else other.clone()
+            top_val.tainted = top_val.tainted or (other.tainted if self.is_top else self.tainted)
+            top_val.origins |= other.origins if self.is_top else self.origins
+            top_val.widen()
+            return top_val
         merged = AbstractValue()
         merged.tainted = self.tainted or other.tainted
         merged.origins = set(self.origins | other.origins)
@@ -437,6 +457,7 @@ class AbstractValue:
             frozenset(self.compare_details.items()),
             tuple(sorted([tuple(sorted(m.items())) for m in self.mask_history])) if self.mask_history else (),
             self.bit_usage_degraded,
+            self.is_top,
         )
 
 
@@ -1852,38 +1873,86 @@ class FunctionAnalyzer:
                 dest = it.next()
                 succs[blk].append(dest.getDestinationBlock())
                 preds[dest.getDestinationBlock()].append(blk)
-        in_states: Dict[Any, Dict[Tuple, AbstractValue]] = {blk: {} for blk in blocks}
-        worklist: deque = deque(blocks)
+
+        # Build Reverse Post-Order for prioritized worklist scheduling
+        visited: Set[Any] = set()
+        post_order: List[Any] = []
+
+        def _dfs(block):
+            visited.add(block)
+            for s in succs.get(block, []):
+                if s not in visited:
+                    _dfs(s)
+            post_order.append(block)
+
+        entry_block = None
+        try:
+            for blk in blocks:
+                if blk.getFirstStartAddress() == func.getEntryPoint():
+                    entry_block = blk
+                    break
+        except Exception:
+            entry_block = blocks[0] if blocks else None
+        if entry_block:
+            _dfs(entry_block)
+        rpo = list(reversed(post_order)) if post_order else list(blocks)
+        priority_map = {blk: idx for idx, blk in enumerate(rpo)}
+
+        worklist: List[Tuple[int, Any]] = []
+        in_queue: Set[Any] = set()
+
+        def _enqueue(block):
+            if block in in_queue:
+                return
+            prio = priority_map.get(block, len(priority_map))
+            heapq.heappush(worklist, (prio, block))
+            in_queue.add(block)
+
+        if blocks:
+            _enqueue(entry_block or blocks[0])
+
+        out_states: Dict[Any, Dict[Tuple, AbstractValue]] = {}
+        block_visits: Dict[Any, int] = defaultdict(int)
         steps = 0
+
         while worklist and steps < self.max_steps:
-            blk = worklist.popleft()
+            _, blk = heapq.heappop(worklist)
+            in_queue.discard(blk)
             steps += 1
             try:
                 if self.monitor and hasattr(self.monitor, "checkCanceled"):
                     self.monitor.checkCanceled()
             except Exception:
                 pass
-            state = self._merge_predecessors(blk, preds, in_states)
+
+            block_visits[blk] += 1
+            must_widen = block_visits[blk] > 20
+
+            state = self._merge_predecessors(blk, preds, out_states, must_widen)
             new_state = self._run_block(func, blk, state, listing, summary)
-            if self._state_changed(in_states.get(blk, {}), new_state):
-                in_states[blk] = new_state
+            if self._state_changed(out_states.get(blk, {}), new_state):
+                out_states[blk] = new_state
                 for succ in succs.get(blk, []):
-                    if succ not in worklist:
-                        worklist.append(succ)
+                    _enqueue(succ)
         if steps >= self.max_steps:
             log_debug(f"[warn] worklist limit hit in function {func.getName()}")
             self.global_state.analysis_stats["worklist_limit"] = True
         self._finalize_summary_from_slots(summary)
         return summary
 
-    def _merge_predecessors(self, blk, preds: Dict[Any, List[Any]], in_states: Dict[Any, Dict[Tuple, AbstractValue]]):
+    def _merge_predecessors(
+        self, blk, preds: Dict[Any, List[Any]], out_states: Dict[Any, Dict[Tuple, AbstractValue]], must_widen: bool = False
+    ):
         merged: Dict[Tuple, AbstractValue] = {}
         for pred in preds.get(blk, []):
-            for key, val in in_states.get(pred, {}).items():
+            for key, val in out_states.get(pred, {}).items():
                 if key not in merged:
                     merged[key] = val.clone()
                 else:
                     merged[key] = merged[key].merge(val)
+        if must_widen:
+            for v in merged.values():
+                v.widen()
         return merged
 
     def _state_changed(self, old: Dict[Tuple, AbstractValue], new: Dict[Tuple, AbstractValue]) -> bool:
@@ -1994,6 +2063,26 @@ class FunctionAnalyzer:
         src = self._get_val(inputs[0], states)
         val = src.clone()
         val.bit_width = out.getSize() * 8
+
+        try:
+            op = out.getDef()
+            if op and op.getOpcode() == PcodeOp.SUBPIECE:
+                byte_offset = inputs[1].getOffset() if len(inputs) > 1 else 0
+                bit_shift = byte_offset * 8
+
+                def _shift_bits(bit_set: Set[int]) -> Set[int]:
+                    return {b - bit_shift for b in bit_set if 0 <= (b - bit_shift) < val.bit_width}
+
+                val.used_bits = _shift_bits(src.used_bits)
+                val.candidate_bits = _shift_bits(src.candidate_bits)
+                val.definitely_used_bits = _shift_bits(src.definitely_used_bits)
+                val.maybe_used_bits = _shift_bits(src.maybe_used_bits)
+
+                if bit_shift != 0:
+                    val.pointer_targets = set()
+                    val.pointer_pattern = None
+        except Exception:
+            pass
         self._set_val(out, val, states)
 
     def _handle_addsub(self, out, inputs, states, opname):
@@ -2007,9 +2096,19 @@ class FunctionAnalyzer:
         val.slot_sources = set(a.slot_sources | b.slot_sources)
         val.bit_width = out.getSize() * 8
         val.definitely_used_bits = _definitely_bits(a) | _definitely_bits(b)
-        val.maybe_used_bits = _maybe_bits(a) | _maybe_bits(b) | set(val.definitely_used_bits)
+        base_maybe = _maybe_bits(a) | _maybe_bits(b) | set(val.definitely_used_bits)
+        lowest_candidate = None
+        candidate_sources = list(a.candidate_bits) + list(b.candidate_bits)
+        if candidate_sources:
+            lowest_candidate = min(candidate_sources)
+        if lowest_candidate is not None and lowest_candidate < val.bit_width:
+            smeared = set(range(lowest_candidate, val.bit_width))
+            val.candidate_bits = smeared
+            val.maybe_used_bits = set(base_maybe | smeared)
+        else:
+            val.candidate_bits = set(base_maybe)
+            val.maybe_used_bits = set(base_maybe)
         val.used_bits = set(val.definitely_used_bits)
-        val.candidate_bits = set(val.maybe_used_bits)
         val.pointer_targets = set(a.pointer_targets | b.pointer_targets)
         if a.pointer_pattern and vn_is_constant(inputs[1]):
             pp = a.pointer_pattern.clone()
@@ -2267,10 +2366,14 @@ class FunctionAnalyzer:
         val = AbstractValue(bit_width=out.getSize() * 8)
         key = slot_key_from_pattern(addr_val.pointer_pattern)
         if key:
-            slot = self.global_state.struct_slots.get(key)
-            if slot:
-                val = slot.value.clone()
-                val.slot_sources.add(key)
+            state_key = ("slot", key[0], key[1])
+            if state_key in states:
+                val = states[state_key].clone()
+            else:
+                slot = self.global_state.struct_slots.get(key)
+                if slot:
+                    val = slot.value.clone()
+                    val.slot_sources.add(key)
         
         # Enable constant propagation from read-only memory (e.g., IAT, .rdata)
         # to resolve indirect calls.
@@ -2331,6 +2434,10 @@ class FunctionAnalyzer:
         old_value = None
         key = slot_key_from_pattern(addr_val.pointer_pattern)
         if key:
+            state_key = ("slot", key[0], key[1])
+            new_slot_val = src_val.clone()
+            new_slot_val.slot_sources.add(key)
+            states[state_key] = new_slot_val
             slot = self.global_state.struct_slots.get(key)
             if slot is None:
                 slot = StructSlot(
