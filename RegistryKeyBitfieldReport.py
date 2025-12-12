@@ -183,7 +183,7 @@ try:  # pragma: no cover - executed inside Ghidra
     from ghidra.program.model.block import BasicBlockModel
     from ghidra.program.model.listing import Instruction
     from ghidra.program.model.address import AddressSet
-    from ghidra.program.model.pcode import PcodeOp
+    from ghidra.program.model.pcode import PcodeOp, Varnode
     from ghidra.program.model.symbol import RefType, SourceType
     from ghidra.util.task import TaskMonitor
 except Exception:  # pragma: no cover
@@ -191,6 +191,7 @@ except Exception:  # pragma: no cover
     BasicBlockModel = None
     Instruction = None
     PcodeOp = None
+    Varnode = None
     RefType = None
     SourceType = None
     TaskMonitor = None
@@ -1617,7 +1618,7 @@ class FunctionAnalyzer:
         except Exception:
             return False
 
-    def _pointer_args_from_registry(self, pointer_args: List[Any], states: AnalysisState) -> bool:
+    def _pointer_args_from_registry(self, pointer_args: List["Varnode"], states: AnalysisState) -> bool:
         for arg in pointer_args:
             try:
                 if self._get_val(arg, states).origins:
@@ -1801,7 +1802,7 @@ class FunctionAnalyzer:
             return self._external_label_for_address(target_addr)
         return None
 
-    def _find_hkey_meta(self, call_args: List[Any], states: AnalysisState) -> Optional[Dict[str, str]]:
+    def _find_hkey_meta(self, call_args: List["Varnode"], states: AnalysisState) -> Optional[Dict[str, str]]:
         for arg in call_args[:2]:
             try:
                 val = self._get_val(arg, states)
@@ -1818,7 +1819,7 @@ class FunctionAnalyzer:
         return None
 
     def _derive_registry_fields(
-        self, string_args: List[Dict[str, Any]], call_args: List[Any], detected_hkey_meta: Optional[Dict[str, str]]
+        self, string_args: List[Dict[str, Any]], call_args: List["Varnode"], detected_hkey_meta: Optional[Dict[str, str]]
     ) -> Tuple[Optional[str], Optional[str], Optional[str], Dict[str, Any]]:
         hive = path = value_name = None
         detail_meta: Dict[str, Any] = {"inferred_hive": False, "inference_reason": None}
@@ -1852,7 +1853,7 @@ class FunctionAnalyzer:
         return hive, path, value_name, detail_meta
 
     def _taint_registry_outputs(
-        self, func, call_args: List[Any], states: AnalysisState, label: Optional[str], root_id: Optional[str]
+        self, func, call_args: List["Varnode"], states: AnalysisState, label: Optional[str], root_id: Optional[str]
     ) -> None:
         if label is None or root_id is None:
             return
@@ -3436,7 +3437,7 @@ class FunctionAnalyzer:
                         self._record_base_id_metadata(base_id, arg)
                     self._set_val(arg, arg_val, states)
         
-        pointer_like_args: List[Any] = []
+        pointer_like_args: List["Varnode"] = []
         for idx, inp in enumerate(call_args):
             arg_val = self._get_val(inp, states)
             if arg_val.origins:
