@@ -183,7 +183,7 @@ def parse_args(raw_args: List[str], context_hint: str) -> Dict[str, Any]:
             sys.exit(1)
         parsed["mode"] = "taint"
     parsed["debug"] = _parse_bool(parsed.get("debug", "false"))
-    parsed["trace"] = _parse_bool(parsed.get("trace", "false"))
+    parsed["trace"] = _parse_bool(parsed.get("trace", "true"))
     if "max_steps" in parsed:
         try:
             parsed["max_steps"] = int(parsed.get("max_steps", "0"))
@@ -259,7 +259,7 @@ elif __name__ == "__main__" or _has_mode(cli_args):
     args = parse_args(cli_args, INVOCATION_CONTEXT)
 else:
     INVOCATION_CONTEXT = "script_manager"
-    args = {"mode": "taint", "debug": False, "trace": False}
+    args = {"mode": "taint", "debug": False, "trace": True}
 DEBUG_ENABLED = args.get("debug", False)
 TRACE_ENABLED = args.get("trace", False)
 for _flag in ["enable_string_seeds", "enable_indirect_roots", "enable_synthetic_full_root"]:
@@ -267,6 +267,8 @@ for _flag in ["enable_string_seeds", "enable_indirect_roots", "enable_synthetic_
 
 
 DEFAULT_POINTER_BIT_WIDTH = 32
+PROGRAM_IS_BIG_ENDIAN = False
+BYTE_ORDER = "little"
 
 
 def _detect_pointer_bit_width(program) -> int:
@@ -280,6 +282,15 @@ def _detect_pointer_bit_width(program) -> int:
     except Exception:
         pass
     return DEFAULT_POINTER_BIT_WIDTH
+
+
+def _detect_endianness(program) -> Tuple[bool, str]:
+    try:
+        lang = program.getLanguage()
+        is_big = bool(getattr(lang, "isBigEndian", lambda: lambda: False)())
+        return is_big, "big" if is_big else "little"
+    except Exception:
+        return False, BYTE_ORDER
 
 
 def _resolve_dummy_monitor():
@@ -450,6 +461,8 @@ class AbstractValue:
     origins: Set[str] = field(default_factory=set)
     bit_width: int = 32
     known_bits: KnownBits = field(default_factory=lambda: KnownBits.top(DEFAULT_POINTER_BIT_WIDTH))
+    range_min: Optional[int] = None
+    range_max: Optional[int] = None
     
     # --- Bitfield Tracking ---
     used_bits: Set[int] = field(default_factory=set)
@@ -477,6 +490,8 @@ class AbstractValue:
             origins=set(self.origins),
             bit_width=self.bit_width,
             known_bits=KnownBits(self.known_bits.bit_width, self.known_bits.known_zeros, self.known_bits.known_ones),
+            range_min=self.range_min,
+            range_max=self.range_max,
             used_bits=set(self.used_bits),
             candidate_bits=set(self.candidate_bits),
             definitely_used_bits=set(self.definitely_used_bits),
@@ -524,6 +539,22 @@ class AbstractValue:
         self.mask_history.clear()
         self.bit_usage_degraded = True
 
+    def interval_widen(self) -> None:
+        """Expand precision conservatively using intervals before giving up to Top."""
+        if self.is_top:
+            return
+        self.is_bottom = False
+        self.bit_usage_degraded = True
+        if self.range_min is None:
+            self.range_min = 0
+        if self.range_max is None:
+            self.range_max = None
+        self.known_bits = KnownBits.top(self.bit_width)
+        self.candidate_bits |= set(range(self.bit_width))
+        self.maybe_used_bits |= set(range(self.bit_width))
+        if not self.definitely_used_bits:
+            self.definitely_used_bits = set()
+
     def widen(self) -> None:
         """Drive to full Top state (completely unknown)."""
         if self.is_top: return
@@ -531,6 +562,8 @@ class AbstractValue:
         self.is_bottom = False
         self.mark_all_bits_used(degraded=True)
         self.known_bits = KnownBits.top(self.bit_width)
+        self.range_min = None
+        self.range_max = None
         self.pointer_targets.clear()
         self.mask_history.clear()
         self.function_pointer_labels.clear()
@@ -559,7 +592,15 @@ class AbstractValue:
         merged.origins = self.origins | other.origins
         merged.bit_width = max(self.bit_width, other.bit_width)
         merged.known_bits = self.known_bits.merge(other.known_bits)
-        
+        if self.range_min is not None and other.range_min is not None:
+            merged.range_min = min(self.range_min, other.range_min)
+        else:
+            merged.range_min = self.range_min if self.range_min is not None else other.range_min
+        if self.range_max is not None and other.range_max is not None:
+            merged.range_max = max(self.range_max, other.range_max) if None not in (self.range_max, other.range_max) else None
+        else:
+            merged.range_max = self.range_max if self.range_max is not None else other.range_max
+
         # Merge Bitfields (Union)
         merged.used_bits = self.used_bits | other.used_bits
         merged.definitely_used_bits = self.definitely_used_bits & other.definitely_used_bits # Intersection for 'definite'
@@ -611,7 +652,9 @@ class AbstractValue:
             pointer_sig,
             frozenset(self.pointer_targets),
             frozenset(self.function_pointer_labels),
-            self.bit_usage_degraded
+            self.bit_usage_degraded,
+            self.range_min,
+            self.range_max,
         )
 
 
@@ -1462,6 +1505,10 @@ def collect_imported_registry_apis(program) -> Tuple[Set[str], Dict[Any, str]]:
 class FunctionAnalyzer:
     DEFAULT_MAX_STEPS = 5_000_000
     DEFAULT_MAX_FUNCTION_ITERATIONS = 250_000
+    DEFAULT_MAX_CALL_DEPTH = 15
+    CALL_STRING_K = 3
+    WIDEN_THRESHOLD = 100
+    WIDEN_ESCALATION = 50
 
     def __init__(self, api: FlatProgramAPI, program, global_state: GlobalState, mode: str, max_call_depth: Optional[int] = None):
         self.api = api
@@ -1469,8 +1516,9 @@ class FunctionAnalyzer:
         self.mode = mode
         self.max_steps = self.DEFAULT_MAX_STEPS
         self.max_function_iterations = self.DEFAULT_MAX_FUNCTION_ITERATIONS
-        self.max_call_depth = max_call_depth
+        self.max_call_depth = max_call_depth if max_call_depth is not None else self.DEFAULT_MAX_CALL_DEPTH
         self.program = program
+        self.pointer_bit_width = _detect_pointer_bit_width(program)
         # Reuse a single BasicBlockModel for the program (safe for Ghidra 12).
         self.block_model = BasicBlockModel(self.program)
         self.monitor = ACTIVE_MONITOR or DUMMY_MONITOR
@@ -1489,6 +1537,11 @@ class FunctionAnalyzer:
 
     def _record_base_id_metadata(self, base_id: Optional[str], vn) -> None:
         _record_storage_metadata(base_id, vn, self.program)
+
+    def _extend_call_context(self, call_ctx: Tuple[str, ...], caller_entry: Any) -> Tuple[str, ...]:
+        ctx_list = list(call_ctx or ())
+        ctx_list.append(str(caller_entry))
+        return tuple(ctx_list[-self.CALL_STRING_K:])
 
     def _function_has_registry_calls(self, func) -> bool:
         if func is None:
@@ -1657,12 +1710,12 @@ class FunctionAnalyzer:
             mem = self.program.getMemory()
             if mem is None:
                 return None
-            width_bytes = max(1, DEFAULT_POINTER_BIT_WIDTH // 8)
+            width_bytes = max(1, getattr(self, "pointer_bit_width", DEFAULT_POINTER_BIT_WIDTH) // 8)
             buf = bytearray(width_bytes)
             read = mem.getBytes(addr, buf)
             if not isinstance(read, (int, float)) or read <= 0:
                 return None
-            return int.from_bytes(bytes(buf[: int(read)]), byteorder="little", signed=False)
+            return int.from_bytes(bytes(buf[: int(read)]), byteorder=BYTE_ORDER, signed=False)
         except Exception:
             return None
 
@@ -1799,8 +1852,8 @@ class FunctionAnalyzer:
 
     def _collect_potential_definitions(self, vn, max_depth=100) -> List[Tuple[Any, Optional[PcodeOp]]]:
         """
-        Performs a DFS backward slice to find all 'root' definitions of a varnode 
-        (Constants, Loads, Inputs), handling control flow merges (Phi nodes) 
+        Performs a DFS backward slice to find all 'root' definitions of a varnode
+        (Constants, Loads, Inputs), handling control flow merges (Phi nodes)
         and passthrough operations.
         """
         definitions = []
@@ -1855,8 +1908,69 @@ class FunctionAnalyzer:
             # Meaningful terminal ops (LOAD, PTRADD, CALL return, etc.)
             else:
                 definitions.append((curr, def_op))
-        
+
         return definitions
+
+    def _extract_const_base_offset(self, vn, depth: int = 0) -> Tuple[Optional[int], Optional[int]]:
+        if vn is None or depth > 5:
+            return None, None
+        if vn_is_constant(vn):
+            return vn_get_offset(vn), 0
+        try:
+            def_op = vn.getDef()
+        except Exception:
+            def_op = None
+        if not def_op:
+            return None, None
+        opcode = def_op.getOpcode()
+        if opcode not in {PcodeOp.INT_ADD, PcodeOp.PTRADD}:
+            return None, None
+        lhs = def_op.getInput(0)
+        rhs = def_op.getInput(1)
+        base_a, off_a = self._extract_const_base_offset(lhs, depth + 1)
+        base_b, off_b = self._extract_const_base_offset(rhs, depth + 1)
+        base = base_a if base_a is not None else base_b
+        offset = 0
+        for off in (off_a, off_b):
+            if off is not None:
+                offset += off
+        if opcode == PcodeOp.PTRADD and def_op.getNumInputs() > 2:
+            idx = def_op.getInput(1)
+            elem = def_op.getInput(2)
+            idx_off = vn_get_offset(idx) if vn_is_constant(idx) else None
+            elem_size = vn_get_offset(elem) if elem and vn_is_constant(elem) else None
+            if idx_off is not None and elem_size is not None:
+                offset = (offset or 0) + idx_off * elem_size
+            else:
+                offset = None
+        return base, offset
+
+    def _resolve_vtable_target(self, addr_vn) -> Tuple[Optional[str], Optional[Any]]:
+        try:
+            base_const, offset = self._extract_const_base_offset(addr_vn)
+            if base_const is None:
+                return None, None
+            base_addr = self.api.toAddr(base_const + (offset or 0))
+            mem = self.program.getMemory()
+            block = mem.getBlock(base_addr) if mem else None
+            if block is None or block.isWrite():
+                return None, None
+            ptr = self._read_pointer_value(base_addr)
+            if ptr is None:
+                return None, None
+            fm = self.program.getFunctionManager()
+            func = fm.getFunctionAt(self.api.toAddr(ptr)) if fm else None
+            if func:
+                return func.getName(), func
+            ext_label = self._external_label_for_address(self.api.toAddr(ptr))
+            if ext_label:
+                return ext_label, None
+            mapped = IMPORTED_REGISTRY_API_ADDRS.get(ptr) or IMPORTED_REGISTRY_API_ADDRS.get(str(ptr))
+            if mapped:
+                return mapped, None
+        except Exception:
+            return None, None
+        return None, None
 
     def _resolve_callee_from_pcode_target(self, target_vn, states: AnalysisState) -> Tuple[Optional[str], Optional[Any]]:
         fm = self.program.getFunctionManager()
@@ -1938,7 +2052,14 @@ class FunctionAnalyzer:
                                 callee_func = f_ptr
                                 callee = f_ptr.getName()
                                 break
-        
+
+                if not callee:
+                    vt_name, vt_func = self._resolve_vtable_target(addr_vn)
+                    if vt_name:
+                        callee = vt_name
+                        callee_func = vt_func or callee_func
+                        break
+
         return callee, callee_func
 
     def _resolve_string_from_vn(self, vn, states: Optional[AnalysisState] = None) -> Optional[Dict[str, Any]]:
@@ -2007,14 +2128,20 @@ class FunctionAnalyzer:
             return None
         return None
 
-    def _func_key(self, func, ctx: str = "root") -> str:
+    def _func_key(self, func, ctx: Any = ("root",)) -> str:
         base = func.getName()
         if hasattr(func, "getEntryPoint"):
             try:
                 base = f"{base}@{func.getEntryPoint()}"
             except Exception:
                 pass
-        return f"{base}::{ctx}"
+        ctx_repr = ctx
+        try:
+            if isinstance(ctx, (list, tuple)):
+                ctx_repr = "->".join(ctx)
+        except Exception:
+            ctx_repr = ctx
+        return f"{base}::{ctx_repr}"
 
     def analyze_all(self) -> None:
         """Global fixed-point over function summaries.
@@ -2028,7 +2155,7 @@ class FunctionAnalyzer:
         queued: Set[str] = set()
         for func in fm.getFunctions(True):
             key = self._func_key(func)
-            worklist.append((func, 0, "root"))
+            worklist.append((func, 0, ("root",)))
             queued.add(key)
         iteration_guard = 0
         while worklist and iteration_guard < self.max_function_iterations:
@@ -2054,7 +2181,7 @@ class FunctionAnalyzer:
             if existing is None:
                 self.global_state.function_summaries[(func.getName(), call_ctx)] = summary
                 for callee in func.getCalledFunctions(self.monitor):
-                    callee_ctx = f"{call_ctx}@{func.getEntryPoint()}"
+                    callee_ctx = self._extend_call_context(call_ctx, func.getEntryPoint())
                     callee_key = self._func_key(callee, callee_ctx)
                     if callee_key not in queued:
                         queued.add(callee_key)
@@ -2062,7 +2189,7 @@ class FunctionAnalyzer:
             else:
                 if existing.merge_from(summary):
                     for callee in func.getCalledFunctions(self.monitor):
-                        callee_ctx = f"{call_ctx}@{func.getEntryPoint()}"
+                        callee_ctx = self._extend_call_context(call_ctx, func.getEntryPoint())
                         callee_key = self._func_key(callee, callee_ctx)
                         if callee_key not in queued:
                             queued.add(callee_key)
@@ -2142,9 +2269,9 @@ class FunctionAnalyzer:
                 pass
 
             block_visits[blk] += 1
-            must_widen = block_visits[blk] > 20
+            widen_progress = max(0, block_visits[blk] - self.WIDEN_THRESHOLD)
 
-            state = self._merge_predecessors(blk, preds, out_states, must_widen)
+            state = self._merge_predecessors(blk, preds, out_states, widen_progress)
             new_state = self._run_block(func, blk, state, listing, summary)
             if self._state_changed(out_states.get(blk), new_state):
                 out_states[blk] = new_state
@@ -2157,7 +2284,7 @@ class FunctionAnalyzer:
         return summary
 
     def _merge_predecessors(
-        self, blk, preds: Dict[Any, List[Any]], out_states: Dict[Any, AnalysisState], must_widen: bool = False
+        self, blk, preds: Dict[Any, List[Any]], out_states: Dict[Any, AnalysisState], widen_progress: int = 0
     ) -> AnalysisState:
         # Filter out predecessors that haven't been visited yet (empty states)
         # This prevents "polluting" the merge with empty/bottom values early in the loop.
@@ -2185,17 +2312,20 @@ class FunctionAnalyzer:
             merged.memory = merged.memory.merge(other_state.memory)
             merged.control_taints |= set(other_state.control_taints)
 
-        # Widen if loop threshold reached
-        if must_widen:
+        # Progressive widening if loop threshold reached
+        if widen_progress > 0:
+            use_interval = widen_progress <= self.WIDEN_ESCALATION
             for v in merged.values.values():
-                v.partial_widen() # Use partial widen first!
-                if v.bit_usage_degraded: # If already degraded, go full widen
+                if use_interval:
+                    v.interval_widen()
+                else:
                     v.widen()
             widened_slots = {}
             for key, slot in merged.memory.slots.items():
                 widened_val = slot.value.clone()
-                widened_val.partial_widen()
-                if widened_val.bit_usage_degraded:
+                if use_interval:
+                    widened_val.interval_widen()
+                else:
                     widened_val.widen()
                 widened_slots[key] = StructSlot(
                     slot.base_id,
@@ -2315,7 +2445,7 @@ class FunctionAnalyzer:
             # Handle standard calls AND tail-call thunks (BRANCHIND)
             self._handle_call(func, inst, op, inputs, states, summary)
         elif opname == "RETURN":
-            self._handle_return(inputs, states, summary)
+            self._handle_return(func, inputs, states, summary)
         else:
             self._handle_unknown(out, inputs, states)
 
@@ -2731,7 +2861,7 @@ class FunctionAnalyzer:
         addr_val = self._get_val(inputs[1], states)
         src_val = self._get_val(inputs[2], states)
 
-        is_ambiguous = len(addr_val.pointer_patterns) > 1
+        is_ambiguous = len(addr_val.pointer_patterns) > 1 or len(addr_val.pointer_targets) > 1
         updated_slots = dict(states.memory.slots)
 
         for pattern in addr_val.pointer_patterns:
@@ -2744,7 +2874,7 @@ class FunctionAnalyzer:
 
                     width = inputs[2].getSize()
                     const_val = vn_get_offset(inputs[2]) or 0
-                    bytes_le = const_val.to_bytes(width, byteorder="little", signed=False)
+                    bytes_le = const_val.to_bytes(width, byteorder=BYTE_ORDER, signed=False)
 
                     for idx, b in enumerate(bytes_le):
                         final_offset = base_offset + idx
@@ -2774,7 +2904,12 @@ class FunctionAnalyzer:
                 and pattern.index_var is None
             )
 
-            strong_update = is_must_write and not new_slot_val.tainted and not new_slot_val.origins and not is_ambiguous
+            strong_update = (
+                is_must_write
+                and not new_slot_val.tainted
+                and not new_slot_val.origins
+                and not is_ambiguous
+            )
             merged_slot_val = new_slot_val
             if existing_slot and not strong_update:
                 merged_slot_val = existing_slot.value.merge(new_slot_val)
@@ -3172,8 +3307,8 @@ class FunctionAnalyzer:
             except Exception:
                 pass
         if callee_name:
-            callee_summary = self.global_state.function_summaries.get(callee_name)
-            if callee_summary:
+            callee_summaries = self._summaries_for(callee_name)
+            for callee_summary in callee_summaries:
                 for idx, roots in callee_summary.param_influence.items():
                     if idx < len(call_args):
                         val = self._get_val(call_args[idx], states)
@@ -3313,25 +3448,41 @@ class FunctionAnalyzer:
                     out_val = out_val.merge(src)
                 self._set_val(op.getOutput(), out_val, states)
 
-    def _handle_return(self, inputs, states, summary: FunctionSummary):
+    def _handle_return(self, func, inputs, states, summary: FunctionSummary):
         if not inputs:
             return
-        ret_source = None
-        for vn in reversed(inputs):
-            if vn is None:
-                continue
-            if vn_is_constant(vn):
-                continue
-            try:
-                if hasattr(vn, "isAddress") and vn.isAddress():
+        ret_varnode = None
+        try:
+            func_ret = func.getReturn()
+            storage = func_ret.getVariableStorage() if func_ret else None
+            storage_vns = list(storage.getVarnodes()) if storage else []
+            for vn in inputs:
+                for sv in storage_vns:
+                    try:
+                        if vn.getAddress() == sv.getAddress() and vn.getSize() == sv.getSize():
+                            ret_varnode = vn
+                            break
+                    except Exception:
+                        continue
+                if ret_varnode:
+                    break
+        except Exception:
+            ret_varnode = None
+
+        if ret_varnode is None:
+            for vn in reversed(inputs):
+                if vn is None or vn_is_constant(vn):
                     continue
-            except Exception:
-                pass
-            ret_source = vn
-            break
-        if ret_source is None:
-            ret_source = inputs[-1]
-        ret_val = self._get_val(ret_source, states)
+                try:
+                    if hasattr(vn, "isAddress") and vn.isAddress():
+                        continue
+                except Exception:
+                    pass
+                ret_varnode = vn
+                break
+        if ret_varnode is None:
+            ret_varnode = inputs[-1]
+        ret_val = self._get_val(ret_varnode, states)
         summary.return_influence |= set(ret_val.origins)
 
     def _handle_unknown(self, out, inputs, states):
@@ -3608,8 +3759,9 @@ def main():
         return
     program = currentProgram
     api = FlatProgramAPI(program)
-    global DEFAULT_POINTER_BIT_WIDTH
+    global DEFAULT_POINTER_BIT_WIDTH, PROGRAM_IS_BIG_ENDIAN, BYTE_ORDER
     DEFAULT_POINTER_BIT_WIDTH = _detect_pointer_bit_width(program)
+    PROGRAM_IS_BIG_ENDIAN, BYTE_ORDER = _detect_endianness(program)
     log_info(
         f"[info] RegistryKeyBitfieldReport starting (mode={mode}, debug={DEBUG_ENABLED}, trace={TRACE_ENABLED}, context={INVOCATION_CONTEXT})"
     )
