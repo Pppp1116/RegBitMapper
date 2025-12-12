@@ -119,6 +119,30 @@ class KnownBits:
         ones = (self.known_ones >> amount) & mask
         return KnownBits(width, zeros & mask, ones & mask)
 
+    def shift_right_arithmetic(self, amount: int) -> "KnownBits":
+        if amount <= 0:
+            return self
+        width = self.bit_width
+
+        msb_mask = 1 << (width - 1)
+        is_neg = (self.known_ones & msb_mask) != 0
+        is_pos = (self.known_zeros & msb_mask) != 0
+
+        logical = self.shift_right(amount)
+
+        fill_mask = ((1 << amount) - 1) << (width - amount)
+
+        if is_pos:
+            return logical
+        elif is_neg:
+            zeros = logical.known_zeros & ~fill_mask
+            ones = logical.known_ones | fill_mask
+            return KnownBits(width, zeros, ones)
+        else:
+            zeros = logical.known_zeros & ~fill_mask
+            ones = logical.known_ones & ~fill_mask
+            return KnownBits(width, zeros, ones)
+
 _JAVA_UNSAFE_SUPPRESS_FLAG = "-Dorg.apache.felix.framework.debug=false"
 _existing_java_opts = os.environ.get("JAVA_TOOL_OPTIONS", "")
 if _JAVA_UNSAFE_SUPPRESS_FLAG not in _existing_java_opts:
@@ -2798,6 +2822,8 @@ class FunctionAnalyzer:
             if shift is not None:
                 if opname == "INT_LEFT":
                     val.known_bits = base.known_bits.shift_left(shift)
+                elif opname == "INT_SRIGHT":
+                    val.known_bits = base.known_bits.shift_right_arithmetic(shift)
                 else:
                     val.known_bits = base.known_bits.shift_right(shift)
             val.definitely_used_bits = shifted_def
