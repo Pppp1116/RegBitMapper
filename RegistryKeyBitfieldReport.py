@@ -96,11 +96,39 @@ class KnownBits:
     def add_bits(self, other: "KnownBits") -> "KnownBits":
         width = self._ensure_width(other)
         mask = (1 << width) - 1
-        ones = self.known_ones | other.known_ones
-        zeros = self.known_zeros | other.known_zeros
-        carry_top = mask ^ (ones | zeros)
-        zeros &= ~carry_top
-        ones &= ~carry_top
+
+        def _bit_possibilities(bits: "KnownBits", idx: int) -> Set[int]:
+            if idx >= bits.bit_width:
+                return {0, 1}
+            bit_mask = 1 << idx
+            if bits.known_ones & bit_mask:
+                return {1}
+            if bits.known_zeros & bit_mask:
+                return {0}
+            return {0, 1}
+
+        carry: Set[int] = {0}
+        ones = 0
+        zeros = 0
+
+        for i in range(width):
+            sum_bits: Set[int] = set()
+            next_carry: Set[int] = set()
+
+            for a in _bit_possibilities(self, i):
+                for b in _bit_possibilities(other, i):
+                    for c in carry:
+                        total = a + b + c
+                        sum_bits.add(total & 1)
+                        next_carry.add(1 if total >= 2 else 0)
+
+            if sum_bits == {0}:
+                zeros |= 1 << i
+            elif sum_bits == {1}:
+                ones |= 1 << i
+
+            carry = next_carry
+
         return KnownBits(width, zeros & mask, ones & mask)
 
     def shift_left(self, amount: int) -> "KnownBits":
@@ -155,7 +183,7 @@ try:  # pragma: no cover - executed inside Ghidra
     from ghidra.program.model.block import BasicBlockModel
     from ghidra.program.model.listing import Instruction
     from ghidra.program.model.address import AddressSet
-    from ghidra.program.model.pcode import PcodeOp
+    from ghidra.program.model.pcode import PcodeOp, Varnode
     from ghidra.program.model.symbol import RefType, SourceType
     from ghidra.util.task import TaskMonitor
 except Exception:  # pragma: no cover
@@ -163,6 +191,7 @@ except Exception:  # pragma: no cover
     BasicBlockModel = None
     Instruction = None
     PcodeOp = None
+    Varnode = None
     RefType = None
     SourceType = None
     TaskMonitor = None
@@ -1589,7 +1618,7 @@ class FunctionAnalyzer:
         except Exception:
             return False
 
-    def _pointer_args_from_registry(self, pointer_args: List[Any], states: AnalysisState) -> bool:
+    def _pointer_args_from_registry(self, pointer_args: List["Varnode"], states: AnalysisState) -> bool:
         for arg in pointer_args:
             try:
                 if self._get_val(arg, states).origins:
@@ -1773,7 +1802,7 @@ class FunctionAnalyzer:
             return self._external_label_for_address(target_addr)
         return None
 
-    def _find_hkey_meta(self, call_args: List[Any], states: AnalysisState) -> Optional[Dict[str, str]]:
+    def _find_hkey_meta(self, call_args: List["Varnode"], states: AnalysisState) -> Optional[Dict[str, str]]:
         for arg in call_args[:2]:
             try:
                 val = self._get_val(arg, states)
@@ -1790,7 +1819,7 @@ class FunctionAnalyzer:
         return None
 
     def _derive_registry_fields(
-        self, string_args: List[Dict[str, Any]], call_args: List[Any], detected_hkey_meta: Optional[Dict[str, str]]
+        self, string_args: List[Dict[str, Any]], call_args: List["Varnode"], detected_hkey_meta: Optional[Dict[str, str]]
     ) -> Tuple[Optional[str], Optional[str], Optional[str], Dict[str, Any]]:
         hive = path = value_name = None
         detail_meta: Dict[str, Any] = {"inferred_hive": False, "inference_reason": None}
@@ -1824,7 +1853,7 @@ class FunctionAnalyzer:
         return hive, path, value_name, detail_meta
 
     def _taint_registry_outputs(
-        self, func, call_args: List[Any], states: AnalysisState, label: Optional[str], root_id: Optional[str]
+        self, func, call_args: List["Varnode"], states: AnalysisState, label: Optional[str], root_id: Optional[str]
     ) -> None:
         if label is None or root_id is None:
             return
@@ -2554,6 +2583,8 @@ class FunctionAnalyzer:
             self._handle_multiequal(out, inputs, states)
         elif opname == "INDIRECT":
             self._handle_indirect(out, inputs, states)
+        elif opname == "CALLOTHER":
+            self._handle_callother(out, inputs, states)
         elif opname in {"CALL", "CALLIND", "BRANCHIND"}:
             # Handle standard calls AND tail-call thunks (BRANCHIND)
             self._handle_call(func, inst, op, inputs, states, summary)
@@ -3406,7 +3437,7 @@ class FunctionAnalyzer:
                         self._record_base_id_metadata(base_id, arg)
                     self._set_val(arg, arg_val, states)
         
-        pointer_like_args: List[Any] = []
+        pointer_like_args: List["Varnode"] = []
         for idx, inp in enumerate(call_args):
             arg_val = self._get_val(inp, states)
             if arg_val.origins:
@@ -3716,6 +3747,36 @@ class FunctionAnalyzer:
         if tainted_input:
             val.bit_usage_degraded = True
             self.global_state.analysis_stats["bit_precision_degraded"] = True
+        self._set_val(out, val, states)
+
+    def _handle_callother(self, out, inputs, states):
+        if out is None:
+            return
+
+        val = AbstractValue(bit_width=out.getSize() * 8)
+        def_union: Set[int] = set()
+        maybe_union: Set[int] = set()
+        tainted_input = False
+
+        for inp in inputs:
+            inp_val = self._get_val(inp, states)
+            val = val.merge(inp_val)
+            def_union |= _definitely_bits(inp_val)
+            maybe_union |= _maybe_bits(inp_val)
+            tainted_input = tainted_input or inp_val.tainted
+
+        val.definitely_used_bits = set(def_union)
+        val.maybe_used_bits = set(maybe_union | def_union)
+        val.candidate_bits = set(val.maybe_used_bits)
+        val.used_bits = set(val.definitely_used_bits)
+
+        if tainted_input:
+            val.tainted = True
+
+        val.bit_usage_degraded = True
+        val.known_bits = KnownBits.top(val.bit_width)
+        self.global_state.analysis_stats["bit_precision_degraded"] = True
+
         self._set_val(out, val, states)
 
     def _finalize_summary_from_slots(self, summary: FunctionSummary) -> None:
