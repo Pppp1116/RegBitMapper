@@ -392,6 +392,15 @@ class PointerPattern:
             offset_history=set(self.offset_history),
         )
 
+    def signature(self) -> Tuple[Any, ...]:
+        return (
+            self.base_id,
+            self.offset,
+            self.stride,
+            self.index_var,
+            self.unknown,
+        )
+
     def merge(self, other: "PointerPattern") -> "PointerPattern":
         if other is None:
             return self
@@ -448,9 +457,9 @@ class AbstractValue:
     definitely_used_bits: Set[int] = field(default_factory=set)
     maybe_used_bits: Set[int] = field(default_factory=set)
     forbidden_bits: Set[int] = field(default_factory=set)
-    
+
     # --- Pointer Analysis ---
-    pointer_pattern: Optional[PointerPattern] = None
+    pointer_patterns: List[PointerPattern] = field(default_factory=list)
     pointer_targets: Set[int] = field(default_factory=set)
     function_pointer_labels: Set[str] = field(default_factory=set)
     
@@ -473,7 +482,7 @@ class AbstractValue:
             definitely_used_bits=set(self.definitely_used_bits),
             maybe_used_bits=set(self.maybe_used_bits),
             forbidden_bits=set(self.forbidden_bits),
-            pointer_pattern=self.pointer_pattern.clone() if self.pointer_pattern else None,
+            pointer_patterns=[p.clone() for p in self.pointer_patterns],
             pointer_targets=set(self.pointer_targets),
             function_pointer_labels=set(self.function_pointer_labels),
             compare_details=dict(self.compare_details),
@@ -506,11 +515,11 @@ class AbstractValue:
         """Relax precision without losing the pointer base."""
         if self.is_top: return
         # Keep base_id but discard precise offset/stride
-        if self.pointer_pattern:
-            self.pointer_pattern.offset = None
-            self.pointer_pattern.stride = None
-            self.pointer_pattern.unknown = True
-            self.pointer_pattern.offset_history.clear()
+        for ptr in self.pointer_patterns:
+            ptr.offset = None
+            ptr.stride = None
+            ptr.unknown = True
+            ptr.offset_history.clear()
         self.pointer_targets.clear()
         self.mask_history.clear()
         self.bit_usage_degraded = True
@@ -525,8 +534,8 @@ class AbstractValue:
         self.pointer_targets.clear()
         self.mask_history.clear()
         self.function_pointer_labels.clear()
-        if self.pointer_pattern:
-            self.pointer_pattern.unknown = True
+        for ptr in self.pointer_patterns:
+            ptr.unknown = True
 
     def merge(self, other: "AbstractValue") -> "AbstractValue":
         if other is None: return self
@@ -561,36 +570,36 @@ class AbstractValue:
         # Merge Pointers
         merged.pointer_targets = self.pointer_targets | other.pointer_targets
         merged.function_pointer_labels = self.function_pointer_labels | other.function_pointer_labels
-        
-        if self.pointer_pattern and other.pointer_pattern:
-            merged.pointer_pattern = self.pointer_pattern.merge(other.pointer_pattern)
-        elif self.pointer_pattern:
-            # Merging Pointer vs Non-Pointer -> Partial Widen
-            merged.pointer_pattern = self.pointer_pattern.clone()
-            merged.pointer_pattern.unknown = True
-        elif other.pointer_pattern:
-            merged.pointer_pattern = other.pointer_pattern.clone()
-            merged.pointer_pattern.unknown = True
-        
+
+        existing_sigs = {p.signature() for p in self.pointer_patterns}
+        merged.pointer_patterns = [p.clone() for p in self.pointer_patterns]
+        for ptr in other.pointer_patterns:
+            sig = ptr.signature()
+            if sig not in existing_sigs:
+                merged.pointer_patterns.append(ptr.clone())
+                existing_sigs.add(sig)
+        if len(merged.pointer_patterns) > 5:
+            merged.pointer_patterns = [self._compress_patterns(merged.pointer_patterns)]
+
         merged.compare_details = self.compare_details.copy()
         merged.compare_details.update(other.compare_details)
         
         # Limit history growth to prevent memory explosion
-        merged.mask_history = (self.mask_history + other.mask_history)[-10:] 
+        merged.mask_history = (self.mask_history + other.mask_history)[-10:]
         merged.bit_usage_degraded = self.bit_usage_degraded or other.bit_usage_degraded
         merged.slot_sources = self.slot_sources | other.slot_sources
-        
+
         return merged
+
+    def _compress_patterns(self, patterns: List[PointerPattern]) -> PointerPattern:
+        base_ids = {p.base_id for p in patterns if p.base_id is not None}
+        base_id = base_ids.pop() if len(base_ids) == 1 else None
+        return PointerPattern(base_id=base_id, unknown=True)
 
     def state_signature(self) -> Tuple:
         pointer_sig = None
-        if self.pointer_pattern:
-            pointer_sig = (
-                self.pointer_pattern.base_id,
-                self.pointer_pattern.offset,
-                self.pointer_pattern.stride,
-                self.pointer_pattern.unknown,
-            )
+        if self.pointer_patterns:
+            pointer_sig = tuple(sorted((p.signature() for p in self.pointer_patterns), key=str))
         return (
             self.is_bottom,
             self.is_top,
@@ -1950,12 +1959,13 @@ class FunctionAnalyzer:
                         addr_candidates.append(self.api.toAddr(off))
                     except Exception:
                         continue
-                if val.pointer_pattern and val.pointer_pattern.base_id:
-                    heap_bytes = self.global_state.heap_string_writes.get(val.pointer_pattern.base_id)
+                for ptr in val.pointer_patterns:
+                    if ptr.base_id is None:
+                        continue
+                    heap_bytes = self.global_state.heap_string_writes.get(ptr.base_id)
                     if heap_bytes:
                         collected = bytearray()
-                        # Prefer contiguous bytes from the exact offset forward.
-                        start = val.pointer_pattern.offset or 0
+                        start = ptr.offset or 0
                         for i in range(0, 256):
                             b = heap_bytes.get(start + i)
                             if b is None:
@@ -2334,7 +2344,7 @@ class FunctionAnalyzer:
 
                 if bit_shift != 0:
                     val.pointer_targets = set()
-                    val.pointer_pattern = None
+                    val.pointer_patterns = []
                     val.known_bits = KnownBits.top(val.bit_width)
         except Exception:
             pass
@@ -2372,25 +2382,39 @@ class FunctionAnalyzer:
             val.maybe_used_bits = set(base_maybe)
         val.used_bits = set(val.definitely_used_bits)
         val.pointer_targets = set(a.pointer_targets | b.pointer_targets)
-        if a.pointer_pattern and vn_is_constant(inputs[1]):
-            pp = a.pointer_pattern.clone()
+        val.pointer_patterns = []
+        existing_ptr_sigs: Set[Tuple[Any, ...]] = set()
+
+        def _append_pattern(ptr: PointerPattern) -> None:
+            sig = ptr.signature()
+            if sig not in existing_ptr_sigs:
+                val.pointer_patterns.append(ptr)
+                existing_ptr_sigs.add(sig)
+
+        if vn_is_constant(inputs[1]):
             delta = vn_get_offset(inputs[1]) or 0
-            pp.adjust_offset(delta if opname == "INT_ADD" else -delta)
-            val.pointer_pattern = pp
+            for ptr in a.pointer_patterns:
+                new_ptr = ptr.clone()
+                new_ptr.adjust_offset(delta if opname == "INT_ADD" else -delta)
+                _append_pattern(new_ptr)
             if a.pointer_targets:
-                adj = vn_get_offset(inputs[1]) or 0
+                adj = delta
                 val.pointer_targets = {p + (adj if opname == "INT_ADD" else -adj) for p in a.pointer_targets}
-        elif b.pointer_pattern and vn_is_constant(inputs[0]):
-            pp = b.pointer_pattern.clone()
+        elif vn_is_constant(inputs[0]):
             delta = vn_get_offset(inputs[0]) or 0
-            pp.adjust_offset(delta if opname == "INT_ADD" else -delta)
-            val.pointer_pattern = pp
+            for ptr in b.pointer_patterns:
+                new_ptr = ptr.clone()
+                new_ptr.adjust_offset(delta if opname == "INT_ADD" else -delta)
+                _append_pattern(new_ptr)
             if b.pointer_targets:
-                adj = vn_get_offset(inputs[0]) or 0
+                adj = delta
                 val.pointer_targets = {p + (adj if opname == "INT_ADD" else -adj) for p in b.pointer_targets}
-        elif a.pointer_pattern and b.pointer_pattern:
-            val.pointer_pattern = a.pointer_pattern.merge(b.pointer_pattern)
-        if not val.pointer_pattern:
+        elif a.pointer_patterns and b.pointer_patterns:
+            for pa in a.pointer_patterns:
+                for pb in b.pointer_patterns:
+                    _append_pattern(pa.merge(pb))
+
+        if not val.pointer_patterns:
             if vn_is_constant(inputs[1]) and a.pointer_targets:
                 adj = vn_get_offset(inputs[1]) or 0
                 val.pointer_targets = {p + (adj if opname == "INT_ADD" else -adj) for p in a.pointer_targets}
@@ -2413,7 +2437,10 @@ class FunctionAnalyzer:
         val.maybe_used_bits = _maybe_bits(a) | _maybe_bits(b) | set(val.definitely_used_bits)
         val.used_bits = set(val.definitely_used_bits)
         val.candidate_bits = set(val.maybe_used_bits)
-        val.pointer_pattern = PointerPattern(unknown=True) if (a.pointer_pattern or b.pointer_pattern) else None
+        if a.pointer_patterns or b.pointer_patterns:
+            val.pointer_patterns = [PointerPattern(unknown=True)]
+        else:
+            val.pointer_patterns = []
         val.pointer_targets = set()
         self._set_val(out, val, states)
 
@@ -2632,12 +2659,20 @@ class FunctionAnalyzer:
             return
         addr_val = self._get_val(inputs[1], states)
         val = AbstractValue(bit_width=out.getSize() * 8)
-        key = slot_key_from_pattern(addr_val.pointer_pattern)
-        if key:
+        loaded = False
+        for pattern in addr_val.pointer_patterns:
+            key = slot_key_from_pattern(pattern)
+            if not key:
+                continue
             slot = states.memory.slots.get(key)
             if slot:
-                val = slot.value.clone()
-                val.slot_sources.add(key)
+                slot_val = slot.value.clone()
+                slot_val.slot_sources.add(key)
+                if not loaded:
+                    val = slot_val
+                    loaded = True
+                else:
+                    val = val.merge(slot_val)
         
         # Enable constant propagation from read-only memory (e.g., IAT, .rdata)
         # to resolve indirect calls.
@@ -2695,69 +2730,65 @@ class FunctionAnalyzer:
         
         addr_val = self._get_val(inputs[1], states)
         src_val = self._get_val(inputs[2], states)
-        
-        # --- Improvement: Byte-by-byte String Construction Detection ---
-        # If we see STORE(Base + Offset, ConstantByte), we record it.
-        if addr_val.pointer_pattern and addr_val.pointer_pattern.base_id and vn_is_constant(inputs[2]):
-            try:
-                # Calculate the exact byte offset
-                base_id = addr_val.pointer_pattern.base_id
-                base_offset = addr_val.pointer_pattern.offset or 0
-                
-                # Get the bytes being written
-                width = inputs[2].getSize()
-                const_val = vn_get_offset(inputs[2]) or 0
-                bytes_le = const_val.to_bytes(width, byteorder="little", signed=False)
-                
-                # Store into the global heap string cache
-                for idx, b in enumerate(bytes_le):
-                    final_offset = base_offset + idx
-                    # Initialize dict if missing
-                    if base_id not in self.global_state.heap_string_writes:
-                        self.global_state.heap_string_writes[base_id] = {}
-                    
-                    self.global_state.heap_string_writes[base_id][final_offset] = bytes([b])
-            except Exception:
-                pass
-        # -------------------------------------------------------------
 
-        key = slot_key_from_pattern(addr_val.pointer_pattern)
-        if key:
+        is_ambiguous = len(addr_val.pointer_patterns) > 1
+        updated_slots = dict(states.memory.slots)
+
+        for pattern in addr_val.pointer_patterns:
+            # --- Improvement: Byte-by-byte String Construction Detection ---
+            # If we see STORE(Base + Offset, ConstantByte), we record it.
+            if pattern.base_id and vn_is_constant(inputs[2]):
+                try:
+                    base_id = pattern.base_id
+                    base_offset = pattern.offset or 0
+
+                    width = inputs[2].getSize()
+                    const_val = vn_get_offset(inputs[2]) or 0
+                    bytes_le = const_val.to_bytes(width, byteorder="little", signed=False)
+
+                    for idx, b in enumerate(bytes_le):
+                        final_offset = base_offset + idx
+                        if base_id not in self.global_state.heap_string_writes:
+                            self.global_state.heap_string_writes[base_id] = {}
+                        self.global_state.heap_string_writes[base_id][final_offset] = bytes([b])
+                except Exception:
+                    pass
+            # -------------------------------------------------------------
+
+            key = slot_key_from_pattern(pattern)
+            if not key:
+                continue
+
             new_slot_val = src_val.clone()
             new_slot_val.slot_sources.add(key)
 
-            # Taint Propagation: If address is tainted, the storage location becomes tainted
             if addr_val.tainted:
                 new_slot_val.tainted = True
                 new_slot_val.origins |= addr_val.origins
 
-            existing_slot = states.memory.slots.get(key)
+            existing_slot = updated_slots.get(key)
             is_must_write = bool(
-                addr_val.pointer_pattern
-                and not addr_val.pointer_pattern.unknown
-                and addr_val.pointer_pattern.base_id is not None
-                and addr_val.pointer_pattern.offset is not None
-                and addr_val.pointer_pattern.index_var is None
+                not pattern.unknown
+                and pattern.base_id is not None
+                and pattern.offset is not None
+                and pattern.index_var is None
             )
 
-            strong_update = is_must_write and not new_slot_val.tainted and not new_slot_val.origins
+            strong_update = is_must_write and not new_slot_val.tainted and not new_slot_val.origins and not is_ambiguous
             merged_slot_val = new_slot_val
             if existing_slot and not strong_update:
                 merged_slot_val = existing_slot.value.merge(new_slot_val)
             merged_slot_val.slot_sources.add(key)
 
-            updated_slots = dict(states.memory.slots)
             merged_slot = StructSlot(
-                addr_val.pointer_pattern.base_id,
+                pattern.base_id,
                 key[1],
-                addr_val.pointer_pattern.stride,
-                addr_val.pointer_pattern.index_var,
+                pattern.stride,
+                pattern.index_var,
                 value=new_slot_val if strong_update and existing_slot else merged_slot_val,
             )
             updated_slots[key] = merged_slot
-            states.memory = MemoryState(updated_slots)
 
-            # Update Global Structure Tracking for reporting only
             slot = self.global_state.struct_slots.get(key)
             if slot is None:
                 slot = merged_slot.clone()
@@ -2769,7 +2800,6 @@ class FunctionAnalyzer:
                     slot.value = slot.value.merge(merged_slot_val)
             slot.value.slot_sources.add(key)
 
-            # Record Write for Summary
             inst_func = self._get_function_for_inst(inst)
             func_name = inst_func.getName() if inst_func else "unknown"
             entry_str = str(inst_func.getEntryPoint()) if inst_func else str(inst.getAddress())
@@ -2782,15 +2812,15 @@ class FunctionAnalyzer:
                 "origins": sorted(slot.value.origins),
             })
 
-            # Track Overrides (Re-writing a tainted value with untainted data)
             old_value = existing_slot.value if existing_slot else None
             if old_value and old_value.tainted and not src_val.tainted:
                 if strong_update and not src_val.origins:
                     log_trace(
                         f"[trace] strong update cleared taint for {key} at {inst.getAddress()}"
                     )
-                # This is a potential sanitization or overwrite
                 pass
+
+        states.memory = MemoryState(updated_slots)
 
     def _handle_ptradd(self, func, out, inputs, states):
         if out is None or len(inputs) < 2:
@@ -2799,15 +2829,20 @@ class FunctionAnalyzer:
         offset = inputs[1]
         val = base.clone()
         val.bit_width = out.getSize() * 8
-        if val.pointer_pattern is None:
+        if val.pointer_patterns:
+            val.pointer_patterns = [p.clone() for p in val.pointer_patterns]
+        else:
             base_id = pointer_base_identifier(func, inputs[0])
-            val.pointer_pattern = PointerPattern(base_id=base_id)
+            val.pointer_patterns = [PointerPattern(base_id=base_id)]
             self._record_base_id_metadata(base_id, inputs[0])
         if vn_is_constant(offset):
-            val.pointer_pattern.adjust_offset(vn_get_offset(offset) or 0)
+            delta = vn_get_offset(offset) or 0
+            for ptr in val.pointer_patterns:
+                ptr.adjust_offset(delta)
         else:
-            val.pointer_pattern.index_var = varnode_key(offset) if offset is not None else None
-            val.pointer_pattern.unknown = True
+            for ptr in val.pointer_patterns:
+                ptr.index_var = varnode_key(offset) if offset is not None else None
+                ptr.unknown = True
         if vn_is_constant(offset) and val.pointer_targets:
             delta = vn_get_offset(offset) or 0
             val.pointer_targets = {p + delta for p in val.pointer_targets}
@@ -2820,18 +2855,22 @@ class FunctionAnalyzer:
         offset = inputs[1]
         val = base.clone()
         val.bit_width = out.getSize() * 8
-        if val.pointer_pattern is None:
+        if val.pointer_patterns:
+            val.pointer_patterns = [p.clone() for p in val.pointer_patterns]
+        else:
             base_id = pointer_base_identifier(func, inputs[0])
-            val.pointer_pattern = PointerPattern(base_id=base_id)
+            val.pointer_patterns = [PointerPattern(base_id=base_id)]
             self._record_base_id_metadata(base_id, inputs[0])
         if vn_is_constant(offset):
             delta = vn_get_offset(offset) or 0
-            val.pointer_pattern.adjust_offset(-delta)
+            for ptr in val.pointer_patterns:
+                ptr.adjust_offset(-delta)
             if val.pointer_targets:
                 val.pointer_targets = {p - delta for p in val.pointer_targets}
         else:
-            val.pointer_pattern.index_var = varnode_key(offset) if offset is not None else None
-            val.pointer_pattern.unknown = True
+            for ptr in val.pointer_patterns:
+                ptr.index_var = varnode_key(offset) if offset is not None else None
+                ptr.unknown = True
             val.pointer_targets = set()
         self._set_val(out, val, states)
 
@@ -2957,7 +2996,7 @@ class FunctionAnalyzer:
             try:
                 if vn is None:
                     return False
-                if val.pointer_targets or val.pointer_pattern or val.function_pointer_labels:
+                if val.pointer_targets or val.pointer_patterns or val.function_pointer_labels:
                     return True
                 if vn_has_address(vn):
                     return True
