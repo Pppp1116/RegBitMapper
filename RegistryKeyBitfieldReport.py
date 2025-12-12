@@ -170,11 +170,11 @@ class KnownBits:
         elif is_neg:
             zeros = logical.known_zeros & ~fill_mask
             ones = logical.known_ones | fill_mask
-            return KnownBits(width, zeros, ones)
+            return KnownBits(width, zeros & mask, ones & mask)
         else:
             zeros = logical.known_zeros & ~fill_mask
             ones = logical.known_ones & ~fill_mask
-            return KnownBits(width, zeros, ones)
+            return KnownBits(width, zeros & mask, ones & mask)
 
 _JAVA_UNSAFE_SUPPRESS_FLAG = "-Dorg.apache.felix.framework.debug=false"
 _existing_java_opts = os.environ.get("JAVA_TOOL_OPTIONS", "")
@@ -756,19 +756,25 @@ class StructSlot:
 class MemoryState:
     slots: Dict[Tuple[str, int], StructSlot] = field(default_factory=dict)
     _shared: bool = field(default=False, init=False, repr=False, compare=False)
+    _version: int = field(default=0, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # Preserve original slots when shared; copy on first write.
         self._shared = bool(self._shared)
 
+    def _bump_version(self) -> None:
+        self._version += 1
+
     def ensure_slots_mutable(self) -> None:
         if self._shared:
             self.slots = {k: v.clone() for k, v in self.slots.items()}
             self._shared = False
+            self._bump_version()
 
     def clone(self, *, share_slots: bool = True) -> "MemoryState":
         cloned_slots = self.slots if share_slots else {k: v.clone() for k, v in self.slots.items()}
         cloned = MemoryState(cloned_slots)
+        cloned._version = self._version
         cloned._shared = share_slots
         if share_slots:
             self._shared = True
@@ -792,7 +798,9 @@ class MemoryState:
                 merged_slots[key] = left.clone()
             elif right:
                 merged_slots[key] = right.clone()
-        return MemoryState(merged_slots)
+        merged = MemoryState(merged_slots)
+        merged._version = max(self._version, other._version) + 1
+        return merged
 
     def signature(self) -> Tuple:
         sig = []
@@ -810,26 +818,36 @@ class AnalysisState:
     _values_shared: bool = field(default=False, init=False, repr=False, compare=False)
     _memory_shared: bool = field(default=False, init=False, repr=False, compare=False)
     _control_shared: bool = field(default=False, init=False, repr=False, compare=False)
+    _version: int = field(default=0, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self._values_shared = bool(self._values_shared)
         self._memory_shared = bool(self._memory_shared)
         self._control_shared = bool(self._control_shared)
 
+    def _bump_version(self) -> None:
+        self._version += 1
+
     def ensure_values_mutable(self) -> None:
         if self._values_shared:
             self.values = self.values.copy()
             self._values_shared = False
+            self._bump_version()
 
     def ensure_memory_mutable(self) -> None:
         if self._memory_shared:
             self.memory = self.memory.clone(share_slots=False)
             self._memory_shared = False
+            self._bump_version()
 
     def ensure_control_taints_mutable(self) -> None:
         if self._control_shared:
             self.control_taints = set(self.control_taints)
             self._control_shared = False
+            self._bump_version()
+
+    def mark_modified(self) -> None:
+        self._bump_version()
 
     def clone(self) -> "AnalysisState":
         cloned = AnalysisState(
@@ -840,6 +858,7 @@ class AnalysisState:
         cloned._values_shared = True
         cloned._memory_shared = True
         cloned._control_shared = True
+        cloned._version = self._version
         return cloned
 
 
@@ -1712,6 +1731,7 @@ class FunctionAnalyzer:
         self.monitor = ACTIVE_MONITOR or DUMMY_MONITOR
         self._registry_string_usage_cache: Dict[str, bool] = {}
         self._functions_with_registry_calls: Set[str] = set()
+        self._definition_cache: Dict[Tuple[Any, int], List[Tuple[Any, Optional[PcodeOp]]]] = {}
         self.dispatch_table: Dict[str, Callable[[Any, Any, Any, Any, List[Any], AnalysisState, FunctionSummary], None]] = self._build_dispatch_table()
 
     def _build_dispatch_table(self) -> Dict[str, Callable[[Any, Any, Any, Any, List[Any], AnalysisState, FunctionSummary], None]]:
@@ -2103,6 +2123,9 @@ class FunctionAnalyzer:
         (Constants, Loads, Inputs), handling control flow merges (Phi nodes)
         and passthrough operations.
         """
+        cache_key = (varnode_key(vn), max_depth)
+        if cache_key in self._definition_cache:
+            return self._definition_cache[cache_key]
         definitions = []
         visited = set()
         # Stack stores (Varnode, depth)
@@ -2158,7 +2181,7 @@ class FunctionAnalyzer:
             # Meaningful terminal ops (LOAD, PTRADD, CALL return, etc.)
             else:
                 definitions.append((curr, def_op))
-
+        self._definition_cache[cache_key] = definitions
         return definitions
 
     def _extract_const_base_offset(self, vn, depth: int = 0) -> Tuple[Optional[int], Optional[int]]:
@@ -2664,6 +2687,7 @@ class FunctionAnalyzer:
     def _merge_state_into(self, merged: AnalysisState, other_state: AnalysisState) -> None:
         merged.ensure_values_mutable()
         merged.ensure_control_taints_mutable()
+        changed = False
         all_keys = set(merged.values.keys()) | set(other_state.values.keys())
         for key in all_keys:
             val_a = merged.values.get(key)
@@ -2671,13 +2695,28 @@ class FunctionAnalyzer:
 
             if val_a is None:
                 merged.values[key] = val_b.clone() if val_b else AbstractValue()
+                changed = True
             elif val_b is None:
                 continue
             else:
-                merged.values[key] = val_a.merge(val_b)
+                merged_val = val_a.merge(val_b)
+                merged.values[key] = merged_val
+                if merged_val.state_signature() != val_a.state_signature():
+                    changed = True
 
-        merged.memory = merged.memory.merge(other_state.memory)
-        merged.control_taints |= set(other_state.control_taints)
+        merged_memory = merged.memory.merge(other_state.memory)
+        if merged_memory.signature() != merged.memory.signature():
+            changed = True
+        merged.memory = merged_memory
+
+        if other_state.control_taints:
+            before = set(merged.control_taints)
+            merged.control_taints |= set(other_state.control_taints)
+            if merged.control_taints != before:
+                changed = True
+
+        if changed:
+            merged.mark_modified()
 
     def _analysis_state_signature(self, state: AnalysisState) -> Tuple:
         value_sig = tuple(sorted(((k, v.state_signature()) for k, v in state.values.items()), key=str))
@@ -2686,6 +2725,8 @@ class FunctionAnalyzer:
     def _state_changed(self, old: AnalysisState, new: AnalysisState) -> bool:
         if old is None:
             return True
+        if getattr(old, "_version", -1) == getattr(new, "_version", None):
+            return False
         if old.control_taints != new.control_taints:
             return True
         if set(old.values.keys()) != set(new.values.keys()):
@@ -2747,6 +2788,7 @@ class FunctionAnalyzer:
             val.tainted = True
             val.control_taints |= set(states.control_taints)
         states.values[key] = val
+        states.mark_modified()
         log_trace(f"[trace] set {key} -> tainted={val.tainted} origins={sorted(val.origins)} bits={sorted(val.candidate_bits)}")
 
     def _process_pcode(self, func, inst: Instruction, op: PcodeOp, states: AnalysisState, summary: FunctionSummary) -> None:
