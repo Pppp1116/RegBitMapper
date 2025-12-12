@@ -400,11 +400,33 @@ class PointerPattern:
         if self.base_id != other.base_id:
             return PointerPattern(base_id=self.base_id or other.base_id, unknown=True)
         merged = PointerPattern(base_id=self.base_id)
-        merged.offset = self.offset if self.offset == other.offset else None
-        merged.stride = self.stride if self.stride == other.stride else None
-        merged.index_var = self.index_var if self.index_var == other.index_var else None
-        merged.unknown = merged.offset is None or merged.stride is None or merged.index_var is None
         merged.offset_history = set(self.offset_history | other.offset_history)
+        merged.index_var = self.index_var if self.index_var == other.index_var else None
+
+        if self.offset == other.offset:
+            merged.offset = self.offset
+            merged.stride = self.stride if self.stride == other.stride else self.stride or other.stride
+        else:
+            if self.offset is not None and other.offset is not None:
+                diff = abs(other.offset - self.offset)
+                stride_candidate = self.stride or other.stride
+
+                if stride_candidate is not None and diff % stride_candidate == 0:
+                    merged.stride = stride_candidate
+                    merged.offset = min(self.offset, other.offset)
+                    merged.index_var = merged.index_var or "loop_inferred"
+                elif diff > 0:
+                    merged.stride = diff
+                    merged.offset = min(self.offset, other.offset)
+                    merged.index_var = merged.index_var or "loop_inferred"
+                else:
+                    merged.unknown = True
+            else:
+                merged.unknown = True
+
+        if not merged.unknown and merged.offset is None and merged.stride is None:
+            merged.unknown = True
+
         return merged
 
 
