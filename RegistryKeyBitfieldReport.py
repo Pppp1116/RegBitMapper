@@ -2297,6 +2297,8 @@ class FunctionAnalyzer:
             _enqueue(entry_block or blocks[0])
 
         out_states: Dict[Any, AnalysisState] = {}
+        merge_cache: Dict[Any, AnalysisState] = {}
+        pred_state_signatures: Dict[Tuple[Any, Any], Tuple] = {}
         block_visits: Dict[Any, int] = defaultdict(int)
         steps = 0
 
@@ -2314,7 +2316,14 @@ class FunctionAnalyzer:
             peel_active = blk in loop_headers and block_visits[blk] <= self.LOOP_PEEL_LIMIT
             widen_progress = 0 if peel_active else max(0, block_visits[blk] - self.WIDEN_THRESHOLD)
 
-            state = self._merge_predecessors(blk, preds, out_states, widen_progress)
+            state = self._merge_predecessors(
+                blk,
+                preds,
+                out_states,
+                widen_progress,
+                merge_cache=merge_cache,
+                pred_state_sigs=pred_state_signatures,
+            )
             new_state = self._run_block(func, blk, state, listing, summary)
             if self._state_changed(out_states.get(blk), new_state):
                 out_states[blk] = new_state
@@ -2327,33 +2336,48 @@ class FunctionAnalyzer:
         return summary
 
     def _merge_predecessors(
-        self, blk, preds: Dict[Any, List[Any]], out_states: Dict[Any, AnalysisState], widen_progress: int = 0
+        self,
+        blk,
+        preds: Dict[Any, List[Any]],
+        out_states: Dict[Any, AnalysisState],
+        widen_progress: int = 0,
+        *,
+        merge_cache: Optional[Dict[Any, AnalysisState]] = None,
+        pred_state_sigs: Optional[Dict[Tuple[Any, Any], Tuple]] = None,
     ) -> AnalysisState:
         # Filter out predecessors that haven't been visited yet (empty states)
         # This prevents "polluting" the merge with empty/bottom values early in the loop.
-        valid_preds = [out_states.get(p) for p in preds.get(blk, []) if p in out_states]
+        valid_preds: List[AnalysisState] = []
+        changed_preds: List[AnalysisState] = []
+        for p in preds.get(blk, []):
+            if p not in out_states:
+                continue
+            pred_state = out_states[p]
+            valid_preds.append(pred_state)
+            if pred_state_sigs is not None:
+                sig = self._analysis_state_signature(pred_state)
+                key = (p, blk)
+                if pred_state_sigs.get(key) != sig:
+                    pred_state_sigs[key] = sig
+                    changed_preds.append(pred_state)
+            else:
+                changed_preds.append(pred_state)
 
         if not valid_preds:
             return AnalysisState()
 
-        merged = valid_preds[0].clone()
+        # Merge only the changed predecessors when caches are available
+        if merge_cache is not None and pred_state_sigs is not None:
+            merged_pre_widen = merge_cache.get(blk, valid_preds[0].clone())
+            for other_state in changed_preds:
+                self._merge_state_into(merged_pre_widen, other_state)
+            merge_cache[blk] = merged_pre_widen.clone()
+        else:
+            merged_pre_widen = valid_preds[0].clone()
+            for other_state in valid_preds[1:]:
+                self._merge_state_into(merged_pre_widen, other_state)
 
-        # Merge the rest
-        for other_state in valid_preds[1:]:
-            all_keys = set(merged.values.keys()) | set(other_state.values.keys())
-            for key in all_keys:
-                val_a = merged.values.get(key)
-                val_b = other_state.values.get(key)
-
-                if val_a is None:
-                    merged.values[key] = val_b.clone() if val_b else AbstractValue()
-                elif val_b is None:
-                    continue
-                else:
-                    merged.values[key] = val_a.merge(val_b)
-
-            merged.memory = merged.memory.merge(other_state.memory)
-            merged.control_taints |= set(other_state.control_taints)
+        merged = merged_pre_widen.clone()
 
         # Progressive widening if loop threshold reached
         if widen_progress > 0:
@@ -2380,6 +2404,26 @@ class FunctionAnalyzer:
             merged.memory = MemoryState(widened_slots)
 
         return merged
+
+    def _merge_state_into(self, merged: AnalysisState, other_state: AnalysisState) -> None:
+        all_keys = set(merged.values.keys()) | set(other_state.values.keys())
+        for key in all_keys:
+            val_a = merged.values.get(key)
+            val_b = other_state.values.get(key)
+
+            if val_a is None:
+                merged.values[key] = val_b.clone() if val_b else AbstractValue()
+            elif val_b is None:
+                continue
+            else:
+                merged.values[key] = val_a.merge(val_b)
+
+        merged.memory = merged.memory.merge(other_state.memory)
+        merged.control_taints |= set(other_state.control_taints)
+
+    def _analysis_state_signature(self, state: AnalysisState) -> Tuple:
+        value_sig = tuple(sorted(((k, v.state_signature()) for k, v in state.values.items()), key=str))
+        return (frozenset(state.control_taints), value_sig, state.memory.signature())
 
     def _state_changed(self, old: AnalysisState, new: AnalysisState) -> bool:
         if old is None:
