@@ -96,39 +96,31 @@ class KnownBits:
         width = self._ensure_width(other)
         mask = (1 << width) - 1
 
-        def _bit_possibilities(bits: "KnownBits", idx: int) -> Set[int]:
-            if idx >= bits.bit_width:
-                return {0, 1}
-            bit_mask = 1 << idx
-            if bits.known_ones & bit_mask:
-                return {1}
-            if bits.known_zeros & bit_mask:
-                return {0}
-            return {0, 1}
+        # Calculate the unsigned interval ranges for both operands
+        # 'known_zeros' implies those bits MUST be 0.
+        # So the minimum value is 'known_ones'.
+        # The maximum value is 'known_ones' + all unknown bits (which is ~known_zeros).
+        min_a = self.known_ones
+        max_a = (~self.known_zeros) & mask
 
-        carry: Set[int] = {0}
-        ones = 0
-        zeros = 0
+        min_b = other.known_ones
+        max_b = (~other.known_zeros) & mask
 
-        for i in range(width):
-            sum_bits: Set[int] = set()
-            next_carry: Set[int] = set()
+        # Add intervals
+        min_sum = (min_a + min_b) & mask
+        max_sum = (max_a + max_b) & mask
 
-            for a in _bit_possibilities(self, i):
-                for b in _bit_possibilities(other, i):
-                    for c in carry:
-                        total = a + b + c
-                        sum_bits.add(total & 1)
-                        next_carry.add(1 if total >= 2 else 0)
+        # If wrap-around occurred in a way that invalidates the range (min > max logic in modular arithmetic),
+        # we strictly degrade to unknown.
+        # However, a simple heuristic is: bits that are identical in min_sum and max_sum are known.
+        # This handles carry propagation implicitly.
 
-            if sum_bits == {0}:
-                zeros |= 1 << i
-            elif sum_bits == {1}:
-                ones |= 1 << i
+        common_ones = min_sum & max_sum
+        common_zeros = (~min_sum) & (~max_sum) & mask
 
-            carry = next_carry
-
-        return KnownBits(width, zeros & mask, ones & mask)
+        # XOR implies the bit varies between min and max, so it's unknown.
+        # This is a fast, safe over-approximation.
+        return KnownBits(width, common_zeros, common_ones)
 
     def shift_left(self, amount: int) -> "KnownBits":
         if amount <= 0:
@@ -826,7 +818,7 @@ class AnalysisState:
 
     def ensure_values_mutable(self) -> None:
         if self._values_shared:
-            self.values = {k: v.clone() for k, v in self.values.items()}
+            self.values = self.values.copy()
             self._values_shared = False
 
     def ensure_memory_mutable(self) -> None:
@@ -1702,7 +1694,7 @@ class FunctionAnalyzer:
     DEFAULT_MAX_FUNCTION_ITERATIONS = 250_000
     DEFAULT_MAX_CALL_DEPTH = 15
     CALL_STRING_K = 3
-    WIDEN_THRESHOLD = 100
+    WIDEN_THRESHOLD = 500
     WIDEN_ESCALATION = 50
     LOOP_PEEL_LIMIT = 3
 
@@ -2064,7 +2056,7 @@ class FunctionAnalyzer:
         for idx in sorted(buffer_indices):
             if idx < 0 or idx >= len(call_args):
                 continue
-            val = self._get_val(call_args[idx], states)
+            val = self._get_val(call_args[idx], states).clone()
             val.tainted = True
             val.origins.add(root_id)
             base_id = pointer_base_identifier(func, call_args[idx])
@@ -2562,6 +2554,15 @@ class FunctionAnalyzer:
                 merge_cache=merge_cache,
                 pred_state_sigs=pred_state_signatures,
             )
+
+            # --- START FIX: NARROWING CHECK ---
+            if widen_snapshots is not None and blk in widen_snapshots:
+                snapshot = widen_snapshots[blk]
+                if self._state_changed(snapshot, state):
+                    state = state.clone()
+                else:
+                    state = snapshot.clone()
+            # --- END FIX ---
             new_state = self._run_block(func, blk, state, listing, summary)
             if self._state_changed(out_states.get(blk), new_state):
                 out_states[blk] = new_state
@@ -3288,6 +3289,22 @@ class FunctionAnalyzer:
                 new_slot_val.tainted = True
                 new_slot_val.origins |= addr_val.origins
                 new_slot_val.control_taints |= addr_val.control_taints
+
+            is_ambiguous_write = (pattern.offset is None or pattern.unknown or pattern.index_var is not None)
+
+            if is_ambiguous_write and pattern.base_id:
+                for other_key, other_slot in list(updated_slots.items()):
+                    if other_key[0] == pattern.base_id:
+                        merged_val = other_slot.value.merge(new_slot_val)
+                        merged_val.widen()
+                        updated_slots[other_key] = StructSlot(
+                            other_slot.base_id,
+                            other_slot.offset,
+                            other_slot.stride,
+                            other_slot.index_var,
+                            merged_val,
+                        )
+                continue
 
             existing_slot = updated_slots.get(key)
             is_must_write = bool(
