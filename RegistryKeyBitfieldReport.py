@@ -135,6 +135,8 @@ class KnownBits:
             return self
         width = self.bit_width
         mask = (1 << width) - 1
+        if amount >= width:
+            return KnownBits(width, mask, 0)
         zeros = ((self.known_zeros << amount) | ((1 << amount) - 1)) & mask
         ones = (self.known_ones << amount) & mask
         return KnownBits(width, zeros, ones)
@@ -144,6 +146,8 @@ class KnownBits:
             return self
         width = self.bit_width
         mask = (1 << width) - 1
+        if amount >= width:
+            return KnownBits(width, mask, 0)
         zeros = (self.known_zeros >> amount) | (((1 << amount) - 1) << (width - amount))
         ones = (self.known_ones >> amount) & mask
         return KnownBits(width, zeros & mask, ones & mask)
@@ -152,10 +156,18 @@ class KnownBits:
         if amount <= 0:
             return self
         width = self.bit_width
+        mask = (1 << width) - 1
 
         msb_mask = 1 << (width - 1)
         is_neg = (self.known_ones & msb_mask) != 0
         is_pos = (self.known_zeros & msb_mask) != 0
+
+        if amount >= width:
+            if is_pos:
+                return KnownBits(width, mask, 0)
+            if is_neg:
+                return KnownBits(width, 0, mask)
+            return KnownBits.top(width)
 
         logical = self.shift_right(amount)
 
@@ -1479,6 +1491,28 @@ def _decode_registry_string_from_memory(
     program, addr, max_len: int = 512, strip_leading_nulls: bool = False, stop_after_first: bool = False
 ) -> Optional[Dict[str, Any]]:
     try:
+        listing = program.getListing() if hasattr(program, "getListing") else None
+        if listing:
+            data = listing.getDataAt(addr)
+            if data and getattr(data, "isDefined", lambda: True)():
+                try:
+                    sval = data.getValue()
+                except Exception:
+                    sval = None
+                if isinstance(sval, (bytes, bytearray)):
+                    try:
+                        sval = bytes(sval).decode("utf-16-le", errors="ignore") or bytes(sval).decode(
+                            "utf-8", errors="ignore"
+                        )
+                    except Exception:
+                        sval = None
+                if isinstance(sval, str) and sval:
+                    meta = parse_registry_string(sval)
+                    if meta:
+                        return meta
+    except Exception:
+        pass
+    try:
         mem = program.getMemory()
         buf = bytearray(max(1, max_len))
         read = mem.getBytes(addr, buf)
@@ -1602,12 +1636,43 @@ def collect_imported_registry_apis(program) -> Tuple[Set[str], Dict[Any, str]]:
         except Exception:
             pass
 
+    def _record_function(func) -> None:
+        if func is None:
+            return
+        try:
+            is_external = getattr(func, "isExternal", lambda: False)()
+        except Exception:
+            is_external = False
+        thunk_target = None
+        try:
+            thunk_target = getattr(func, "getThunkedFunction", lambda *a, **kw: None)(True)
+        except Exception:
+            pass
+        if not is_external and thunk_target is not None:
+            try:
+                is_external = getattr(thunk_target, "isExternal", lambda: False)()
+            except Exception:
+                is_external = False
+        if not is_external:
+            return
+        try:
+            _record_symbol(func.getName(), func.getEntryPoint())
+        except Exception:
+            _record_symbol(str(func), getattr(func, "getEntryPoint", lambda: None)())
+        if thunk_target and thunk_target != func:
+            try:
+                _record_symbol(thunk_target.getName(), thunk_target.getEntryPoint())
+            except Exception:
+                _record_symbol(str(thunk_target), getattr(thunk_target, "getEntryPoint", lambda: None)())
+
     try:
         symtab = program.getSymbolTable()
         ext_syms = symtab.getExternalSymbols() if symtab else None
         if ext_syms:
             for sym in ext_syms:
                 try:
+                    if hasattr(sym, "isExternal") and not sym.isExternal():
+                        continue
                     _record_symbol(sym.getName(True) if hasattr(sym, "getName") else str(sym), sym.getAddress())
                 except Exception:
                     continue
@@ -1618,8 +1683,7 @@ def collect_imported_registry_apis(program) -> Tuple[Set[str], Dict[Any, str]]:
         fm = program.getFunctionManager()
         for f in fm.getFunctions(True):
             try:
-                if getattr(f, "isExternal", lambda: False)():
-                    _record_symbol(f.getName(), f.getEntryPoint())
+                _record_function(f)
             except Exception:
                 continue
     except Exception:
@@ -3473,6 +3537,15 @@ class FunctionAnalyzer:
                 string_args.append(meta)
         uses_registry_strings = self._function_uses_registry_strings(func)
         detected_hkey_meta: Optional[Dict[str, str]] = self._find_hkey_meta(call_args, states)
+        unknown_hkey_handle = False
+        for arg in call_args[:2]:
+            try:
+                val = self._get_val(arg, states)
+            except Exception:
+                val = AbstractValue()
+            if getattr(val, "is_top", False):
+                unknown_hkey_handle = True
+                break
 
         def _pointerish_argument(vn, val: AbstractValue) -> bool:
             try:
@@ -3495,6 +3568,7 @@ class FunctionAnalyzer:
             entry_point: Optional[str],
             api_kind: Optional[str] = None,
             indirect_reason: Optional[str] = None,
+            unknown_hkey: bool = False,
         ) -> None:
             summary.uses_registry = True
             hive, path, value_name, derivation_meta = self._derive_registry_fields(
@@ -3522,6 +3596,11 @@ class FunctionAnalyzer:
                 analysis_meta.update(derivation_meta)
             if indirect_reason:
                 analysis_meta.setdefault("indirect_reason", indirect_reason)
+            if unknown_hkey:
+                root_meta["potential_unknown_root"] = True
+                notes = analysis_meta.setdefault("notes", [])
+                if "Potential Registry Access (Unknown Root)" not in notes:
+                    notes.append("Potential Registry Access (Unknown Root)")
             if entry_point and not root_meta.get("entry"):
                 root_meta["entry"] = entry_point
             if hive and not root_meta.get("hive"):
@@ -3717,7 +3796,7 @@ class FunctionAnalyzer:
                         pass
                 root_id = f"api_{safe_label}_{inst.getAddress()}"
                 entry_point = str(callee_func.getEntryPoint()) if callee_func else str(inst.getAddress())
-                _seed_root(root_id, api_label, entry_point, api_kind=api_kind)
+                _seed_root(root_id, api_label, entry_point, api_kind=api_kind, unknown_hkey=unknown_hkey_handle)
                 self._taint_registry_outputs(func, call_args, states, api_label, root_id)
                 if DEBUG_ENABLED:
                     log_debug(
@@ -3726,7 +3805,14 @@ class FunctionAnalyzer:
             elif wrapper_registry and indirect_roots_enabled:
                 root_id = f"wrapper_{safe_label}_{inst.getAddress()}"
                 entry_point = str(callee_func.getEntryPoint()) if callee_func else str(inst.getAddress())
-                _seed_root(root_id, api_label, entry_point, api_kind=api_kind, indirect_reason="registry_wrapper")
+                _seed_root(
+                    root_id,
+                    api_label,
+                    entry_point,
+                    api_kind=api_kind,
+                    indirect_reason="registry_wrapper",
+                    unknown_hkey=unknown_hkey_handle,
+                )
                 if DEBUG_ENABLED:
                     log_debug(
                         f"[debug] wrapper-based registry root seeded: id={root_id} api={api_label} at={inst.getAddress()}"
@@ -3741,6 +3827,7 @@ class FunctionAnalyzer:
                         entry_point=entry_point,
                         api_kind="string_seed",
                         indirect_reason="string_only",
+                        unknown_hkey=unknown_hkey_handle,
                     )
                     self._taint_registry_outputs(func, call_args, states, label_fragment, root_id)
             if string_args and string_seeds_enabled and indirect_roots_enabled:
@@ -3756,7 +3843,14 @@ class FunctionAnalyzer:
                 if indirect_reason:
                     root_id = f"indirect_{inst.getAddress()}"
                     entry_point = str(callee_func.getEntryPoint()) if callee_func else str(inst.getAddress())
-                    _seed_root(root_id, api_label or "<indirect>", entry_point, api_kind=api_kind, indirect_reason=indirect_reason)
+                    _seed_root(
+                        root_id,
+                        api_label or "<indirect>",
+                        entry_point,
+                        api_kind=api_kind,
+                        indirect_reason=indirect_reason,
+                        unknown_hkey=unknown_hkey_handle,
+                    )
                     if DEBUG_ENABLED:
                         log_debug(
                             f"[debug] string-based root seeded: id={root_id} hive={self.global_state.roots[root_id].get('hive')} "
@@ -3775,7 +3869,13 @@ class FunctionAnalyzer:
                 if hkey_handle_present and indirect_reason != "string_prefix":
                     indirect_reason = "hkey_handle"
                 root_id = f"indirect_{inst.getAddress()}"
-                _seed_root(root_id, "<indirect>", str(inst.getAddress()), indirect_reason=indirect_reason)
+                _seed_root(
+                    root_id,
+                    "<indirect>",
+                    str(inst.getAddress()),
+                    indirect_reason=indirect_reason,
+                    unknown_hkey=unknown_hkey_handle,
+                )
                 if DEBUG_ENABLED:
                     log_debug(
                         f"[debug] string-based root seeded: id={root_id} hive={self.global_state.roots[root_id].get('hive')} "
@@ -3792,7 +3892,14 @@ class FunctionAnalyzer:
                 caller_name = func.getName() if func else "<unknown>"
                 api_label = f"<string_seed:{caller_name}>"
                 root_id = f"string_seed_{inst.getAddress()}"
-                _seed_root(root_id, api_label, str(inst.getAddress()), api_kind="open_key", indirect_reason="registry_string_in_function")
+                _seed_root(
+                    root_id,
+                    api_label,
+                    str(inst.getAddress()),
+                    api_kind="open_key",
+                    indirect_reason="registry_string_in_function",
+                    unknown_hkey=unknown_hkey_handle,
+                )
                 if DEBUG_ENABLED:
                     log_debug(
                         f"[debug] string-based root seeded: id={root_id} hive={self.global_state.roots[root_id].get('hive')} "
@@ -4051,6 +4158,8 @@ def build_root_records(global_state: GlobalState) -> List[Dict[str, Any]]:
             "value_name": meta.get("value_name"),
             "api_name": meta.get("api_name"),
             "entry": meta.get("entry"),
+            "analysis_meta": meta.get("analysis_meta"),
+            "potential_unknown_root": bool(meta.get("potential_unknown_root")),
             "struct_slots": slot_entries,
             "bit_usage": {
                 "bit_width": max([DEFAULT_POINTER_BIT_WIDTH] + slot_bit_widths),
