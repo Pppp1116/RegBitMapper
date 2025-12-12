@@ -19,6 +19,11 @@ def analyze_target() -> None:
         "Decompiler Parameter ID": "true",  # Required for -O3 custom calling conventions
         "Stack": "true",
         "Data Reference": "true",
+        "ASCII Strings": "true",  # Improves string detection for indirect roots
+        "Aggressive Instruction Search": "true",  # Handles inlined/optimized code
+        "Embedded Media": "true",  # For embedded configs in binaries
+        "Reference": "true",  # Better pointer resolution
+        "Variadic Function Signature Override": "true",  # For custom calling conventions in -O3
     }
 
     print("[+] Initializing Ghidra 12.0 Context...")
@@ -33,6 +38,8 @@ def analyze_target() -> None:
     ) as flat_api:
         program = flat_api.getCurrentProgram()
         print(f"[+] Program Mounted: {program.getName()}")
+
+        flat_api.analyzeAll(program)
 
         # Verify auto-analysis is complete
         func_count = program.getFunctionManager().getFunctionCount()
