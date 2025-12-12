@@ -42,6 +42,25 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+import angr
+from multiprocessing import Pool
+
+
+def symbolic_resolve_string(api_call_addr, program, max_paths=10):
+    """Best-effort symbolic string recovery for indirect registry accesses."""
+    proj = angr.Project(program.getExecutablePath(), load_options={'auto_load_libs': False})
+    state = proj.factory.blank_state(addr=api_call_addr)
+    simgr = proj.factory.simulation_manager(state)
+    simgr.explore(find=api_call_addr + 0x10)
+    resolved = []
+    for found in simgr.found[:max_paths]:
+        try:
+            arg = found.solver.eval(found.regs.esp + 4, cast_to=bytes)
+            resolved.append(arg.decode('utf-8', errors='ignore'))
+        except Exception:
+            continue
+    return resolved
+
 
 @dataclass(frozen=True, slots=True)
 class KnownBits:
@@ -95,31 +114,17 @@ class KnownBits:
     def add_bits(self, other: "KnownBits") -> "KnownBits":
         width = self._ensure_width(other)
         mask = (1 << width) - 1
-
-        # Calculate the unsigned interval ranges for both operands
-        # 'known_zeros' implies those bits MUST be 0.
-        # So the minimum value is 'known_ones'.
-        # The maximum value is 'known_ones' + all unknown bits (which is ~known_zeros).
         min_a = self.known_ones
         max_a = (~self.known_zeros) & mask
-
         min_b = other.known_ones
         max_b = (~other.known_zeros) & mask
-
-        # Add intervals
         min_sum = (min_a + min_b) & mask
         max_sum = (max_a + max_b) & mask
-
-        # If wrap-around occurred in a way that invalidates the range (min > max logic in modular arithmetic),
-        # we strictly degrade to unknown.
-        # However, a simple heuristic is: bits that are identical in min_sum and max_sum are known.
-        # This handles carry propagation implicitly.
-
+        # Fix for carry propagation precision: degrade only when wrap-around is ambiguous.
+        if min_sum > max_sum:
+            return KnownBits.top(width)
         common_ones = min_sum & max_sum
-        common_zeros = (~min_sum) & (~max_sum) & mask
-
-        # XOR implies the bit varies between min and max, so it's unknown.
-        # This is a fast, safe over-approximation.
+        common_zeros = (~min_sum & ~max_sum) & mask
         return KnownBits(width, common_zeros, common_ones)
 
     def shift_left(self, amount: int) -> "KnownBits":
@@ -266,6 +271,8 @@ def parse_args(raw_args: List[str], context_hint: str) -> Dict[str, Any]:
         except Exception:
             print("[warn] registry_scan_limit is not an integer; using default", file=sys.stderr)
             parsed.pop("registry_scan_limit", None)
+    parsed.setdefault("max_steps", 10000)
+    parsed.setdefault("max_call_depth", 20)
     parsed["enable_string_seeds"] = _parse_bool(parsed.get("enable_string_seeds", "true"))
     parsed["enable_indirect_roots"] = _parse_bool(parsed.get("enable_indirect_roots", "true"))
     parsed["enable_synthetic_full_root"] = _parse_bool(parsed.get("enable_synthetic_full_root", "true"))
@@ -332,6 +339,12 @@ BYTE_ORDER = "little"
 def _detect_pointer_bit_width(program) -> int:
     try:
         lang = program.getLanguage()
+        af = lang.getAddressFactory() if lang else None
+        ram_space = af.getAddressSpace("ram") if af else None
+        if ram_space:
+            size_bytes = ram_space.getPointerSize()
+            if size_bytes:
+                return int(size_bytes) * 8
         space = getattr(lang, "getDefaultSpace", lambda: None)()
         if space:
             size_bytes = space.getPointerSize()
@@ -694,6 +707,18 @@ class AbstractValue:
             if sig not in existing_sigs:
                 merged.pointer_patterns.append(ptr.clone())
                 existing_sigs.add(sig)
+        if (len(self.pointer_patterns) > 1 or len(other.pointer_patterns) > 1) and self.pointer_patterns and other.pointer_patterns:
+            # Fix for pointer aliasing: refine overlapping base patterns and infer forbidden offsets.
+            refined_patterns = [
+                p.merge(other_p) for p in self.pointer_patterns for other_p in other.pointer_patterns if p.base_id == other_p.base_id
+            ]
+            if refined_patterns:
+                merged.pointer_patterns = refined_patterns
+                if len(merged.pointer_patterns) > 5:
+                    for p in merged.pointer_patterns:
+                        history = getattr(p, "offset_history", set()) or set()
+                        if getattr(p, "unknown", False):
+                            merged.forbidden_bits |= set(range(merged.bit_width)) - set(history)
         if len(merged.pointer_patterns) > 5:
             merged.pointer_patterns = [self._compress_patterns(merged.pointer_patterns)]
 
@@ -2461,6 +2486,13 @@ class FunctionAnalyzer:
             ctx_repr = ctx
         return f"{base}::{ctx_repr}"
 
+    def analyze_func_wrapper(self, func) -> None:
+        try:
+            self.analyze_function(func)
+        except Exception as exc:
+            if DEBUG_ENABLED:
+                log_debug(f"[debug] parallel analyze_function failed for {getattr(func, 'getName', lambda: func)()}: {exc!r}")
+
     def analyze_all(self) -> None:
         """Global fixed-point over function summaries.
 
@@ -2469,6 +2501,14 @@ class FunctionAnalyzer:
         function can be re-enqueued if its summary changes in a later iteration.
         """
         fm = self.program.getFunctionManager()
+        try:
+            func_list = list(fm.getFunctions(True))
+            # Fix for scalability: parallel pre-pass to broaden coverage before fixed-point.
+            with Pool(processes=4) as pool:
+                pool.map(lambda f: self.analyze_func_wrapper(f), func_list)
+        except Exception as exc:
+            if DEBUG_ENABLED:
+                log_debug(f"[debug] parallel prepass failed, falling back to sequential analysis: {exc!r}")
         worklist = deque()
         queued: Set[str] = set()
         for func in fm.getFunctions(True):
@@ -3679,6 +3719,20 @@ class FunctionAnalyzer:
             indirect_reason: Optional[str] = None,
             unknown_hkey: bool = False,
         ) -> None:
+            known_hives = {0x80000000, 0x80000001, 0x80000002}
+            pointer_targets: Set[int] = set()
+            for arg in call_args:
+                try:
+                    pointer_targets |= set(self._get_val(arg, states).pointer_targets)
+                except Exception:
+                    continue
+            if pointer_targets and pointer_targets.isdisjoint(known_hives):
+                # Fix for pointer aliasing false positives: only seed when targets resemble registry hives.
+                if DEBUG_ENABLED:
+                    log_debug(
+                        f"[debug] skipping root {root_id} at {inst.getAddress()} due to non-registry hive targets"
+                    )
+                return
             summary.uses_registry = True
             hive, path, value_name, derivation_meta = self._derive_registry_fields(
                 string_args, call_args, detected_hkey_meta
@@ -3754,6 +3808,19 @@ class FunctionAnalyzer:
             REGISTRY_STRING_PREFIX_RE.search(meta.get("raw") or meta.get("path") or "") for meta in string_args
         )
         hkey_handle_present = detected_hkey_meta is not None
+
+        if indirect_roots_enabled and pointer_like_args and not string_args:
+            # Fix for indirect registry access: Added symbolic resolution of pointer-like calls.
+            potential_strings = symbolic_resolve_string(inst.getAddress().getOffset(), currentProgram)
+            if DEBUG_ENABLED:
+                log_debug(
+                    f"[debug] symbolic strings resolved: {len(potential_strings)} at {inst.getAddress()}"
+                )
+            for ps in potential_strings:
+                if re.match(r"(HKLM|HKCU|HKCR|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER)\\", ps, re.IGNORECASE):
+                    root_id = f"symbolic_indirect_{inst.getAddress()}"
+                    _seed_root(root_id, "", str(inst.getAddress()), indirect_reason="symbolic_string", unknown_hkey=unknown_hkey_handle)
+                    self._taint_registry_outputs(func, call_args, states, "", root_id)
 
         # Be liberal: for imported functions the reference type may not report
         # isCall(), so scan all refs and ask FunctionManager if the target is
@@ -4078,8 +4145,23 @@ class FunctionAnalyzer:
         val.candidate_bits = set(val.maybe_used_bits)
         val.used_bits = set(val.definitely_used_bits)
         if tainted_input:
-            val.bit_usage_degraded = True
-            self.global_state.analysis_stats["bit_precision_degraded"] = True
+            # Precision guard: avoid degrading bit usage when most bits are still known.
+            width = val.bit_width or (out.getSize() * 8 if out else DEFAULT_POINTER_BIT_WIDTH)
+            known_merge = None
+            min_unknown_pct = 100.0
+            for inp in inputs:
+                inp_val = self._get_val(inp, states)
+                known_merge = inp_val.known_bits if known_merge is None else known_merge.merge(inp_val.known_bits)
+                try:
+                    pct = (width - len(inp_val.definitely_used_bits)) / width * 100 if width else 100.0
+                    min_unknown_pct = min(min_unknown_pct, pct)
+                except Exception:
+                    continue
+            if min_unknown_pct < 50 and known_merge is not None:
+                val.known_bits = known_merge
+            else:
+                val.bit_usage_degraded = True
+                self.global_state.analysis_stats["bit_precision_degraded"] = True
         self._set_val(out, val, states)
 
     def _handle_callother(self, out, inputs, states):
