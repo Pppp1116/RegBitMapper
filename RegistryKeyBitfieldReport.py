@@ -592,6 +592,64 @@ class StructSlot:
     index_var: Optional[Any] = None
     value: AbstractValue = field(default_factory=AbstractValue)
 
+    def clone(self) -> "StructSlot":
+        return StructSlot(
+            self.base_id,
+            self.offset,
+            self.stride,
+            self.index_var,
+            self.value.clone(),
+        )
+
+
+@dataclass
+class MemoryState:
+    slots: Dict[Tuple[str, int], StructSlot] = field(default_factory=dict)
+
+    def clone(self) -> "MemoryState":
+        return MemoryState({k: v.clone() for k, v in self.slots.items()})
+
+    def merge(self, other: "MemoryState") -> "MemoryState":
+        merged_slots: Dict[Tuple[str, int], StructSlot] = {}
+        for key in set(self.slots.keys()) | set(other.slots.keys()):
+            left = self.slots.get(key)
+            right = other.slots.get(key)
+            if left and right:
+                merged_val = left.value.merge(right.value)
+                merged_slots[key] = StructSlot(
+                    base_id=left.base_id or right.base_id,
+                    offset=left.offset if left.offset is not None else right.offset,
+                    stride=left.stride if left.stride is not None else right.stride,
+                    index_var=left.index_var if left.index_var is not None else right.index_var,
+                    value=merged_val,
+                )
+            elif left:
+                merged_slots[key] = left.clone()
+            elif right:
+                merged_slots[key] = right.clone()
+        return MemoryState(merged_slots)
+
+    def signature(self) -> Tuple:
+        sig = []
+        for key in sorted(self.slots.keys(), key=lambda k: (str(k[0]), k[1])):
+            slot = self.slots[key]
+            sig.append((key, slot.value.state_signature(), slot.stride, slot.index_var))
+        return tuple(sig)
+
+
+@dataclass
+class AnalysisState:
+    values: Dict[Tuple, AbstractValue] = field(default_factory=dict)
+    memory: MemoryState = field(default_factory=MemoryState)
+    control_taints: Set[str] = field(default_factory=set)
+
+    def clone(self) -> "AnalysisState":
+        return AnalysisState(
+            values={k: v.clone() for k, v in self.values.items()},
+            memory=self.memory.clone(),
+            control_taints=set(self.control_taints),
+        )
+
 
 @dataclass
 class Decision:
@@ -1413,7 +1471,7 @@ class FunctionAnalyzer:
         except Exception:
             return False
 
-    def _pointer_args_from_registry(self, pointer_args: List[Any], states: Dict[Tuple, AbstractValue]) -> bool:
+    def _pointer_args_from_registry(self, pointer_args: List[Any], states: AnalysisState) -> bool:
         for arg in pointer_args:
             try:
                 if self._get_val(arg, states).origins:
@@ -1597,7 +1655,7 @@ class FunctionAnalyzer:
             return self._external_label_for_address(target_addr)
         return None
 
-    def _find_hkey_meta(self, call_args: List[Any], states: Dict[Tuple, AbstractValue]) -> Optional[Dict[str, str]]:
+    def _find_hkey_meta(self, call_args: List[Any], states: AnalysisState) -> Optional[Dict[str, str]]:
         for arg in call_args[:2]:
             try:
                 val = self._get_val(arg, states)
@@ -1648,7 +1706,7 @@ class FunctionAnalyzer:
         return hive, path, value_name, detail_meta
 
     def _taint_registry_outputs(
-        self, func, call_args: List[Any], states: Dict[Tuple, AbstractValue], label: Optional[str], root_id: Optional[str]
+        self, func, call_args: List[Any], states: AnalysisState, label: Optional[str], root_id: Optional[str]
     ) -> None:
         if label is None or root_id is None:
             return
@@ -1769,7 +1827,7 @@ class FunctionAnalyzer:
         
         return definitions
 
-    def _resolve_callee_from_pcode_target(self, target_vn, states: Dict[Tuple, AbstractValue]) -> Tuple[Optional[str], Optional[Any]]:
+    def _resolve_callee_from_pcode_target(self, target_vn, states: AnalysisState) -> Tuple[Optional[str], Optional[Any]]:
         fm = self.program.getFunctionManager()
         callee = None
         callee_func = None
@@ -1852,7 +1910,7 @@ class FunctionAnalyzer:
         
         return callee, callee_func
 
-    def _resolve_string_from_vn(self, vn, states: Optional[Dict[Tuple, AbstractValue]] = None) -> Optional[Dict[str, Any]]:
+    def _resolve_string_from_vn(self, vn, states: Optional[AnalysisState] = None) -> Optional[Dict[str, Any]]:
         try:
             addr_candidates: List[Any] = []
             if vn is None:
@@ -2037,7 +2095,7 @@ class FunctionAnalyzer:
         if blocks:
             _enqueue(entry_block or blocks[0])
 
-        out_states: Dict[Any, Dict[Tuple, AbstractValue]] = {}
+        out_states: Dict[Any, AnalysisState] = {}
         block_visits: Dict[Any, int] = defaultdict(int)
         steps = 0
 
@@ -2056,7 +2114,7 @@ class FunctionAnalyzer:
 
             state = self._merge_predecessors(blk, preds, out_states, must_widen)
             new_state = self._run_block(func, blk, state, listing, summary)
-            if self._state_changed(out_states.get(blk, {}), new_state):
+            if self._state_changed(out_states.get(blk), new_state):
                 out_states[blk] = new_state
                 for succ in succs.get(blk, []):
                     _enqueue(succ)
@@ -2067,63 +2125,76 @@ class FunctionAnalyzer:
         return summary
 
     def _merge_predecessors(
-        self, blk, preds: Dict[Any, List[Any]], out_states: Dict[Any, Dict[Tuple, AbstractValue]], must_widen: bool = False
-    ):
-        merged: Dict[Tuple, AbstractValue] = {}
-        
+        self, blk, preds: Dict[Any, List[Any]], out_states: Dict[Any, AnalysisState], must_widen: bool = False
+    ) -> AnalysisState:
         # Filter out predecessors that haven't been visited yet (empty states)
         # This prevents "polluting" the merge with empty/bottom values early in the loop.
         valid_preds = [out_states.get(p) for p in preds.get(blk, []) if p in out_states]
-        
-        if not valid_preds:
-            return {}
 
-        # Initialize with the first valid predecessor
-        # Deep copy is essential to avoid mutating the predecessor's state
-        first_state = valid_preds[0]
-        for key, val in first_state.items():
-            merged[key] = val.clone()
+        if not valid_preds:
+            return AnalysisState()
+
+        merged = valid_preds[0].clone()
 
         # Merge the rest
         for other_state in valid_preds[1:]:
-            all_keys = set(merged.keys()) | set(other_state.keys())
+            all_keys = set(merged.values.keys()) | set(other_state.values.keys())
             for key in all_keys:
-                val_a = merged.get(key)
-                val_b = other_state.get(key)
-                
+                val_a = merged.values.get(key)
+                val_b = other_state.values.get(key)
+
                 if val_a is None:
-                    # Variable exists in path B but not path A. 
-                    # Conservatively, this is implicit "Bottom" or "Undefined".
-                    # We adopt path B's value but mark it as potentially partial.
-                    merged[key] = val_b.clone()
+                    merged.values[key] = val_b.clone() if val_b else AbstractValue()
                 elif val_b is None:
-                    # Variable exists in path A but not B. Keep A.
-                    pass 
+                    continue
                 else:
-                    merged[key] = val_a.merge(val_b)
-        
+                    merged.values[key] = val_a.merge(val_b)
+
+            merged.memory = merged.memory.merge(other_state.memory)
+            merged.control_taints |= set(other_state.control_taints)
+
         # Widen if loop threshold reached
         if must_widen:
-            for v in merged.values():
+            for v in merged.values.values():
                 v.partial_widen() # Use partial widen first!
                 if v.bit_usage_degraded: # If already degraded, go full widen
                     v.widen()
-                    
+            widened_slots = {}
+            for key, slot in merged.memory.slots.items():
+                widened_val = slot.value.clone()
+                widened_val.partial_widen()
+                if widened_val.bit_usage_degraded:
+                    widened_val.widen()
+                widened_slots[key] = StructSlot(
+                    slot.base_id,
+                    slot.offset,
+                    slot.stride,
+                    slot.index_var,
+                    widened_val,
+                )
+            merged.memory = MemoryState(widened_slots)
+
         return merged
 
-    def _state_changed(self, old: Dict[Tuple, AbstractValue], new: Dict[Tuple, AbstractValue]) -> bool:
-        if set(old.keys()) != set(new.keys()):
+    def _state_changed(self, old: AnalysisState, new: AnalysisState) -> bool:
+        if old is None:
             return True
-        for k, v in new.items():
-            o = old.get(k)
+        if old.control_taints != new.control_taints:
+            return True
+        if set(old.values.keys()) != set(new.values.keys()):
+            return True
+        for k, v in new.values.items():
+            o = old.values.get(k)
             if o is None:
                 return True
             if v.state_signature() != o.state_signature():
                 return True
+        if old.memory.signature() != new.memory.signature():
+            return True
         return False
 
-    def _run_block(self, func, blk, state: Dict[Tuple, AbstractValue], listing, summary: FunctionSummary) -> Dict[Tuple, AbstractValue]:
-        states = {k: v.clone() for k, v in state.items()}
+    def _run_block(self, func, blk, state: AnalysisState, listing, summary: FunctionSummary) -> AnalysisState:
+        states = state.clone()
         addr_set = AddressSet()
         try:
             addr_set.addRange(blk.getFirstStartAddress(), blk.getMaxAddress())
@@ -2151,18 +2222,22 @@ class FunctionAnalyzer:
     # P-code processing
     # ------------------------------------------------------------------
 
-    def _get_val(self, vn, states: Dict[Tuple, AbstractValue]) -> AbstractValue:
+    def _get_val(self, vn, states: AnalysisState) -> AbstractValue:
         key = varnode_key(vn)
-        if key not in states:
-            states[key] = new_value_from_varnode(vn)
-        return states[key]
+        if key not in states.values:
+            states.values[key] = new_value_from_varnode(vn)
+        return states.values[key]
 
-    def _set_val(self, vn, val: AbstractValue, states: Dict[Tuple, AbstractValue]) -> None:
+    def _set_val(self, vn, val: AbstractValue, states: AnalysisState) -> None:
         key = varnode_key(vn)
-        states[key] = val
+        if states.control_taints:
+            val = val.clone()
+            val.tainted = True
+            val.origins |= set(states.control_taints)
+        states.values[key] = val
         log_trace(f"[trace] set {key} -> tainted={val.tainted} origins={sorted(val.origins)} bits={sorted(val.candidate_bits)}")
 
-    def _process_pcode(self, func, inst: Instruction, op: PcodeOp, states: Dict[Tuple, AbstractValue], summary: FunctionSummary) -> None:
+    def _process_pcode(self, func, inst: Instruction, op: PcodeOp, states: AnalysisState, summary: FunctionSummary) -> None:
         opname = opcode_name(op)
         out = op.getOutput()
         inputs = [op.getInput(i) for i in range(op.getNumInputs())]
@@ -2537,14 +2612,10 @@ class FunctionAnalyzer:
         val = AbstractValue(bit_width=out.getSize() * 8)
         key = slot_key_from_pattern(addr_val.pointer_pattern)
         if key:
-            state_key = ("slot", key[0], key[1])
-            if state_key in states:
-                val = states[state_key].clone()
-            else:
-                slot = self.global_state.struct_slots.get(key)
-                if slot:
-                    val = slot.value.clone()
-                    val.slot_sources.add(key)
+            slot = states.memory.slots.get(key)
+            if slot:
+                val = slot.value.clone()
+                val.slot_sources.add(key)
         
         # Enable constant propagation from read-only memory (e.g., IAT, .rdata)
         # to resolve indirect calls.
@@ -2630,34 +2701,40 @@ class FunctionAnalyzer:
 
         key = slot_key_from_pattern(addr_val.pointer_pattern)
         if key:
-            state_key = ("slot", key[0], key[1])
             new_slot_val = src_val.clone()
             new_slot_val.slot_sources.add(key)
-            
+
             # Taint Propagation: If address is tainted, the storage location becomes tainted
             if addr_val.tainted:
                 new_slot_val.tainted = True
                 new_slot_val.origins |= addr_val.origins
 
-            states[state_key] = new_slot_val
-            
-            # Update Global Structure Tracking
+            existing_slot = states.memory.slots.get(key)
+            merged_slot_val = new_slot_val
+            if existing_slot:
+                merged_slot_val = existing_slot.value.merge(new_slot_val)
+            merged_slot_val.slot_sources.add(key)
+
+            updated_slots = dict(states.memory.slots)
+            merged_slot = StructSlot(
+                addr_val.pointer_pattern.base_id,
+                key[1],
+                addr_val.pointer_pattern.stride,
+                addr_val.pointer_pattern.index_var,
+                value=merged_slot_val,
+            )
+            updated_slots[key] = merged_slot
+            states.memory = MemoryState(updated_slots)
+
+            # Update Global Structure Tracking for reporting only
             slot = self.global_state.struct_slots.get(key)
             if slot is None:
-                slot = StructSlot(
-                    addr_val.pointer_pattern.base_id,
-                    key[1],
-                    addr_val.pointer_pattern.stride,
-                    addr_val.pointer_pattern.index_var,
-                    value=src_val.clone(),
-                )
+                slot = merged_slot.clone()
                 self.global_state.struct_slots[key] = slot
             else:
-                old_value = slot.value.clone()
-                slot.value = old_value.merge(src_val)
-            
+                slot.value = slot.value.merge(merged_slot_val)
             slot.value.slot_sources.add(key)
-            
+
             # Record Write for Summary
             inst_func = self._get_function_for_inst(inst)
             func_name = inst_func.getName() if inst_func else "unknown"
@@ -2670,9 +2747,9 @@ class FunctionAnalyzer:
                 "offset": slot.offset,
                 "origins": sorted(slot.value.origins),
             })
-            
+
             # Track Overrides (Re-writing a tainted value with untainted data)
-            old_value = states.get(state_key)
+            old_value = existing_slot.value if existing_slot else None
             if old_value and old_value.tainted and not src_val.tainted:
                 # This is a potential sanitization or overwrite
                 pass
@@ -2727,6 +2804,8 @@ class FunctionAnalyzer:
         if self.mode == "taint" and not cond_val.origins:
             log_trace(f"[trace] skipping untainted branch at {inst.getAddress()}")
             return
+        if cond_val.tainted or cond_val.origins:
+            states.control_taints |= set(cond_val.origins)
         branch_detail = {"type": "branch"}
         used_bits = set(_definitely_bits(cond_val))
         maybe_bits = set(_maybe_bits(cond_val))
