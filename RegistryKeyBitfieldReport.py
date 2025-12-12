@@ -41,10 +41,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-sys.setrecursionlimit(5000)
 
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class KnownBits:
     """Tracks which bits are definitively zero/one for an abstract value."""
 
@@ -418,7 +416,7 @@ def log_trace(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(slots=True)
 class PointerPattern:
     base_id: Optional[str] = None
     offset: Optional[int] = None
@@ -505,7 +503,7 @@ class PointerPattern:
         return merged
 
 
-@dataclass
+@dataclass(slots=True)
 class AbstractValue:
     # --- Status Flags ---
     tainted: bool = False
@@ -717,7 +715,7 @@ class AbstractValue:
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class StructSlot:
     base_id: str
     offset: int
@@ -735,12 +733,27 @@ class StructSlot:
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class MemoryState:
     slots: Dict[Tuple[str, int], StructSlot] = field(default_factory=dict)
+    _shared: bool = field(default=False, init=False, repr=False, compare=False)
 
-    def clone(self) -> "MemoryState":
-        return MemoryState({k: v.clone() for k, v in self.slots.items()})
+    def __post_init__(self) -> None:
+        # Preserve original slots when shared; copy on first write.
+        self._shared = bool(self._shared)
+
+    def ensure_slots_mutable(self) -> None:
+        if self._shared:
+            self.slots = {k: v.clone() for k, v in self.slots.items()}
+            self._shared = False
+
+    def clone(self, *, share_slots: bool = True) -> "MemoryState":
+        cloned_slots = self.slots if share_slots else {k: v.clone() for k, v in self.slots.items()}
+        cloned = MemoryState(cloned_slots)
+        cloned._shared = share_slots
+        if share_slots:
+            self._shared = True
+        return cloned
 
     def merge(self, other: "MemoryState") -> "MemoryState":
         merged_slots: Dict[Tuple[str, int], StructSlot] = {}
@@ -770,21 +783,48 @@ class MemoryState:
         return tuple(sig)
 
 
-@dataclass
+@dataclass(slots=True)
 class AnalysisState:
     values: Dict[Tuple, AbstractValue] = field(default_factory=dict)
     memory: MemoryState = field(default_factory=MemoryState)
     control_taints: Set[str] = field(default_factory=set)
+    _values_shared: bool = field(default=False, init=False, repr=False, compare=False)
+    _memory_shared: bool = field(default=False, init=False, repr=False, compare=False)
+    _control_shared: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._values_shared = bool(self._values_shared)
+        self._memory_shared = bool(self._memory_shared)
+        self._control_shared = bool(self._control_shared)
+
+    def ensure_values_mutable(self) -> None:
+        if self._values_shared:
+            self.values = {k: v.clone() for k, v in self.values.items()}
+            self._values_shared = False
+
+    def ensure_memory_mutable(self) -> None:
+        if self._memory_shared:
+            self.memory = self.memory.clone(share_slots=False)
+            self._memory_shared = False
+
+    def ensure_control_taints_mutable(self) -> None:
+        if self._control_shared:
+            self.control_taints = set(self.control_taints)
+            self._control_shared = False
 
     def clone(self) -> "AnalysisState":
-        return AnalysisState(
-            values={k: v.clone() for k, v in self.values.items()},
-            memory=self.memory.clone(),
-            control_taints=set(self.control_taints),
+        cloned = AnalysisState(
+            values=self.values,
+            memory=self.memory,
+            control_taints=self.control_taints,
         )
+        cloned._values_shared = True
+        cloned._memory_shared = True
+        cloned._control_shared = True
+        return cloned
 
 
-@dataclass
+@dataclass(slots=True)
 class Decision:
     address: str
     mnemonic: str
@@ -806,7 +846,7 @@ class Decision:
         }
 
 
-@dataclass
+@dataclass(slots=True)
 class FunctionSummary:
     name: str
     entry: str
@@ -871,7 +911,7 @@ class FunctionSummary:
         return changed
 
 
-@dataclass
+@dataclass(slots=True)
 class GlobalState:
     roots: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     struct_slots: Dict[Tuple[str, int], StructSlot] = field(default_factory=dict)
@@ -2410,6 +2450,7 @@ class FunctionAnalyzer:
 
         # Progressive widening if loop threshold reached
         if widen_progress > 0:
+            merged.ensure_values_mutable()
             use_interval = widen_progress <= self.WIDEN_ESCALATION
             for v in merged.values.values():
                 if use_interval:
@@ -2435,6 +2476,8 @@ class FunctionAnalyzer:
         return merged
 
     def _merge_state_into(self, merged: AnalysisState, other_state: AnalysisState) -> None:
+        merged.ensure_values_mutable()
+        merged.ensure_control_taints_mutable()
         all_keys = set(merged.values.keys()) | set(other_state.values.keys())
         for key in all_keys:
             val_a = merged.values.get(key)
@@ -2503,11 +2546,16 @@ class FunctionAnalyzer:
     def _get_val(self, vn, states: AnalysisState) -> AbstractValue:
         key = varnode_key(vn)
         if key not in states.values:
+            states.ensure_values_mutable()
             states.values[key] = new_value_from_varnode(vn)
+        elif states._values_shared:
+            states.ensure_values_mutable()
         return states.values[key]
 
     def _set_val(self, vn, val: AbstractValue, states: AnalysisState) -> None:
         key = varnode_key(vn)
+        states.ensure_values_mutable()
+        states.ensure_control_taints_mutable()
         if states.control_taints:
             val = val.clone()
             val.tainted = True
