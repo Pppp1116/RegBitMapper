@@ -40,7 +40,7 @@ import traceback
 from collections import defaultdict, deque
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 
 @dataclass(frozen=True, slots=True)
@@ -1720,6 +1720,65 @@ class FunctionAnalyzer:
         self.monitor = ACTIVE_MONITOR or DUMMY_MONITOR
         self._registry_string_usage_cache: Dict[str, bool] = {}
         self._functions_with_registry_calls: Set[str] = set()
+        self.dispatch_table: Dict[str, Callable[[Any, Any, Any, Any, List[Any], AnalysisState, FunctionSummary], None]] = self._build_dispatch_table()
+
+    def _build_dispatch_table(self) -> Dict[str, Callable[[Any, Any, Any, Any, List[Any], AnalysisState, FunctionSummary], None]]:
+        return {
+            "COPY": lambda func, inst, op, out, inputs, states, summary: self._handle_copy(out, inputs, states),
+            "INT_ZEXT": lambda func, inst, op, out, inputs, states, summary: self._handle_copy(out, inputs, states),
+            "INT_SEXT": lambda func, inst, op, out, inputs, states, summary: self._handle_copy(out, inputs, states),
+            "SUBPIECE": lambda func, inst, op, out, inputs, states, summary: self._handle_copy(out, inputs, states),
+            "PIECE": lambda func, inst, op, out, inputs, states, summary: self._handle_piece(out, inputs, states),
+            "INT_ADD": lambda func, inst, op, out, inputs, states, summary: self._handle_addsub(out, inputs, states, "INT_ADD"),
+            "INT_SUB": lambda func, inst, op, out, inputs, states, summary: self._handle_addsub(out, inputs, states, "INT_SUB"),
+            "INT_MULT": lambda func, inst, op, out, inputs, states, summary: self._handle_multdiv(out, inputs, states),
+            "INT_DIV": lambda func, inst, op, out, inputs, states, summary: self._handle_multdiv(out, inputs, states),
+            "INT_AND": lambda func, inst, op, out, inputs, states, summary: self._handle_and(out, inputs, states),
+            "INT_OR": lambda func, inst, op, out, inputs, states, summary: self._handle_orxor(out, inputs, states, "INT_OR"),
+            "INT_XOR": lambda func, inst, op, out, inputs, states, summary: self._handle_orxor(out, inputs, states, "INT_XOR"),
+            "INT_LEFT": lambda func, inst, op, out, inputs, states, summary: self._handle_shift(out, inputs, states, "INT_LEFT"),
+            "INT_RIGHT": lambda func, inst, op, out, inputs, states, summary: self._handle_shift(out, inputs, states, "INT_RIGHT"),
+            "INT_SRIGHT": lambda func, inst, op, out, inputs, states, summary: self._handle_shift(out, inputs, states, "INT_SRIGHT"),
+            "LOAD": lambda func, inst, op, out, inputs, states, summary: self._handle_load(out, inputs, states),
+            "STORE": lambda func, inst, op, out, inputs, states, summary: self._handle_store(inst, inputs, states),
+            "PTRADD": lambda func, inst, op, out, inputs, states, summary: self._handle_ptradd(func, out, inputs, states),
+            "PTRSUB": lambda func, inst, op, out, inputs, states, summary: self._handle_ptrsub(func, out, inputs, states),
+            "INT_EQUAL": lambda func, inst, op, out, inputs, states, summary: self._handle_compare(out, inputs, states),
+            "INT_NOTEQUAL": lambda func, inst, op, out, inputs, states, summary: self._handle_compare(out, inputs, states),
+            "INT_LESS": lambda func, inst, op, out, inputs, states, summary: self._handle_compare(out, inputs, states),
+            "INT_LESSEQUAL": lambda func, inst, op, out, inputs, states, summary: self._handle_compare(out, inputs, states),
+            "INT_SLESS": lambda func, inst, op, out, inputs, states, summary: self._handle_compare(out, inputs, states),
+            "INT_SLESSEQUAL": lambda func, inst, op, out, inputs, states, summary: self._handle_compare(out, inputs, states),
+            "INT_CARRY": lambda func, inst, op, out, inputs, states, summary: self._handle_compare(out, inputs, states),
+            "INT_SCARRY": lambda func, inst, op, out, inputs, states, summary: self._handle_compare(out, inputs, states),
+            "INT_SBORROW": lambda func, inst, op, out, inputs, states, summary: self._handle_compare(out, inputs, states),
+            "FLOAT_EQUAL": lambda func, inst, op, out, inputs, states, summary: self._handle_compare(out, inputs, states),
+            "FLOAT_NOTEQUAL": lambda func, inst, op, out, inputs, states, summary: self._handle_compare(out, inputs, states),
+            "FLOAT_LESS": lambda func, inst, op, out, inputs, states, summary: self._handle_compare(out, inputs, states),
+            "FLOAT_LESSEQUAL": lambda func, inst, op, out, inputs, states, summary: self._handle_compare(out, inputs, states),
+            "FLOAT_NAN": lambda func, inst, op, out, inputs, states, summary: self._handle_compare(out, inputs, states),
+            "FLOAT_ADD": lambda func, inst, op, out, inputs, states, summary: self._handle_float(out, inputs, states, "FLOAT_ADD"),
+            "FLOAT_SUB": lambda func, inst, op, out, inputs, states, summary: self._handle_float(out, inputs, states, "FLOAT_SUB"),
+            "FLOAT_MULT": lambda func, inst, op, out, inputs, states, summary: self._handle_float(out, inputs, states, "FLOAT_MULT"),
+            "FLOAT_DIV": lambda func, inst, op, out, inputs, states, summary: self._handle_float(out, inputs, states, "FLOAT_DIV"),
+            "FLOAT_NEG": lambda func, inst, op, out, inputs, states, summary: self._handle_float(out, inputs, states, "FLOAT_NEG"),
+            "FLOAT_ABS": lambda func, inst, op, out, inputs, states, summary: self._handle_float(out, inputs, states, "FLOAT_ABS"),
+            "FLOAT_SQRT": lambda func, inst, op, out, inputs, states, summary: self._handle_float(out, inputs, states, "FLOAT_SQRT"),
+            "INT_FLOAT": lambda func, inst, op, out, inputs, states, summary: self._handle_float(out, inputs, states, "INT_FLOAT"),
+            "FLOAT_INT": lambda func, inst, op, out, inputs, states, summary: self._handle_float(out, inputs, states, "FLOAT_INT"),
+            "FLOAT_TRUNC": lambda func, inst, op, out, inputs, states, summary: self._handle_float(out, inputs, states, "FLOAT_TRUNC"),
+            "FLOAT_CEIL": lambda func, inst, op, out, inputs, states, summary: self._handle_float(out, inputs, states, "FLOAT_CEIL"),
+            "FLOAT_FLOOR": lambda func, inst, op, out, inputs, states, summary: self._handle_float(out, inputs, states, "FLOAT_FLOOR"),
+            "FLOAT_ROUND": lambda func, inst, op, out, inputs, states, summary: self._handle_float(out, inputs, states, "FLOAT_ROUND"),
+            "CBRANCH": lambda func, inst, op, out, inputs, states, summary: self._handle_branch(func, inst, "CBRANCH", inputs, states, summary),
+            "MULTIEQUAL": lambda func, inst, op, out, inputs, states, summary: self._handle_multiequal(out, inputs, states),
+            "INDIRECT": lambda func, inst, op, out, inputs, states, summary: self._handle_indirect(out, inputs, states),
+            "CALLOTHER": lambda func, inst, op, out, inputs, states, summary: self._handle_callother(out, inputs, states),
+            "CALL": lambda func, inst, op, out, inputs, states, summary: self._handle_call(func, inst, op, inputs, states, summary),
+            "CALLIND": lambda func, inst, op, out, inputs, states, summary: self._handle_call(func, inst, op, inputs, states, summary),
+            "BRANCHIND": lambda func, inst, op, out, inputs, states, summary: self._handle_call(func, inst, op, inputs, states, summary),
+            "RETURN": lambda func, inst, op, out, inputs, states, summary: self._handle_return(func, inputs, states, summary),
+        }
 
     def _summaries_for(self, func_name: str) -> List[FunctionSummary]:
         return [s for (name, _ctx), s in self.global_state.function_summaries.items() if name == func_name]
@@ -2078,7 +2137,10 @@ class FunctionAnalyzer:
 
             try:
                 def_op = curr.getDef()
-            except Exception:
+            except Exception as exc:
+                if _is_cancelled(exc):
+                    raise
+                log_exception(f"[debug] failed to read definition for {key}", exc)
                 definitions.append((curr, None))
                 continue
 
@@ -2419,12 +2481,20 @@ class FunctionAnalyzer:
         visited: Set[Any] = set()
         post_order: List[Any] = []
 
-        def _dfs(block):
-            visited.add(block)
-            for s in succs.get(block, []):
-                if s not in visited:
-                    _dfs(s)
-            post_order.append(block)
+        def _iterative_dfs(start_block):
+            stack: List[Tuple[Any, bool]] = [(start_block, False)]
+            while stack:
+                block, expanded = stack.pop()
+                if block in visited and not expanded:
+                    continue
+                if expanded:
+                    post_order.append(block)
+                    continue
+                visited.add(block)
+                stack.append((block, True))
+                for s in reversed(succs.get(block, [])):
+                    if s not in visited:
+                        stack.append((s, False))
 
         entry_block = None
         try:
@@ -2435,7 +2505,7 @@ class FunctionAnalyzer:
         except Exception:
             entry_block = blocks[0] if blocks else None
         if entry_block:
-            _dfs(entry_block)
+            _iterative_dfs(entry_block)
         rpo = list(reversed(post_order)) if post_order else list(blocks)
         priority_map = {blk: idx for idx, blk in enumerate(rpo)}
 
@@ -2473,8 +2543,10 @@ class FunctionAnalyzer:
             try:
                 if self.monitor and hasattr(self.monitor, "checkCanceled"):
                     self.monitor.checkCanceled()
-            except Exception:
-                pass
+            except Exception as exc:
+                if _is_cancelled(exc):
+                    raise
+                log_exception("[debug] monitor check failed", exc)
 
             block_visits[blk] += 1
             peel_active = blk in loop_headers and block_visits[blk] <= self.LOOP_PEEL_LIMIT
@@ -2507,7 +2579,6 @@ class FunctionAnalyzer:
         preds: Dict[Any, List[Any]],
         out_states: Dict[Any, AnalysisState],
         widen_progress: int = 0,
-        *,
         *,
         widen_tracker: Optional[Dict[Any, bool]] = None,
         widen_snapshots: Optional[Dict[Any, AnalysisState]] = None,
@@ -2681,77 +2752,9 @@ class FunctionAnalyzer:
         opname = opcode_name(op)
         out = op.getOutput()
         inputs = [op.getInput(i) for i in range(op.getNumInputs())]
-        if opname in {"COPY", "INT_ZEXT", "INT_SEXT", "SUBPIECE"}:
-            self._handle_copy(out, inputs, states)
-        elif opname == "PIECE":
-            self._handle_piece(out, inputs, states)
-        elif opname in {"INT_ADD", "INT_SUB"}:
-            self._handle_addsub(out, inputs, states, opname)
-        elif opname in {"INT_MULT", "INT_DIV"}:
-            self._handle_multdiv(out, inputs, states)
-        elif opname == "INT_AND":
-            self._handle_and(out, inputs, states)
-        elif opname in {"INT_OR", "INT_XOR"}:
-            self._handle_orxor(out, inputs, states, opname)
-        elif opname in {"INT_LEFT", "INT_RIGHT", "INT_SRIGHT"}:
-            self._handle_shift(out, inputs, states, opname)
-        elif opname == "LOAD":
-            self._handle_load(out, inputs, states)
-        elif opname == "STORE":
-            self._handle_store(inst, inputs, states)
-        elif opname == "PTRADD":
-            self._handle_ptradd(func, out, inputs, states)
-        elif opname == "PTRSUB":
-            self._handle_ptrsub(func, out, inputs, states)
-        elif opname in {
-            "INT_EQUAL",
-            "INT_NOTEQUAL",
-            "INT_LESS",
-            "INT_LESSEQUAL",
-            "INT_SLESS",
-            "INT_SLESSEQUAL",
-            "INT_CARRY",
-            "INT_SCARRY",
-            "INT_SBORROW",
-        }:
-            self._handle_compare(out, inputs, states)
-        elif opname in {
-            "FLOAT_EQUAL",
-            "FLOAT_NOTEQUAL",
-            "FLOAT_LESS",
-            "FLOAT_LESSEQUAL",
-            "FLOAT_NAN",
-        }:
-            self._handle_compare(out, inputs, states)
-        elif opname in {
-            "FLOAT_ADD",
-            "FLOAT_SUB",
-            "FLOAT_MULT",
-            "FLOAT_DIV",
-            "FLOAT_NEG",
-            "FLOAT_ABS",
-            "FLOAT_SQRT",
-            "INT_FLOAT",
-            "FLOAT_INT",
-            "FLOAT_TRUNC",
-            "FLOAT_CEIL",
-            "FLOAT_FLOOR",
-            "FLOAT_ROUND",
-        }:
-            self._handle_float(out, inputs, states, opname)
-        elif opname == "CBRANCH":  # unconditional BRANCH has no condition operand
-            self._handle_branch(func, inst, opname, inputs, states, summary)
-        elif opname == "MULTIEQUAL":
-            self._handle_multiequal(out, inputs, states)
-        elif opname == "INDIRECT":
-            self._handle_indirect(out, inputs, states)
-        elif opname == "CALLOTHER":
-            self._handle_callother(out, inputs, states)
-        elif opname in {"CALL", "CALLIND", "BRANCHIND"}:
-            # Handle standard calls AND tail-call thunks (BRANCHIND)
-            self._handle_call(func, inst, op, inputs, states, summary)
-        elif opname == "RETURN":
-            self._handle_return(func, inputs, states, summary)
+        handler = self.dispatch_table.get(opname)
+        if handler:
+            handler(func, inst, op, out, inputs, states, summary)
         else:
             self._handle_unknown(out, inputs, states)
 
@@ -2790,8 +2793,10 @@ class FunctionAnalyzer:
                 if bit_shift != 0:
                     val.pointer_targets = set()
                     val.pointer_patterns = []
-        except Exception:
-            pass
+        except Exception as exc:
+            if _is_cancelled(exc):
+                raise
+            log_exception("[debug] failed to adjust SUBPIECE copy", exc)
         self._set_val(out, val, states)
 
     def _handle_piece(self, out, inputs, states):
