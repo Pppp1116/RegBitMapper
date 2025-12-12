@@ -2710,8 +2710,17 @@ class FunctionAnalyzer:
                 new_slot_val.origins |= addr_val.origins
 
             existing_slot = states.memory.slots.get(key)
+            is_must_write = bool(
+                addr_val.pointer_pattern
+                and not addr_val.pointer_pattern.unknown
+                and addr_val.pointer_pattern.base_id is not None
+                and addr_val.pointer_pattern.offset is not None
+                and addr_val.pointer_pattern.index_var is None
+            )
+
+            strong_update = is_must_write and not new_slot_val.tainted and not new_slot_val.origins
             merged_slot_val = new_slot_val
-            if existing_slot:
+            if existing_slot and not strong_update:
                 merged_slot_val = existing_slot.value.merge(new_slot_val)
             merged_slot_val.slot_sources.add(key)
 
@@ -2721,7 +2730,7 @@ class FunctionAnalyzer:
                 key[1],
                 addr_val.pointer_pattern.stride,
                 addr_val.pointer_pattern.index_var,
-                value=merged_slot_val,
+                value=new_slot_val if strong_update and existing_slot else merged_slot_val,
             )
             updated_slots[key] = merged_slot
             states.memory = MemoryState(updated_slots)
@@ -2732,14 +2741,17 @@ class FunctionAnalyzer:
                 slot = merged_slot.clone()
                 self.global_state.struct_slots[key] = slot
             else:
-                slot.value = slot.value.merge(merged_slot_val)
+                if strong_update:
+                    slot.value = new_slot_val.clone()
+                else:
+                    slot.value = slot.value.merge(merged_slot_val)
             slot.value.slot_sources.add(key)
 
             # Record Write for Summary
             inst_func = self._get_function_for_inst(inst)
             func_name = inst_func.getName() if inst_func else "unknown"
             entry_str = str(inst_func.getEntryPoint()) if inst_func else str(inst.getAddress())
-            
+
             self.global_state.function_summaries.setdefault(
                 func_name, FunctionSummary(func_name, entry_str)
             ).slot_writes.append({
@@ -2751,6 +2763,10 @@ class FunctionAnalyzer:
             # Track Overrides (Re-writing a tainted value with untainted data)
             old_value = existing_slot.value if existing_slot else None
             if old_value and old_value.tainted and not src_val.tainted:
+                if strong_update and not src_val.origins:
+                    log_trace(
+                        f"[trace] strong update cleared taint for {key} at {inst.getAddress()}"
+                    )
                 # This is a potential sanitization or overwrite
                 pass
 
