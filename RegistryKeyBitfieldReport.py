@@ -36,6 +36,7 @@ import json
 import sys
 import os
 import heapq
+import traceback
 from collections import defaultdict, deque
 import re
 from dataclasses import dataclass, field
@@ -409,6 +410,20 @@ def log_debug(msg: str) -> None:
 def log_trace(msg: str) -> None:
     if TRACE_ENABLED:
         print(msg, file=sys.stderr)
+
+
+def log_exception(prefix: str, exc: Exception) -> None:
+    if DEBUG_ENABLED:
+        log_debug(f"{prefix}: {exc}")
+        traceback.print_exc()
+
+
+def _is_cancelled(exc: Exception) -> bool:
+    try:
+        from ghidra.util.exception import CancelledException  # type: ignore
+    except Exception:
+        return False
+    return isinstance(exc, CancelledException)
 
 
 # ---------------------------------------------------------------------------
@@ -1078,6 +1093,20 @@ def slot_key_from_pattern(ptr: Optional[PointerPattern]) -> Optional[Tuple[str, 
         except Exception:
             offset_val = ptr.offset
     return (ptr.base_id, offset_val)
+
+
+def pattern_may_alias_slot(ptr: PointerPattern, slot: StructSlot, access_size: int) -> bool:
+    if ptr.base_id is None or slot.base_id is None:
+        return True
+    if ptr.base_id != slot.base_id:
+        return False
+    if ptr.offset is None or slot.offset is None:
+        return True
+    if ptr.unknown or ptr.index_var is not None:
+        return True
+    delta = abs(ptr.offset - slot.offset)
+    stride = ptr.stride or slot.stride or access_size or 1
+    return delta < access_size or (stride and delta % stride == 0)
 
 
 def classify_storage(base_id: Optional[str]) -> str:
@@ -2369,6 +2398,8 @@ class FunctionAnalyzer:
         merge_cache: Dict[Any, AnalysisState] = {}
         pred_state_signatures: Dict[Tuple[Any, Any], Tuple] = {}
         block_visits: Dict[Any, int] = defaultdict(int)
+        widen_tracker: Dict[Any, bool] = defaultdict(bool)
+        widen_snapshots: Dict[Any, AnalysisState] = {}
         steps = 0
 
         while worklist and steps < self.max_steps:
@@ -2390,6 +2421,8 @@ class FunctionAnalyzer:
                 preds,
                 out_states,
                 widen_progress,
+                widen_tracker=widen_tracker,
+                widen_snapshots=widen_snapshots,
                 merge_cache=merge_cache,
                 pred_state_sigs=pred_state_signatures,
             )
@@ -2411,6 +2444,9 @@ class FunctionAnalyzer:
         out_states: Dict[Any, AnalysisState],
         widen_progress: int = 0,
         *,
+        *,
+        widen_tracker: Optional[Dict[Any, bool]] = None,
+        widen_snapshots: Optional[Dict[Any, AnalysisState]] = None,
         merge_cache: Optional[Dict[Any, AnalysisState]] = None,
         pred_state_sigs: Optional[Dict[Tuple[Any, Any], Tuple]] = None,
     ) -> AnalysisState:
@@ -2448,30 +2484,44 @@ class FunctionAnalyzer:
 
         merged = merged_pre_widen.clone()
 
-        # Progressive widening if loop threshold reached
+        # Progressive widening if loop threshold reached, followed by narrowing
         if widen_progress > 0:
-            merged.ensure_values_mutable()
-            use_interval = widen_progress <= self.WIDEN_ESCALATION
-            for v in merged.values.values():
-                if use_interval:
-                    v.interval_widen()
-                else:
-                    v.widen()
-            widened_slots = {}
-            for key, slot in merged.memory.slots.items():
-                widened_val = slot.value.clone()
-                if use_interval:
-                    widened_val.interval_widen()
-                else:
-                    widened_val.widen()
-                widened_slots[key] = StructSlot(
-                    slot.base_id,
-                    slot.offset,
-                    slot.stride,
-                    slot.index_var,
-                    widened_val,
-                )
-            merged.memory = MemoryState(widened_slots)
+            apply_widen = (
+                widen_progress <= self.WIDEN_ESCALATION
+                or (widen_tracker is not None and not widen_tracker.get(blk, False))
+            )
+            if apply_widen:
+                merged.ensure_values_mutable()
+                use_interval = widen_progress <= self.WIDEN_ESCALATION
+                for v in merged.values.values():
+                    if use_interval:
+                        v.interval_widen()
+                    else:
+                        v.widen()
+                widened_slots = {}
+                for key, slot in merged.memory.slots.items():
+                    widened_val = slot.value.clone()
+                    if use_interval:
+                        widened_val.interval_widen()
+                    else:
+                        widened_val.widen()
+                    widened_slots[key] = StructSlot(
+                        slot.base_id,
+                        slot.offset,
+                        slot.stride,
+                        slot.index_var,
+                        widened_val,
+                    )
+                merged.memory = MemoryState(widened_slots)
+                if widen_tracker is not None:
+                    widen_tracker[blk] = True
+                if widen_snapshots is not None:
+                    widen_snapshots[blk] = merged.clone()
+            else:
+                if widen_snapshots is not None and blk in widen_snapshots:
+                    narrowed = merged.clone()
+                    self._merge_state_into(narrowed, widen_snapshots[blk])
+                    merged = narrowed
 
         return merged
 
@@ -3119,8 +3169,10 @@ class FunctionAnalyzer:
                                         val.function_pointer_labels.add(norm)
                                         val.pointer_targets.add(to_addr.getOffset())
 
-                except Exception:
-                    pass
+                except Exception as exc:
+                    if _is_cancelled(exc):
+                        raise
+                    log_exception("load pointer resolution failed", exc)
 
         self._set_val(out, val, states)
 
@@ -3150,8 +3202,10 @@ class FunctionAnalyzer:
                         if base_id not in self.global_state.heap_string_writes:
                             self.global_state.heap_string_writes[base_id] = {}
                         self.global_state.heap_string_writes[base_id][final_offset] = bytes([b])
-                except Exception:
-                    pass
+                except Exception as exc:
+                    if _is_cancelled(exc):
+                        raise
+                    log_exception("failed to record heap string write", exc)
             # -------------------------------------------------------------
 
             key = slot_key_from_pattern(pattern)
@@ -3195,6 +3249,21 @@ class FunctionAnalyzer:
                 value=new_slot_val if strong_update and existing_slot else merged_slot_val,
             )
             updated_slots[key] = merged_slot
+
+            access_size = inputs[2].getSize() if hasattr(inputs[2], "getSize") else 0
+            for other_key, other_slot in list(updated_slots.items()):
+                if other_key == key:
+                    continue
+                if pattern_may_alias_slot(pattern, other_slot, access_size):
+                    degraded_val = other_slot.value.merge(new_slot_val)
+                    degraded_val.bit_usage_degraded = True
+                    updated_slots[other_key] = StructSlot(
+                        other_slot.base_id,
+                        other_slot.offset,
+                        other_slot.stride,
+                        other_slot.index_var,
+                        degraded_val,
+                    )
 
             slot = self.global_state.struct_slots.get(key)
             if slot is None:
