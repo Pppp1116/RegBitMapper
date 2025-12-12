@@ -914,36 +914,30 @@ def normalize_registry_label(raw: Optional[str]) -> Optional[str]:
     if not cleaned:
         return None
     cleaned = re.sub(r"(?i)^(?:j__|__imp__?|imp_|__imported_|imported_)", "", cleaned)
-    cleaned = cleaned.strip(r"@ !:\/")
+    cleaned = cleaned.strip("@ !:\\/")
     # Keep suffixes that look registry-like, handling common separators and
     # mangled import labels such as ADVAPI32.dll::RegOpenKeyExA@16 or
     # ADVAPI32.dll_RegQueryValueExW. We also want to gracefully accept
     # decorations like "__imp__RegOpenKeyExA@16" and thunks that carry module
     # qualifiers.
-    split_re = r"[.:@!\/]|::"
-    registry_re = re.compile(r"(?i)^(reg|zw|nt|cm|rtl)[a-z0-9_@]*$")
-
-    def _normalize_token(tok: str) -> Optional[str]:
-        tok = tok.strip("_").strip()
-        if not tok:
-            return None
-        tok = re.sub(r"@[0-9]+$", "", tok)
-        tok = re.sub(r"\$[A-Za-z0-9_]+$", "", tok)
-        if registry_re.match(tok):
-            return tok
-        return None
-
+    split_re = r"[.:@!\\/]|::"
     tokens: List[str] = []
     for part in re.split(split_re, cleaned):
         for seg in part.split("_"):
-            norm = _normalize_token(seg)
-            if norm:
-                tokens.append(norm)
-
-    if tokens:
-        return tokens[-1]
-
-    return _normalize_token(cleaned)
+            seg = seg.strip()
+            if seg:
+                tokens.append(seg)
+    tokens = tokens or [cleaned]
+    # strip leftover decoration like @NN or trailing digits
+    cleaned = re.sub(r"@[0-9]+$", "", cleaned)
+    cleaned = re.sub(r"\$[A-Za-z0-9_]+$", "", cleaned)
+    registry_re = re.compile(r"(?i)(reg|zw|nt|cm|rtl)[a-z0-9_@]*")
+    for tok in reversed(tokens):
+        m = registry_re.search(tok)
+        if m:
+            return m.group(0)
+    m = registry_re.search(cleaned)
+    return m.group(0) if m else None
 
 
 def is_registry_api(name: str) -> bool:
@@ -1015,7 +1009,7 @@ def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
         return None
     raw = raw.replace("/", "\\")
     # Trim leading junk before a known hive fragment if present, but do not
-    # require a canonical prefix – synthetic/relative paths are allowed.
+    # require a canonical prefix â synthetic/relative paths are allowed.
     m = REGISTRY_STRING_PREFIX_RE.search(raw)
     hive_key = None
     path = raw
@@ -1310,7 +1304,7 @@ class FunctionAnalyzer:
         return self._decode_string_at_address(addr, addr_str)
 
     def _registry_string_addresses(self) -> Set[str]:
-        # do not cache — registry strings can be discovered dynamically during analysis
+        # do not cache â registry strings can be discovered dynamically during analysis
         return set(self.global_state.registry_strings.keys())
 
     def _function_uses_registry_strings(self, func) -> bool:
@@ -1561,144 +1555,157 @@ class FunctionAnalyzer:
                     log_debug(f"[debug] error resolving external reference at {inst.getAddress()}: {e!r}")
         return None
 
+    def _collect_potential_definitions(self, vn, max_depth=100) -> List[Tuple[Any, Optional[PcodeOp]]]:
+        """
+        Performs a DFS backward slice to find all 'root' definitions of a varnode 
+        (Constants, Loads, Inputs), handling control flow merges (Phi nodes) 
+        and passthrough operations.
+        """
+        definitions = []
+        visited = set()
+        # Stack stores (Varnode, depth)
+        stack = [(vn, 0)]
+        
+        while stack:
+            curr, depth = stack.pop()
+            # Cycle detection for "infinite" context safety
+            key = varnode_key(curr)
+            if key in visited:
+                continue
+            visited.add(key)
+            
+            if depth > max_depth:
+                definitions.append((curr, None))
+                continue
+
+            if curr is None:
+                continue
+
+            if curr.isConstant() or curr.isAddress():
+                definitions.append((curr, None))
+                continue
+
+            try:
+                def_op = curr.getDef()
+            except Exception:
+                definitions.append((curr, None))
+                continue
+
+            if not def_op:
+                definitions.append((curr, None)) # Function input or uninitialized
+                continue
+                
+            opcode = def_op.getOpcode()
+            
+            # Passthrough operations: dive deeper
+            if opcode in {PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT, PcodeOp.SUBPIECE}:
+                inp = def_op.getInput(0)
+                if inp:
+                    stack.append((inp, depth + 1))
+            
+            # Phi nodes (MULTIEQUAL): Explore ALL branches (infinite context across CFG splits)
+            elif opcode == PcodeOp.MULTIEQUAL:
+                for i in range(def_op.getNumInputs()):
+                    inp = def_op.getInput(i)
+                    if inp:
+                        stack.append((inp, depth + 1))
+            
+            # Meaningful terminal ops (LOAD, PTRADD, CALL return, etc.)
+            else:
+                definitions.append((curr, def_op))
+        
+        return definitions
+
     def _resolve_callee_from_pcode_target(self, target_vn, states: Dict[Tuple, AbstractValue]) -> Tuple[Optional[str], Optional[Any]]:
         fm = self.program.getFunctionManager()
         callee = None
         callee_func = None
-        target_addr = None
-        try:
-            def_op = target_vn.getDef() if target_vn is not None else None
-        except Exception:
-            def_op = None
-        if def_op is not None and def_op.getOpcode() == PcodeOp.LOAD:
-            try:
-                load_addr_vn = def_op.getInput(1)
-            except Exception:
-                load_addr_vn = None
-            if load_addr_vn and vn_is_constant(load_addr_vn):
-                load_offset = vn_get_offset(load_addr_vn)
-                if load_offset is not None:
-                    try:
-                        callee_addr = self.api.toAddr(load_offset)
-                    except Exception:
-                        callee_addr = None
-                    try:
-                        sym = getattr(self.api, "getSymbolAt", lambda a: None)(callee_addr)
-                    except Exception:
-                        sym = None
-                    if sym is not None:
-                        callee = sym.getName()
-                        try:
-                            if SourceType is not None and getattr(sym, "getSource", lambda: None)() == SourceType.IMPORTED:
-                                ext_loc = sym.getExternalLocation()
-                                if ext_loc and ext_loc.getLabel():
-                                    callee = ext_loc.getLabel()
-                        except Exception:
-                            pass
-                        try:
-                            callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(callee_addr))
-                        except Exception:
-                            pass
-                    if callee is None:
-                        mapped = None
-                        if callee_addr is not None:
-                            mapped = IMPORTED_REGISTRY_API_ADDRS.get(str(callee_addr))
-                        if mapped is None and load_offset is not None:
+
+        # 1. Collect ALL potential definitions via Backward Slice
+        # This handles cases where a register is set in an if/else block (Phi node)
+        potential_defs = self._collect_potential_definitions(target_vn)
+
+        for real_vn, def_op in potential_defs:
+            if callee: break # Stop if we found a match
+
+            # Case A: Indirect Call via Register (CALL RBX) where RBX = LOAD[IAT]
+            if def_op and def_op.getOpcode() == PcodeOp.LOAD:
+                load_addr_vn = def_op.getInput(1) # Index 1 is the address
+                
+                # Recursively trace the address being loaded (handle MOV RAX, IAT; LOAD [RAX])
+                addr_defs = self._collect_potential_definitions(load_addr_vn, max_depth=20)
+                
+                for addr_vn, _ in addr_defs:
+                    if addr_vn and vn_is_constant(addr_vn):
+                        iat_offset = vn_get_offset(addr_vn)
+                        if iat_offset is not None:
                             try:
-                                mapped = IMPORTED_REGISTRY_API_ADDRS.get(int(load_offset))
+                                iat_addr = self.api.toAddr(iat_offset)
+                                
+                                # A1: Check Ghidra References (Strongest IAT Signal)
+                                ref_mgr = getattr(self.program, "getReferenceManager", lambda: None)()
+                                if ref_mgr:
+                                    for ref in ref_mgr.getReferencesFrom(iat_addr):
+                                        to_addr = ref.getToAddress()
+                                        if not to_addr: continue
+                                        
+                                        # Is it an external ref?
+                                        if getattr(to_addr, "isExternalAddress", lambda: False)() or "EXTERNAL" in str(to_addr.getAddressSpace()):
+                                            ext = self._external_label_for_address(to_addr)
+                                            if ext:
+                                                callee = ext
+                                                break
+                                        
+                                        # Is it a known cached import?
+                                        mapped = (IMPORTED_REGISTRY_API_ADDRS.get(to_addr.getOffset()) or 
+                                                  IMPORTED_REGISTRY_API_ADDRS.get(str(to_addr)))
+                                        if mapped:
+                                            callee = mapped
+                                            break
+
+                                # A2: Check Import Cache directly
+                                if not callee:
+                                    mapped = (IMPORTED_REGISTRY_API_ADDRS.get(iat_offset) or 
+                                              IMPORTED_REGISTRY_API_ADDRS.get(str(iat_offset)) or
+                                              IMPORTED_REGISTRY_API_ADDRS.get(str(iat_addr)))
+                                    if mapped:
+                                        callee = mapped
+
+                                # A3: Read memory (if initialized)
+                                if not callee:
+                                    ptr = self._read_pointer_value(iat_addr)
+                                    if ptr:
+                                        mapped = (IMPORTED_REGISTRY_API_ADDRS.get(ptr) or 
+                                                  IMPORTED_REGISTRY_API_ADDRS.get(str(ptr)))
+                                        if mapped:
+                                            callee = mapped
                             except Exception:
-                                mapped = None
-                        if mapped:
-                            callee = mapped
-                            if callee_addr is not None:
-                                try:
-                                    callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(callee_addr))
-                                except Exception:
-                                    pass
-        if target_vn is not None:
-            try:
-                if hasattr(target_vn, "getAddress"):
-                    target_addr = target_vn.getAddress()
-                if target_addr is None and vn_is_constant(target_vn):
-                    off = vn_get_offset(target_vn)
-                    if off is not None:
-                        target_addr = self.api.toAddr(off)
-            except Exception:
-                target_addr = None
-        try:
-            val = self._get_val(target_vn, states) if target_vn is not None else AbstractValue()
-        except Exception:
-            val = AbstractValue()
-        if val.function_pointer_labels:
-            callee = sorted(val.function_pointer_labels)[0]
-        if target_addr is not None:
-            func_at_target = self._follow_thunk(fm.getFunctionAt(target_addr))
-            if func_at_target:
-                callee_func = func_at_target
-                if callee is None:
-                    callee = func_at_target.getName()
-            mapped = IMPORTED_REGISTRY_API_ADDRS.get(str(target_addr))
-            if mapped:
-                callee = callee or mapped
-                try:
-                    callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(target_addr))
-                except Exception:
-                    pass
-            if callee is None:
-                ext_label = self._external_label_for_address(target_addr)
-                if ext_label:
-                    callee = ext_label
-            if callee is None:
-                manual = self._resolve_import_from_pointer(target_addr)
-                if manual:
-                    callee = manual
-        try:
-            target = target_vn.getOffset() if target_vn is not None and hasattr(target_vn, "getOffset") else None
-        except Exception:
-            target = None
-        if callee is None and target is not None:
-            mapped = IMPORTED_REGISTRY_API_ADDRS.get(int(target))
-            if mapped:
-                callee = mapped
-                try:
-                    callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(self.api.toAddr(target)))
-                except Exception:
-                    pass
-            if callee is None:
-                try:
-                    callee = self._resolve_import_from_pointer(self.api.toAddr(target))
-                except Exception:
-                    pass
-        if callee is None:
-            for tgt in sorted(val.pointer_targets):
-                mapped = IMPORTED_REGISTRY_API_ADDRS.get(tgt)
+                                pass
+                    if callee: break
+
+            # Case B: The Varnode ITSELF is a pointer to an API (e.g. constant pointer)
+            elif real_vn and vn_is_constant(real_vn):
+                off = vn_get_offset(real_vn)
+                mapped = IMPORTED_REGISTRY_API_ADDRS.get(off)
                 if mapped:
                     callee = mapped
-                    try:
-                        callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(self.api.toAddr(tgt)))
-                    except Exception:
-                        pass
-                    break
-                try:
-                    addr_obj = self.api.toAddr(tgt)
-                    str_addr = str(addr_obj)
-                    mapped = IMPORTED_REGISTRY_API_ADDRS.get(str_addr)
-                    if mapped:
-                        callee = mapped
-                        callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(addr_obj))
-                        break
-                    ext_label = self._external_label_for_address(addr_obj)
-                    if ext_label:
-                        callee = ext_label
-                        callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(addr_obj))
-                        break
-                    manual = self._resolve_import_from_pointer(addr_obj)
-                    if manual:
-                        callee = manual
-                        callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(addr_obj))
-                        break
-                except Exception:
-                    continue
+        
+        # 4. Case C: Tainted Function Pointer (Forward Analysis Fallback)
+        if not callee:
+            try:
+                val = self._get_val(target_vn, states) if target_vn is not None else AbstractValue()
+                if val.function_pointer_labels:
+                    callee = sorted(val.function_pointer_labels)[0]
+                
+                if not callee and val.pointer_targets:
+                    for tgt in sorted(val.pointer_targets):
+                        mapped = IMPORTED_REGISTRY_API_ADDRS.get(tgt) or IMPORTED_REGISTRY_API_ADDRS.get(str(tgt))
+                        if mapped:
+                            callee = mapped
+                            break
+            except Exception:
+                pass
+
         return callee, callee_func
 
     def _resolve_string_from_vn(self, vn, states: Optional[Dict[Tuple, AbstractValue]] = None) -> Optional[Dict[str, Any]]:
@@ -1972,10 +1979,8 @@ class FunctionAnalyzer:
             self._handle_multiequal(out, inputs, states)
         elif opname == "INDIRECT":
             self._handle_indirect(out, inputs, states)
-        elif opname in {"CALL", "CALLIND"}:
-            # Treat both direct (CALL) and indirect (CALLIND) calls as call sites.
-            # For CALLIND, callee_name may be None, but we still seed roots based
-            # on registry-like string arguments.
+        elif opname in {"CALL", "CALLIND", "BRANCHIND"}:
+            # Handle standard calls AND tail-call thunks (BRANCHIND)
             self._handle_call(func, inst, op, inputs, states, summary)
         elif opname == "RETURN":
             self._handle_return(inputs, states, summary)
@@ -2266,6 +2271,56 @@ class FunctionAnalyzer:
             if slot:
                 val = slot.value.clone()
                 val.slot_sources.add(key)
+        
+        # Enable constant propagation from read-only memory (e.g., IAT, .rdata)
+        # to resolve indirect calls.
+        # Allow 32-bit (4 bytes) or 64-bit (8 bytes) loads
+        if out.getSize() in (4, 8) and not val.pointer_targets:
+            targets = []
+            if vn_is_constant(inputs[1]):
+                targets.append(vn_get_offset(inputs[1]))
+            elif addr_val.pointer_targets:
+                targets.extend(sorted(addr_val.pointer_targets)[:5])
+            
+            for t in targets:
+                if t is None: continue
+                try:
+                    src_addr = self.api.toAddr(t)
+                    
+                    # 1. Try reading pointer from memory (e.g. initialized globals)
+                    ptr = self._read_pointer_value(src_addr)
+                    if ptr is not None:
+                        val.pointer_targets.add(ptr)
+                        mapped = (IMPORTED_REGISTRY_API_ADDRS.get(ptr) or 
+                                  IMPORTED_REGISTRY_API_ADDRS.get(str(ptr)))
+                        if mapped:
+                            val.function_pointer_labels.add(mapped)
+
+                    # 2. Try resolving via Ghidra References (Critical for IAT/Externals)
+                    ref_mgr = getattr(self.program, "getReferenceManager", lambda: None)()
+                    if ref_mgr:
+                        for ref in ref_mgr.getReferencesFrom(src_addr):
+                            to_addr = ref.getToAddress()
+                            if not to_addr: continue
+                            
+                            mapped = (IMPORTED_REGISTRY_API_ADDRS.get(to_addr.getOffset()) or 
+                                      IMPORTED_REGISTRY_API_ADDRS.get(str(to_addr)))
+                            if mapped:
+                                val.function_pointer_labels.add(mapped)
+                                val.pointer_targets.add(to_addr.getOffset())
+                                continue
+                            
+                            if getattr(to_addr, "isExternalAddress", lambda: False)():
+                                ext_label = self._external_label_for_address(to_addr)
+                                if ext_label:
+                                    norm = normalize_registry_label(ext_label)
+                                    if norm:
+                                        val.function_pointer_labels.add(norm)
+                                        val.pointer_targets.add(to_addr.getOffset())
+
+                except Exception:
+                    pass
+
         self._set_val(out, val, states)
 
     def _handle_store(self, inst, inputs, states):
@@ -2468,7 +2523,18 @@ class FunctionAnalyzer:
     def _handle_call(self, func, inst, op: PcodeOp, inputs, states, summary: FunctionSummary):
         string_seeds_enabled = args.get("enable_string_seeds", True)
         indirect_roots_enabled = args.get("enable_indirect_roots", True)
-        call_args = inputs[1:] if inputs else []
+        
+        # Determine arguments based on opcode
+        is_branch_ind = (op.getOpcode() == PcodeOp.BRANCHIND)
+        call_args = []
+        if is_branch_ind:
+            # BRANCHIND usually doesn't have explicit arguments in P-code like CALL
+            # but we treat it as a potential tail-call.
+            # We assume standard calling convention registers are already set if this is a tail call.
+            pass
+        else:
+            call_args = inputs[1:] if inputs else []
+
         string_args: List[Dict[str, Any]] = []
         for inp in call_args:
             meta = self._resolve_string_from_vn(inp, states)
@@ -2537,12 +2603,16 @@ class FunctionAnalyzer:
                 root_meta["api_kind"] = api_kind
             if indirect_reason and not root_meta.get("indirect_reason"):
                 root_meta["indirect_reason"] = indirect_reason
+            
+            # If there's an output, taint it
             if op.getOutput() is not None:
                 val = self._get_val(op.getOutput(), states)
                 val.tainted = True
                 val.origins.add(root_id)
                 val.bit_width = op.getOutput().getSize() * 8
                 self._set_val(op.getOutput(), val, states)
+            
+            # Taint pointer arguments
             for arg in call_args:
                 arg_val = self._get_val(arg, states)
                 if _pointerish_argument(arg, arg_val):
@@ -2552,6 +2622,7 @@ class FunctionAnalyzer:
                     if base_id:
                         self._record_base_id_metadata(base_id, arg)
                     self._set_val(arg, arg_val, states)
+        
         pointer_like_args: List[Any] = []
         for idx, inp in enumerate(call_args):
             arg_val = self._get_val(inp, states)
@@ -2631,11 +2702,12 @@ class FunctionAnalyzer:
                 callee_name = manual
 
         if DEBUG_ENABLED:
-            log_debug(
-                f"[debug] call at {inst.getAddress()} opname={opcode_name(op)} "
-                f"callee_name={callee_name!r} refs={len(refs)} "
-                f"strings={string_args} hkey_meta={detected_hkey_meta}"
-            )
+            if callee_name or detected_hkey_meta or string_args:
+                log_debug(
+                    f"[debug] call/jump at {inst.getAddress()} opname={opcode_name(op)} "
+                    f"callee_name={callee_name!r} strings={len(string_args)} hkey={bool(detected_hkey_meta)}"
+                )
+        
         normalized_api_label = normalize_registry_label(callee_name) if callee_name else None
         label_fragment = normalized_api_label or callee_name or "<indirect>"
         safe_label = re.sub(r"[^A-Za-z0-9_]+", "_", label_fragment)
