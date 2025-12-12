@@ -456,9 +456,10 @@ class AbstractValue:
     tainted: bool = False
     is_top: bool = False      # Represents "Unknown / All Possible Values"
     is_bottom: bool = True    # Represents "Uninitialized / Not Yet Visited"
-    
+
     # --- Data Tracking ---
     origins: Set[str] = field(default_factory=set)
+    control_taints: Set[str] = field(default_factory=set)
     bit_width: int = 32
     known_bits: KnownBits = field(default_factory=lambda: KnownBits.top(DEFAULT_POINTER_BIT_WIDTH))
     range_min: Optional[int] = None
@@ -488,6 +489,7 @@ class AbstractValue:
             is_top=self.is_top,
             is_bottom=self.is_bottom,
             origins=set(self.origins),
+            control_taints=set(self.control_taints),
             bit_width=self.bit_width,
             known_bits=KnownBits(self.known_bits.bit_width, self.known_bits.known_zeros, self.known_bits.known_ones),
             range_min=self.range_min,
@@ -590,6 +592,7 @@ class AbstractValue:
         merged.is_bottom = False
         merged.tainted = self.tainted or other.tainted
         merged.origins = self.origins | other.origins
+        merged.control_taints = self.control_taints | other.control_taints
         merged.bit_width = max(self.bit_width, other.bit_width)
         merged.known_bits = self.known_bits.merge(other.known_bits)
         if self.range_min is not None and other.range_min is not None:
@@ -646,6 +649,7 @@ class AbstractValue:
             self.is_top,
             self.tainted,
             frozenset(self.origins),
+            frozenset(self.control_taints),
             self.bit_width,
             frozenset(self.used_bits),
             frozenset(self.definitely_used_bits),
@@ -732,6 +736,7 @@ class Decision:
     disasm: str
     origins: Set[str]
     used_bits: Set[int]
+    control_taints: Set[str] = field(default_factory=set)
     details: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -741,6 +746,7 @@ class Decision:
             "disasm": self.disasm,
             "origins": sorted(self.origins),
             "used_bits": sorted(self.used_bits),
+            "control_taints": sorted(self.control_taints),
             "details": self.details,
         }
 
@@ -762,6 +768,7 @@ class FunctionSummary:
         return (
             decision.address,
             tuple(sorted(decision.origins)),
+            tuple(sorted(decision.control_taints)),
             tuple(sorted(decision.used_bits)),
             tuple(sorted(decision.details.items())),
         )
@@ -772,9 +779,9 @@ class FunctionSummary:
             return
         self._decision_signatures.add(sig)
         self.decisions.append(decision)
-        if decision.origins:
+        if decision.origins or decision.control_taints:
             self.uses_registry = True
-            self.registry_decision_roots |= set(decision.origins)
+            self.registry_decision_roots |= set(decision.origins | decision.control_taints)
 
     def merge_from(self, other: "FunctionSummary") -> bool:
         changed = False
@@ -1509,6 +1516,7 @@ class FunctionAnalyzer:
     CALL_STRING_K = 3
     WIDEN_THRESHOLD = 100
     WIDEN_ESCALATION = 50
+    LOOP_PEEL_LIMIT = 3
 
     def __init__(self, api: FlatProgramAPI, program, global_state: GlobalState, mode: str, max_call_depth: Optional[int] = None):
         self.api = api
@@ -1520,7 +1528,7 @@ class FunctionAnalyzer:
         self.program = program
         self.pointer_bit_width = _detect_pointer_bit_width(program)
         # Reuse a single BasicBlockModel for the program (safe for Ghidra 12).
-        self.block_model = BasicBlockModel(self.program)
+        self.block_model = BasicBlockModel(self.program) if BasicBlockModel else None
         self.monitor = ACTIVE_MONITOR or DUMMY_MONITOR
         self._registry_string_usage_cache: Dict[str, bool] = {}
         self._functions_with_registry_calls: Set[str] = set()
@@ -2207,6 +2215,8 @@ class FunctionAnalyzer:
         summary = FunctionSummary(func.getName(), str(func.getEntryPoint()))
         body = func.getBody()
         listing = self.program.getListing()
+        if not self.block_model:
+            return summary
         blocks = list(self.block_model.getCodeBlocksContaining(body, self.monitor))
         preds: Dict[Any, List[Any]] = defaultdict(list)
         succs: Dict[Any, List[Any]] = defaultdict(list)
@@ -2241,6 +2251,12 @@ class FunctionAnalyzer:
         rpo = list(reversed(post_order)) if post_order else list(blocks)
         priority_map = {blk: idx for idx, blk in enumerate(rpo)}
 
+        loop_headers: Set[Any] = set()
+        for blk in blocks:
+            for succ in succs.get(blk, []):
+                if priority_map.get(succ, len(priority_map)) <= priority_map.get(blk, len(priority_map)):
+                    loop_headers.add(succ)
+
         worklist: List[Tuple[int, Any]] = []
         in_queue: Set[Any] = set()
 
@@ -2269,7 +2285,8 @@ class FunctionAnalyzer:
                 pass
 
             block_visits[blk] += 1
-            widen_progress = max(0, block_visits[blk] - self.WIDEN_THRESHOLD)
+            peel_active = blk in loop_headers and block_visits[blk] <= self.LOOP_PEEL_LIMIT
+            widen_progress = 0 if peel_active else max(0, block_visits[blk] - self.WIDEN_THRESHOLD)
 
             state = self._merge_predecessors(blk, preds, out_states, widen_progress)
             new_state = self._run_block(func, blk, state, listing, summary)
@@ -2395,7 +2412,7 @@ class FunctionAnalyzer:
         if states.control_taints:
             val = val.clone()
             val.tainted = True
-            val.origins |= set(states.control_taints)
+            val.control_taints |= set(states.control_taints)
         states.values[key] = val
         log_trace(f"[trace] set {key} -> tainted={val.tainted} origins={sorted(val.origins)} bits={sorted(val.candidate_bits)}")
 
@@ -2405,6 +2422,8 @@ class FunctionAnalyzer:
         inputs = [op.getInput(i) for i in range(op.getNumInputs())]
         if opname in {"COPY", "INT_ZEXT", "INT_SEXT", "SUBPIECE"}:
             self._handle_copy(out, inputs, states)
+        elif opname == "PIECE":
+            self._handle_piece(out, inputs, states)
         elif opname in {"INT_ADD", "INT_SUB"}:
             self._handle_addsub(out, inputs, states, opname)
         elif opname in {"INT_MULT", "INT_DIV"}:
@@ -2435,6 +2454,30 @@ class FunctionAnalyzer:
             "INT_SBORROW",
         }:
             self._handle_compare(out, inputs, states)
+        elif opname in {
+            "FLOAT_EQUAL",
+            "FLOAT_NOTEQUAL",
+            "FLOAT_LESS",
+            "FLOAT_LESSEQUAL",
+            "FLOAT_NAN",
+        }:
+            self._handle_compare(out, inputs, states)
+        elif opname in {
+            "FLOAT_ADD",
+            "FLOAT_SUB",
+            "FLOAT_MULT",
+            "FLOAT_DIV",
+            "FLOAT_NEG",
+            "FLOAT_ABS",
+            "FLOAT_SQRT",
+            "INT_FLOAT",
+            "FLOAT_INT",
+            "FLOAT_TRUNC",
+            "FLOAT_CEIL",
+            "FLOAT_FLOOR",
+            "FLOAT_ROUND",
+        }:
+            self._handle_float(out, inputs, states, opname)
         elif opname == "CBRANCH":  # unconditional BRANCH has no condition operand
             self._handle_branch(func, inst, opname, inputs, states, summary)
         elif opname == "MULTIEQUAL":
@@ -2460,7 +2503,7 @@ class FunctionAnalyzer:
 
         try:
             op = out.getDef()
-            if op and op.getOpcode() == PcodeOp.SUBPIECE:
+            if op and PcodeOp and op.getOpcode() == PcodeOp.SUBPIECE:
                 byte_offset = inputs[1].getOffset() if len(inputs) > 1 else 0
                 bit_shift = byte_offset * 8
 
@@ -2472,12 +2515,60 @@ class FunctionAnalyzer:
                 val.definitely_used_bits = _shift_bits(src.definitely_used_bits)
                 val.maybe_used_bits = _shift_bits(src.maybe_used_bits)
 
+                shifted_known = src.known_bits.shift_right(bit_shift)
+                mask = (1 << val.bit_width) - 1 if val.bit_width else 0
+                val.known_bits = KnownBits(val.bit_width, shifted_known.known_zeros & mask, shifted_known.known_ones & mask)
+
+                if src.range_min is not None:
+                    val.range_min = max(0, src.range_min >> bit_shift)
+                if src.range_max is not None:
+                    val.range_max = src.range_max >> bit_shift if src.range_max is not None else None
+
                 if bit_shift != 0:
                     val.pointer_targets = set()
                     val.pointer_patterns = []
-                    val.known_bits = KnownBits.top(val.bit_width)
         except Exception:
             pass
+        self._set_val(out, val, states)
+
+    def _handle_piece(self, out, inputs, states):
+        if out is None or len(inputs) < 2:
+            return
+        val = AbstractValue(bit_width=out.getSize() * 8)
+        mask = (1 << val.bit_width) - 1 if val.bit_width else 0
+        combined_zeros = 0
+        combined_ones = 0
+        used_bits: Set[int] = set()
+        maybe_bits: Set[int] = set()
+        origins: Set[str] = set()
+        control_taints: Set[str] = set()
+        slot_sources: Set[Tuple[str, int]] = set()
+        offset = 0
+        for vn in reversed(inputs):  # PIECE uses most significant first
+            src = self._get_val(vn, states)
+            origins |= set(src.origins)
+            control_taints |= set(src.control_taints)
+            slot_sources |= set(src.slot_sources)
+            shifted_def = {b + offset for b in _definitely_bits(src) if (b + offset) < val.bit_width}
+            shifted_maybe = {b + offset for b in _maybe_bits(src) if (b + offset) < val.bit_width}
+            used_bits |= shifted_def
+            maybe_bits |= shifted_maybe | shifted_def
+            combined_zeros |= (src.known_bits.known_zeros << offset) & mask
+            combined_ones |= (src.known_bits.known_ones << offset) & mask
+            offset += max(0, vn.getSize() * 8)
+
+        val.tainted = bool(origins or control_taints)
+        val.origins = origins
+        val.control_taints = control_taints
+        val.slot_sources = slot_sources
+        val.definitely_used_bits = used_bits
+        val.maybe_used_bits = maybe_bits | used_bits
+        val.candidate_bits = set(val.maybe_used_bits)
+        val.used_bits = set(val.definitely_used_bits)
+        val.known_bits = KnownBits(val.bit_width, combined_zeros & mask, combined_ones & mask)
+        val.pointer_patterns = []
+        val.pointer_targets = set()
+        val.mask_history = []
         self._set_val(out, val, states)
 
     def _handle_addsub(self, out, inputs, states, opname):
@@ -2488,6 +2579,7 @@ class FunctionAnalyzer:
         val = AbstractValue()
         val.tainted = a.tainted or b.tainted
         val.origins = set(a.origins | b.origins)
+        val.control_taints = set(a.control_taints | b.control_taints)
         val.slot_sources = set(a.slot_sources | b.slot_sources)
         val.bit_width = out.getSize() * 8
         if opname == "INT_OR":
@@ -2553,6 +2645,26 @@ class FunctionAnalyzer:
                 val.pointer_targets = {p + (adj if opname == "INT_ADD" else -adj) for p in b.pointer_targets}
         self._set_val(out, val, states)
 
+    def _handle_float(self, out, inputs, states, opname):
+        if out is None or not inputs:
+            return
+        operands = [self._get_val(inp, states) for inp in inputs if inp is not None]
+        if not operands:
+            return
+        val = operands[0].clone()
+        for extra in operands[1:]:
+            val = val.merge(extra)
+        val.bit_width = out.getSize() * 8
+        val.known_bits = KnownBits.top(val.bit_width)
+        val.pointer_patterns = []
+        val.pointer_targets = set()
+        val.function_pointer_labels = set()
+        val.mask_history = []
+        if opname in {"FLOAT_NEG", "FLOAT_ABS"}:
+            val.definitely_used_bits |= set(range(val.bit_width))
+            val.maybe_used_bits |= set(range(val.bit_width))
+        self._set_val(out, val, states)
+
     def _handle_multdiv(self, out, inputs, states):
         if out is None or len(inputs) < 2:
             return
@@ -2561,6 +2673,7 @@ class FunctionAnalyzer:
         val = AbstractValue()
         val.tainted = a.tainted or b.tainted
         val.origins = set(a.origins | b.origins)
+        val.control_taints = set(a.control_taints | b.control_taints)
         val.slot_sources = set(a.slot_sources | b.slot_sources)
         val.bit_width = out.getSize() * 8
         val.definitely_used_bits = _definitely_bits(a) | _definitely_bits(b)
@@ -2582,6 +2695,7 @@ class FunctionAnalyzer:
         val = AbstractValue()
         val.tainted = a.tainted or b.tainted
         val.origins = set(a.origins | b.origins)
+        val.control_taints = set(a.control_taints | b.control_taints)
         val.slot_sources = set(a.slot_sources | b.slot_sources)
         val.bit_width = out.getSize() * 8
         val.definitely_used_bits = _definitely_bits(a) | _definitely_bits(b)
@@ -2650,6 +2764,7 @@ class FunctionAnalyzer:
         val = AbstractValue()
         val.tainted = base.tainted or self._get_val(amt, states).tainted
         val.origins = set(base.origins | self._get_val(amt, states).origins)
+        val.control_taints = set(base.control_taints | self._get_val(amt, states).control_taints)
         val.slot_sources = set(base.slot_sources | self._get_val(amt, states).slot_sources)
         val.bit_width = out.getSize() * 8
         val.known_bits = KnownBits.top(val.bit_width)
@@ -2702,6 +2817,7 @@ class FunctionAnalyzer:
         val = AbstractValue(bit_width=out.getSize() * 8)
         val.tainted = a.tainted or b.tainted
         val.origins = set(a.origins | b.origins)
+        val.control_taints = set(a.control_taints | b.control_taints)
         val.slot_sources = set(a.slot_sources | b.slot_sources)
         def_bits_a = _definitely_bits(a)
         def_bits_b = _definitely_bits(b)
@@ -2803,7 +2919,9 @@ class FunctionAnalyzer:
                     loaded = True
                 else:
                     val = val.merge(slot_val)
-        
+
+        val.control_taints |= set(addr_val.control_taints)
+
         # Enable constant propagation from read-only memory (e.g., IAT, .rdata)
         # to resolve indirect calls.
         # Allow 32-bit (4 bytes) or 64-bit (8 bytes) loads
@@ -2892,9 +3010,10 @@ class FunctionAnalyzer:
             new_slot_val = src_val.clone()
             new_slot_val.slot_sources.add(key)
 
-            if addr_val.tainted:
+            if addr_val.tainted or addr_val.origins or addr_val.control_taints:
                 new_slot_val.tainted = True
                 new_slot_val.origins |= addr_val.origins
+                new_slot_val.control_taints |= addr_val.control_taints
 
             existing_slot = updated_slots.get(key)
             is_must_write = bool(
@@ -2904,10 +3023,12 @@ class FunctionAnalyzer:
                 and pattern.index_var is None
             )
 
+            base_storage = classify_storage(pattern.base_id)
+            local_stack_overwrite = is_must_write and base_storage == "stack"
+
             strong_update = (
                 is_must_write
-                and not new_slot_val.tainted
-                and not new_slot_val.origins
+                and (local_stack_overwrite or (not new_slot_val.tainted and not new_slot_val.origins))
                 and not is_ambiguous
             )
             merged_slot_val = new_slot_val
@@ -2945,6 +3066,7 @@ class FunctionAnalyzer:
                 "base_id": slot.base_id,
                 "offset": slot.offset,
                 "origins": sorted(slot.value.origins),
+                "control_taints": sorted(slot.value.control_taints),
             })
 
             old_value = existing_slot.value if existing_slot else None
@@ -3013,11 +3135,11 @@ class FunctionAnalyzer:
         if opname != "CBRANCH" or not inputs:
             return
         cond_val = self._get_val(inputs[0], states)
-        if self.mode == "taint" and not cond_val.origins:
+        if self.mode == "taint" and not cond_val.origins and not cond_val.control_taints:
             log_trace(f"[trace] skipping untainted branch at {inst.getAddress()}")
             return
-        if cond_val.tainted or cond_val.origins:
-            states.control_taints |= set(cond_val.origins)
+        if cond_val.tainted or cond_val.origins or cond_val.control_taints:
+            states.control_taints |= set(cond_val.origins | cond_val.control_taints)
         branch_detail = {"type": "branch"}
         used_bits = set(_definitely_bits(cond_val))
         maybe_bits = set(_maybe_bits(cond_val))
@@ -3048,14 +3170,19 @@ class FunctionAnalyzer:
             self.global_state.analysis_stats["bit_precision_degraded"] = True
         if cond_val.compare_details:
             branch_detail.update(cond_val.compare_details)
-        if cond_val.origins or cond_val.slot_sources:
-            summary.uses_registry = summary.uses_registry or bool(cond_val.origins)
+        if cond_val.origins:
+            branch_detail["data_taints"] = sorted(cond_val.origins)
+        if cond_val.control_taints:
+            branch_detail["control_taints"] = sorted(cond_val.control_taints)
+        if cond_val.origins or cond_val.slot_sources or cond_val.control_taints:
+            summary.uses_registry = summary.uses_registry or bool(cond_val.origins or cond_val.control_taints)
         decision = Decision(
             address=str(inst.getAddress()),
             mnemonic=inst.getMnemonicString(),
             disasm=inst.toString(),
             origins=set(cond_val.origins),
             used_bits=set(used_bits),
+            control_taints=set(cond_val.control_taints),
             details=branch_detail,
         )
         decision.details["branch_kind"] = "conditional"
@@ -3329,17 +3456,29 @@ class FunctionAnalyzer:
                     slot_val = self.global_state.struct_slots.get(key)
                     if slot_val:
                         slot_val.value.origins |= set(slot.get("origins", []))
+                        slot_val.value.control_taints |= set(slot.get("control_taints", []))
                         for origin in slot_val.value.origins:
+                            self.global_state.root_slot_index[origin].add(key)
+                        for origin in slot_val.value.control_taints:
                             self.global_state.root_slot_index[origin].add(key)
                     else:
                         origins = set(slot.get("origins", []))
+                        control_taints = set(slot.get("control_taints", []))
                         if key[0] is not None and key[1] is not None:
                             self.global_state.struct_slots[key] = StructSlot(
-                                key[0], key[1], value=AbstractValue(origins=origins, tainted=bool(origins))
+                                key[0],
+                                key[1],
+                                value=AbstractValue(
+                                    origins=origins,
+                                    control_taints=control_taints,
+                                    tainted=bool(origins or control_taints),
+                                ),
                             )
                             for origin in origins:
                                 self.global_state.root_slot_index[origin].add(key)
-                    if slot.get("origins"):
+                            for origin in control_taints:
+                                self.global_state.root_slot_index[origin].add(key)
+                    if slot.get("origins") or slot.get("control_taints"):
                         summary.uses_registry = True
                 if callee_summary.registry_decision_roots:
                     summary.uses_registry = True
@@ -3483,7 +3622,7 @@ class FunctionAnalyzer:
         if ret_varnode is None:
             ret_varnode = inputs[-1]
         ret_val = self._get_val(ret_varnode, states)
-        summary.return_influence |= set(ret_val.origins)
+        summary.return_influence |= set(ret_val.origins | ret_val.control_taints)
 
     def _handle_unknown(self, out, inputs, states):
         if out is None:
@@ -3509,7 +3648,7 @@ class FunctionAnalyzer:
 
     def _finalize_summary_from_slots(self, summary: FunctionSummary) -> None:
         existing = self.global_state.function_summaries.get(summary.name)
-        if any(slot.get("origins") for slot in summary.slot_writes):
+        if any(slot.get("origins") or slot.get("control_taints") for slot in summary.slot_writes):
             summary.uses_registry = True
         if existing:
             summary.merge_from(existing)
