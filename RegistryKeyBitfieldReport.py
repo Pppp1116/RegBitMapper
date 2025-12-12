@@ -41,6 +41,84 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+
+@dataclass(frozen=True)
+class KnownBits:
+    """Tracks which bits are definitively zero/one for an abstract value."""
+
+    bit_width: int
+    known_zeros: int = 0
+    known_ones: int = 0
+
+    @staticmethod
+    def top(width: int) -> "KnownBits":
+        return KnownBits(width, 0, 0)
+
+    @staticmethod
+    def from_constant(width: int, value: int) -> "KnownBits":
+        mask = (1 << width) - 1
+        clean = value & mask
+        return KnownBits(width, (~clean) & mask, clean)
+
+    def _ensure_width(self, other: "KnownBits") -> int:
+        return max(self.bit_width, other.bit_width)
+
+    def merge(self, other: "KnownBits") -> "KnownBits":
+        width = self._ensure_width(other)
+        mask = (1 << width) - 1
+        zeros = self.known_zeros & other.known_zeros & mask
+        ones = self.known_ones & other.known_ones & mask
+        return KnownBits(width, zeros, ones)
+
+    def and_bits(self, other: "KnownBits") -> "KnownBits":
+        width = self._ensure_width(other)
+        mask = (1 << width) - 1
+        zeros = (self.known_zeros | other.known_zeros | (self.known_ones & other.known_zeros)) & mask
+        ones = (self.known_ones & other.known_ones) & mask
+        return KnownBits(width, zeros, ones)
+
+    def or_bits(self, other: "KnownBits") -> "KnownBits":
+        width = self._ensure_width(other)
+        mask = (1 << width) - 1
+        ones = (self.known_ones | other.known_ones | (self.known_zeros & other.known_ones)) & mask
+        zeros = (self.known_zeros & other.known_zeros) & mask
+        return KnownBits(width, zeros, ones)
+
+    def xor_bits(self, other: "KnownBits") -> "KnownBits":
+        width = self._ensure_width(other)
+        mask = (1 << width) - 1
+        ones = ((self.known_ones & ~other.known_ones) | (~self.known_ones & other.known_ones)) & mask
+        zeros = (self.known_zeros & other.known_zeros) & mask
+        return KnownBits(width, zeros, ones)
+
+    def add_bits(self, other: "KnownBits") -> "KnownBits":
+        width = self._ensure_width(other)
+        mask = (1 << width) - 1
+        ones = self.known_ones | other.known_ones
+        zeros = self.known_zeros | other.known_zeros
+        carry_top = mask ^ (ones | zeros)
+        zeros &= ~carry_top
+        ones &= ~carry_top
+        return KnownBits(width, zeros & mask, ones & mask)
+
+    def shift_left(self, amount: int) -> "KnownBits":
+        if amount <= 0:
+            return self
+        width = self.bit_width
+        mask = (1 << width) - 1
+        zeros = ((self.known_zeros << amount) | ((1 << amount) - 1)) & mask
+        ones = (self.known_ones << amount) & mask
+        return KnownBits(width, zeros, ones)
+
+    def shift_right(self, amount: int) -> "KnownBits":
+        if amount <= 0:
+            return self
+        width = self.bit_width
+        mask = (1 << width) - 1
+        zeros = (self.known_zeros >> amount) | (((1 << amount) - 1) << (width - amount))
+        ones = (self.known_ones >> amount) & mask
+        return KnownBits(width, zeros & mask, ones & mask)
+
 _JAVA_UNSAFE_SUPPRESS_FLAG = "-Dorg.apache.felix.framework.debug=false"
 _existing_java_opts = os.environ.get("JAVA_TOOL_OPTIONS", "")
 if _JAVA_UNSAFE_SUPPRESS_FLAG not in _existing_java_opts:
@@ -340,6 +418,7 @@ class AbstractValue:
     # --- Data Tracking ---
     origins: Set[str] = field(default_factory=set)
     bit_width: int = 32
+    known_bits: KnownBits = field(default_factory=lambda: KnownBits.top(DEFAULT_POINTER_BIT_WIDTH))
     
     # --- Bitfield Tracking ---
     used_bits: Set[int] = field(default_factory=set)
@@ -366,6 +445,7 @@ class AbstractValue:
             is_bottom=self.is_bottom,
             origins=set(self.origins),
             bit_width=self.bit_width,
+            known_bits=KnownBits(self.known_bits.bit_width, self.known_bits.known_zeros, self.known_bits.known_ones),
             used_bits=set(self.used_bits),
             candidate_bits=set(self.candidate_bits),
             definitely_used_bits=set(self.definitely_used_bits),
@@ -396,6 +476,7 @@ class AbstractValue:
         self.used_bits |= full_set
         self.definitely_used_bits |= full_set
         self.maybe_used_bits |= full_set
+        self.known_bits = KnownBits.top(self.bit_width)
         if degraded:
             self.bit_usage_degraded = True
 
@@ -418,6 +499,7 @@ class AbstractValue:
         self.is_top = True
         self.is_bottom = False
         self.mark_all_bits_used(degraded=True)
+        self.known_bits = KnownBits.top(self.bit_width)
         self.pointer_targets.clear()
         self.mask_history.clear()
         self.function_pointer_labels.clear()
@@ -445,6 +527,7 @@ class AbstractValue:
         merged.tainted = self.tainted or other.tainted
         merged.origins = self.origins | other.origins
         merged.bit_width = max(self.bit_width, other.bit_width)
+        merged.known_bits = self.known_bits.merge(other.known_bits)
         
         # Merge Bitfields (Union)
         merged.used_bits = self.used_bits | other.used_bits
@@ -599,7 +682,7 @@ class GlobalState:
     roots: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     struct_slots: Dict[Tuple[str, int], StructSlot] = field(default_factory=dict)
     decisions: List[Decision] = field(default_factory=list)
-    function_summaries: Dict[str, FunctionSummary] = field(default_factory=dict)
+    function_summaries: Dict[Tuple[str, str], FunctionSummary] = field(default_factory=dict)
     analysis_stats: Dict[str, Any] = field(default_factory=dict)
     overrides: List[Dict[str, Any]] = field(default_factory=list)
     registry_strings: Dict[str, Dict[str, Any]] = field(default_factory=dict)
@@ -796,7 +879,12 @@ def new_value_from_varnode(vn) -> AbstractValue:
     width = vn.getSize() * 8 if vn else DEFAULT_POINTER_BIT_WIDTH
     if not width:
         width = DEFAULT_POINTER_BIT_WIDTH
-    val = AbstractValue(bit_width=width)
+    known = KnownBits.top(width)
+    if vn and vn.isConstant():
+        off = vn_get_offset(vn)
+        if off is not None:
+            known = KnownBits.from_constant(width, off)
+    val = AbstractValue(bit_width=width, known_bits=known)
     val.is_bottom = False
     if vn and vn.isConstant():
         val.tainted = False
@@ -1300,6 +1388,9 @@ class FunctionAnalyzer:
         self._registry_string_usage_cache: Dict[str, bool] = {}
         self._functions_with_registry_calls: Set[str] = set()
 
+    def _summaries_for(self, func_name: str) -> List[FunctionSummary]:
+        return [s for (name, _ctx), s in self.global_state.function_summaries.items() if name == func_name]
+
     def _get_function_for_inst(self, inst: Instruction):
         try:
             fm = self.program.getFunctionManager()
@@ -1316,9 +1407,9 @@ class FunctionAnalyzer:
         try:
             if func.getName() in self._functions_with_registry_calls:
                 return True
-            summary = self.global_state.function_summaries.get(func.getName())
-            if summary and summary.uses_registry:
-                return True
+            for summary in self._summaries_for(func.getName()):
+                if summary.uses_registry:
+                    return True
         except Exception:
             return False
 
@@ -1826,13 +1917,14 @@ class FunctionAnalyzer:
             return None
         return None
 
-    def _func_key(self, func) -> str:
+    def _func_key(self, func, ctx: str = "root") -> str:
+        base = func.getName()
         if hasattr(func, "getEntryPoint"):
             try:
-                return str(func.getEntryPoint())
+                base = f"{base}@{func.getEntryPoint()}"
             except Exception:
                 pass
-        return func.getName()
+        return f"{base}::{ctx}"
 
     def analyze_all(self) -> None:
         """Global fixed-point over function summaries.
@@ -1846,7 +1938,7 @@ class FunctionAnalyzer:
         queued: Set[str] = set()
         for func in fm.getFunctions(True):
             key = self._func_key(func)
-            worklist.append((func, 0))
+            worklist.append((func, 0, "root"))
             queued.add(key)
         iteration_guard = 0
         while worklist and iteration_guard < self.max_function_iterations:
@@ -1857,32 +1949,34 @@ class FunctionAnalyzer:
                     break
             except Exception:
                 pass
-            func, depth = worklist.popleft()
-            func_key = self._func_key(func)
+            func, depth, call_ctx = worklist.popleft()
+            func_key = self._func_key(func, call_ctx)
             queued.discard(func_key)
             iteration_guard += 1
             if self.max_call_depth is not None and depth > self.max_call_depth:
                 self.global_state.analysis_stats["call_depth_limit"] = True
                 continue
-            summary = self.analyze_function(func)
+            summary = self.analyze_function(func, call_ctx)
             self.global_state.analysis_stats["functions_analyzed"] = self.global_state.analysis_stats.get(
                 "functions_analyzed", 0
             ) + 1
-            existing = self.global_state.function_summaries.get(func.getName())
+            existing = self.global_state.function_summaries.get((func.getName(), call_ctx))
             if existing is None:
-                self.global_state.function_summaries[func.getName()] = summary
+                self.global_state.function_summaries[(func.getName(), call_ctx)] = summary
                 for callee in func.getCalledFunctions(self.monitor):
-                    callee_key = self._func_key(callee)
+                    callee_ctx = f"{call_ctx}@{func.getEntryPoint()}"
+                    callee_key = self._func_key(callee, callee_ctx)
                     if callee_key not in queued:
                         queued.add(callee_key)
-                        worklist.append((callee, depth + 1))
+                        worklist.append((callee, depth + 1, callee_ctx))
             else:
                 if existing.merge_from(summary):
                     for callee in func.getCalledFunctions(self.monitor):
-                        callee_key = self._func_key(callee)
+                        callee_ctx = f"{call_ctx}@{func.getEntryPoint()}"
+                        callee_key = self._func_key(callee, callee_ctx)
                         if callee_key not in queued:
                             queued.add(callee_key)
-                            worklist.append((callee, depth + 1))
+                            worklist.append((callee, depth + 1, callee_ctx))
         if iteration_guard >= self.max_function_iterations:
             log_debug("[warn] function iteration limit hit")
             self.global_state.analysis_stats["function_iterations_limit"] = True
@@ -1891,8 +1985,8 @@ class FunctionAnalyzer:
     # Function level fixed-point over basic blocks
     # ------------------------------------------------------------------
 
-    def analyze_function(self, func) -> FunctionSummary:
-        log_trace(f"[trace] analyzing function {func.getName()} at {func.getEntryPoint()}")
+    def analyze_function(self, func, call_context: str = "root") -> FunctionSummary:
+        log_trace(f"[trace] analyzing function {func.getName()} at {func.getEntryPoint()} ctx={call_context}")
         summary = FunctionSummary(func.getName(), str(func.getEntryPoint()))
         body = func.getBody()
         listing = self.program.getListing()
@@ -2125,6 +2219,7 @@ class FunctionAnalyzer:
         src = self._get_val(inputs[0], states)
         val = src.clone()
         val.bit_width = out.getSize() * 8
+        val.known_bits = KnownBits(val.bit_width, val.known_bits.known_zeros, val.known_bits.known_ones)
 
         try:
             op = out.getDef()
@@ -2143,6 +2238,7 @@ class FunctionAnalyzer:
                 if bit_shift != 0:
                     val.pointer_targets = set()
                     val.pointer_pattern = None
+                    val.known_bits = KnownBits.top(val.bit_width)
         except Exception:
             pass
         self._set_val(out, val, states)
@@ -2157,6 +2253,13 @@ class FunctionAnalyzer:
         val.origins = set(a.origins | b.origins)
         val.slot_sources = set(a.slot_sources | b.slot_sources)
         val.bit_width = out.getSize() * 8
+        if opname == "INT_OR":
+            val.known_bits = a.known_bits.or_bits(b.known_bits)
+        else:
+            val.known_bits = a.known_bits.xor_bits(b.known_bits)
+        val.known_bits = a.known_bits.and_bits(b.known_bits)
+        val.known_bits = KnownBits.top(val.bit_width)
+        val.known_bits = a.known_bits.add_bits(b.known_bits)
         val.definitely_used_bits = _definitely_bits(a) | _definitely_bits(b)
         base_maybe = _maybe_bits(a) | _maybe_bits(b) | set(val.definitely_used_bits)
         lowest_candidate = None
@@ -2295,6 +2398,7 @@ class FunctionAnalyzer:
         val.origins = set(base.origins | self._get_val(amt, states).origins)
         val.slot_sources = set(base.slot_sources | self._get_val(amt, states).slot_sources)
         val.bit_width = out.getSize() * 8
+        val.known_bits = KnownBits.top(val.bit_width)
         val.pointer_targets = set(base.pointer_targets)
         val.mask_history = list(base.mask_history)
         val.forbidden_bits = set(base.forbidden_bits)
@@ -2322,6 +2426,11 @@ class FunctionAnalyzer:
                     shifted_maybe.add(min(val.bit_width - 1, b + shift))
                 else:
                     shifted_maybe.add(max(0, b - shift))
+            if shift is not None:
+                if opname == "INT_LEFT":
+                    val.known_bits = base.known_bits.shift_left(shift)
+                else:
+                    val.known_bits = base.known_bits.shift_right(shift)
             val.definitely_used_bits = shifted_def
             val.maybe_used_bits = shifted_maybe | shifted_def
             val.used_bits = set(val.definitely_used_bits)
