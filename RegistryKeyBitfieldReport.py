@@ -259,6 +259,7 @@ def parse_args(raw_args: List[str], context_hint: str) -> Dict[str, Any]:
             parsed.pop("registry_scan_limit", None)
     parsed.setdefault("max_steps", 10000)
     parsed.setdefault("max_call_depth", 20)
+    parsed.setdefault("registry_scan_limit", DEFAULT_REGISTRY_STRING_SCAN_LIMIT)
     parsed["enable_string_seeds"] = _parse_bool(parsed.get("enable_string_seeds", "true"))
     parsed["enable_indirect_roots"] = _parse_bool(parsed.get("enable_indirect_roots", "true"))
     parsed["enable_synthetic_full_root"] = _parse_bool(parsed.get("enable_synthetic_full_root", "true"))
@@ -1831,54 +1832,96 @@ def _decode_registry_string_from_memory(
     return None
 
 
+DEFAULT_REGISTRY_STRING_SCAN_LIMIT = 128
+
+
 def collect_registry_string_candidates(program, scan_limit: Optional[int] = None) -> Dict[str, Dict[str, Any]]:
-    listing = program.getListing()
-    candidates: Dict[str, Dict[str, Any]] = {}
-    if scan_limit == 0:
+    """Collect registry-like string constants only from registry API callsites."""
+
+    if program is None:
         return {}
-    max_scan = scan_limit
-    scanned = 0
+
+    max_candidates = DEFAULT_REGISTRY_STRING_SCAN_LIMIT if scan_limit is None else scan_limit
+    if max_candidates is None or max_candidates <= 0:
+        return {}
+
+    listing = program.getListing()
+    ref_mgr = getattr(program, "getReferenceManager", lambda: None)()
     monitor = ACTIVE_MONITOR or DUMMY_MONITOR
-    for data in listing.getDefinedData(True):
+    candidates: Dict[str, Dict[str, Any]] = {}
+
+    try:
+        inst_iter = listing.getInstructions(True)
+    except Exception:
+        return {}
+
+    for inst in inst_iter:
         try:
             if monitor and hasattr(monitor, "isCancelled") and monitor.isCancelled():
                 log_debug("[debug] registry string scan cancelled by user")
                 break
         except Exception:
             pass
-        scanned += 1
-        if max_scan is not None and scanned > max_scan:
-            log_debug("[debug] registry string candidate scan capped for performance")
-            break
+
         try:
-            sval: Optional[str] = None
+            callee_name, _ = resolve_call_api_name(inst, program)
+        except Exception:
+            callee_name = None
+
+        if not is_registry_api(callee_name):
+            continue
+
+        try:
+            refs = list(ref_mgr.getReferencesFrom(inst.getAddress())) if ref_mgr else []
+        except Exception:
+            refs = []
+
+        for ref in refs:
+            try:
+                to_addr = ref.getToAddress()
+            except Exception:
+                to_addr = None
+            if to_addr is None:
+                continue
+
+            addr_str = str(to_addr)
+            if addr_str in candidates:
+                continue
+
             meta: Optional[Dict[str, Any]] = None
-            if data.hasStringValue():
+            try:
+                data = listing.getDataContaining(to_addr)
+            except Exception:
+                data = None
+            if data and data.hasStringValue():
                 try:
                     val_obj = data.getValue()
                     sval = val_obj.getString() if hasattr(val_obj, "getString") else str(val_obj)
                     if sval is not None:
                         meta = parse_registry_string(sval)
-                except Exception:
-                    sval = None
-            if sval is None and meta is None:
-                meta = _decode_registry_string_from_memory(
-                    program,
-                    data.getAddress(),
-                    max_len=max(16, data.getLength()),
-                    strip_leading_nulls=False,
-                    stop_after_first=True,
-                )
-            if meta:
-                candidates[str(data.getAddress())] = meta
-        except Exception as e:
-            if DEBUG_ENABLED:
+                except Exception as e:
+                    if DEBUG_ENABLED:
+                        log_debug(f"[debug] error resolving string value at {addr_str}: {e!r}")
+
+            if meta is None:
                 try:
-                    addr_str = str(data.getAddress())
-                except Exception:
-                    addr_str = "<unknown>"
-                log_debug(f"[debug] error in collect_registry_string_candidates at {addr_str}: {e!r}")
-            continue
+                    meta = _decode_registry_string_from_memory(
+                        program,
+                        to_addr,
+                        max_len=64,
+                        strip_leading_nulls=False,
+                        stop_after_first=True,
+                    )
+                except Exception as e:
+                    if DEBUG_ENABLED:
+                        log_debug(f"[debug] error decoding registry string at {addr_str}: {e!r}")
+
+            if meta:
+                candidates[addr_str] = meta
+                if len(candidates) >= max_candidates:
+                    log_debug("[debug] registry string candidate scan capped for performance")
+                    return candidates
+
     return candidates
 
 
@@ -4944,7 +4987,7 @@ def main():
     global_state = GlobalState()
     # ensure call_depth_limit is explicitly initialized (future use)
     global_state.analysis_stats["call_depth_limit"] = False
-    scan_limit = args.get("registry_scan_limit")
+    scan_limit = args.get("registry_scan_limit", DEFAULT_REGISTRY_STRING_SCAN_LIMIT)
     if scan_limit is not None and scan_limit < 0:
         log_debug("[debug] registry_scan_limit negative; disabling pre-scan")
         scan_limit = 0
