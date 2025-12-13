@@ -16,6 +16,7 @@ Arguments (key=value):
   mode  : "taint" (registry/config seeded) or "full" (analyze all flows with synthetic fallback).
   debug : verbose summaries (true/false/1/0/yes/no/on/off).
   trace : per-step traces (true/false/1/0/yes/no/on/off).
+  out   : optional path to write NDJSON output (UTF-8) in addition to stdout.
 
 Assembly is authoritative for addresses/mnemonics/disassembly. P-code is used
 as the internal IR for semantics and dataflow. The analysis runs in two modes:
@@ -275,6 +276,8 @@ def parse_args(raw_args: List[str], context_hint: str) -> Dict[str, Any]:
     parsed["enable_string_seeds"] = _parse_bool(parsed.get("enable_string_seeds", "true"))
     parsed["enable_indirect_roots"] = _parse_bool(parsed.get("enable_indirect_roots", "true"))
     parsed["enable_synthetic_full_root"] = _parse_bool(parsed.get("enable_synthetic_full_root", "true"))
+    if "out" in parsed:
+        parsed["out"] = parsed.get("out")
     return parsed
 
 
@@ -2100,10 +2103,20 @@ class FunctionAnalyzer:
 
     def _follow_thunk(self, func):
         try:
-            if func and getattr(func, "isThunk", lambda: False)():
-                thunk_target = getattr(func, "getThunkedFunction", lambda: None)()
-                if thunk_target:
-                    return thunk_target
+            if func:
+                name = getattr(func, "getName", lambda: "")() or ""
+                if getattr(func, "isThunk", lambda: False)() or name.lower().startswith("thunk_"):
+                    try:
+                        thunk_target = func.getThunkedFunction(True)
+                    except Exception:
+                        thunk_target = None
+                    if thunk_target is None:
+                        try:
+                            thunk_target = func.getThunkedFunction(False)
+                        except Exception:
+                            thunk_target = None
+                    if thunk_target:
+                        return thunk_target
             # Manual thunk resolution: some headless analyses never promote IAT
             # jump stubs to real thunk functions, so inspect the first
             # instruction for a direct/indirect jump to an external target.
@@ -2149,21 +2162,55 @@ class FunctionAnalyzer:
     def _resolve_import_from_pointer(self, ptr_addr) -> Optional[str]:
         if ptr_addr is None:
             return None
-        pointee = self._read_pointer_value(ptr_addr)
-        if pointee is None:
-            return None
-        mapped = IMPORTED_REGISTRY_API_ADDRS.get(pointee) or IMPORTED_REGISTRY_API_ADDRS.get(str(pointee))
-        if mapped:
-            return mapped
         try:
-            target_addr = self.api.toAddr(pointee)
+            symtab = getattr(self.program, "getSymbolTable", lambda: None)()
+            sym = symtab.getPrimarySymbol(ptr_addr) if symtab else None
+            sym_name = sym.getName() if sym else None
         except Exception:
-            target_addr = None
-        if target_addr:
-            mapped = IMPORTED_REGISTRY_API_ADDRS.get(str(target_addr))
-            if mapped:
-                return mapped
-            return self._external_label_for_address(target_addr)
+            sym_name = None
+
+        if sym_name:
+            m = re.match(r"(?i)(__imp__?|imp_|PTR_)(.+)", sym_name)
+            if m:
+                suffix = m.group(2)
+                normalized = normalize_registry_label(suffix) or suffix
+                return normalized
+
+        try:
+            ref_mgr = getattr(self.program, "getReferenceManager", lambda: None)()
+            refs_from = list(ref_mgr.getReferencesFrom(ptr_addr)) if ref_mgr else []
+        except Exception:
+            refs_from = []
+
+        fm = getattr(self.program, "getFunctionManager", lambda: None)()
+        for ref in refs_from:
+            try:
+                to_addr = ref.getToAddress()
+            except Exception:
+                to_addr = None
+            if to_addr is None:
+                continue
+            try:
+                space = to_addr.getAddressSpace()
+                if space and str(space).upper().startswith("EXTERNAL"):
+                    label = self._external_label_for_address(to_addr)
+                    if label:
+                        return normalize_registry_label(label) or label
+            except Exception:
+                pass
+            try:
+                func = fm.getFunctionAt(to_addr) if fm else None
+            except Exception:
+                func = None
+            func = self._follow_thunk(func)
+            if func:
+                try:
+                    name = func.getName()
+                except Exception:
+                    name = None
+                if name:
+                    normalized = normalize_registry_label(name) or name
+                    return normalized
         return None
 
     def _find_hkey_meta(self, call_args: List["Varnode"], states: AnalysisState) -> Optional[Dict[str, str]]:
@@ -2327,7 +2374,7 @@ class FunctionAnalyzer:
         for idx in sorted(handle_indices):
             _taint_arg(idx, taint_memory=True)
 
-    def _resolve_callee_from_refs(self, inst: Instruction, refs_list) -> Tuple[Optional[str], Optional[Any]]:
+    def _resolve_callee_from_refs(self, inst: Instruction, refs_list) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
         fm = self.program.getFunctionManager()
         for r in refs_list:
             try:
@@ -2336,14 +2383,14 @@ class FunctionAnalyzer:
                     continue
                 f = self._follow_thunk(fm.getFunctionAt(to_addr))
                 if f is not None:
-                    return f.getName(), f
+                    return f.getName(), f, "ref"
                 external_label = self._external_label_for_address(to_addr)
                 if external_label:
-                    return external_label, fm.getFunctionAt(to_addr)
+                    return external_label, fm.getFunctionAt(to_addr), "ref"
             except Exception as e:
                 if DEBUG_ENABLED:
                     log_debug(f"[debug] error resolving call reference at {inst.getAddress()}: {e!r}")
-        return None, None
+        return None, None, None
 
     def _resolve_callee_from_external_refs(self, inst: Instruction, refs_list) -> Optional[str]:
         for r in refs_list:
@@ -3868,9 +3915,11 @@ class FunctionAnalyzer:
 
         callee_name = None
         callee_func = None
+        resolution_method: Optional[str] = None
         resolved_name, resolved_func = resolve_call_api_name(inst, self.program)
         if resolved_name:
             callee_name = resolved_name
+            resolution_method = "direct"
         if resolved_func:
             callee_func = resolved_func
 
@@ -4021,13 +4070,16 @@ class FunctionAnalyzer:
             refs = []
 
         if callee_name is None:
-            callee_name, callee_func = self._resolve_callee_from_refs(inst, refs)
+            callee_name, callee_func, res_method = self._resolve_callee_from_refs(inst, refs)
+            resolution_method = resolution_method or res_method
         if callee_name is None:
             callee_name = self._resolve_callee_from_external_refs(inst, refs)
+            resolution_method = resolution_method or ("external_ref" if callee_name else None)
         if callee_name is None and inputs:
             alt_name, alt_func = self._resolve_callee_from_pcode_target(inputs[0], states)
             callee_name = alt_name
             callee_func = callee_func or alt_func
+            resolution_method = resolution_method or ("pcode_target" if callee_name else None)
         if callee_name is None:
             try:
                 ref_mgr = self.program.getReferenceManager()
@@ -4052,6 +4104,8 @@ class FunctionAnalyzer:
                             callee_func = callee_func or self._follow_thunk(fm.getFunctionAt(to_addr))
                         except Exception:
                             pass
+                        if resolution_method is None:
+                            resolution_method = "pointer-symbol"
                         if DEBUG_ENABLED:
                             log_debug(
                                 f"[debug] fallback resolved registry callee from EXTERNAL import: {callee_name} at {inst.getAddress()}"
@@ -4075,14 +4129,25 @@ class FunctionAnalyzer:
             manual = self._resolve_import_from_pointer(ptr_addr) if ptr_addr is not None else None
             if manual:
                 callee_name = manual
+                resolution_method = resolution_method or "pointer-symbol"
 
         if DEBUG_ENABLED:
             if callee_name or detected_hkey_meta or string_args:
                 log_debug(
                     f"[debug] call/jump at {inst.getAddress()} opname={opcode_name(op)} "
-                    f"callee_name={callee_name!r} strings={len(string_args)} hkey={bool(detected_hkey_meta)}"
+                    f"callee_name={callee_name!r} strings={len(string_args)} hkey={bool(detected_hkey_meta)} "
+                    f"resolution={resolution_method}"
                 )
-        
+
+        if callee_func:
+            followed_func = self._follow_thunk(callee_func)
+            if followed_func and followed_func is not callee_func:
+                callee_func = followed_func
+                resolution_method = resolution_method or "thunk"
+                try:
+                    callee_name = callee_func.getName()
+                except Exception:
+                    pass
         normalized_api_label = normalize_registry_label(callee_name) if callee_name else None
         label_fragment = normalized_api_label or callee_name or "<indirect>"
         safe_label = re.sub(r"[^A-Za-z0-9_]+", "_", label_fragment)
@@ -4167,6 +4232,11 @@ class FunctionAnalyzer:
                 if DEBUG_ENABLED:
                     log_debug(
                         f"[debug] registry root seeded: id={root_id} api={api_label} at={inst.getAddress()} entry={entry_point}"
+                        f" resolution={resolution_method} kind={api_kind}"
+                    )
+                    log_debug(
+                        f"[debug] registry call recognized at {inst.getAddress()} opcode={opcode_name(op)} callee={callee_name!r} "
+                        f"api_label={api_label!r} api_kind={api_kind} resolution={resolution_method or 'unknown'}"
                     )
             elif wrapper_registry and indirect_roots_enabled:
                 root_id = f"wrapper_{safe_label}_{inst.getAddress()}"
@@ -4562,9 +4632,10 @@ def build_root_records(global_state: GlobalState) -> List[Dict[str, Any]]:
     return records
 
 
-def emit_ndjson(global_state: GlobalState) -> None:
+def emit_ndjson(global_state: GlobalState, out_path: Optional[str] = None) -> None:
+    lines: List[str] = []
     for rec in build_root_records(global_state):
-        print(json.dumps(rec))
+        lines.append(json.dumps(rec))
     summary = {
         "type": "analysis_summary",
         "functions_analyzed": len(global_state.function_summaries),
@@ -4591,7 +4662,19 @@ def emit_ndjson(global_state: GlobalState) -> None:
         "roots_with_no_decisions": roots_with_no_decisions,
         "roots_with_overrides": roots_with_overrides,
     }
-    print(json.dumps(summary))
+    lines.append(json.dumps(summary))
+
+    if out_path:
+        try:
+            with open(out_path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+            if DEBUG_ENABLED:
+                log_debug(f"[debug] NDJSON written to {out_path}")
+        except Exception as exc:
+            log_debug(f"[debug] failed to write NDJSON to {out_path}: {exc!r}")
+
+    for line in lines:
+        print(line)
 
 
 def emit_improvement_suggestions(global_state: GlobalState) -> None:
@@ -4686,7 +4769,7 @@ def main():
             "path": None,
             "value_name": None,
         }
-    emit_ndjson(global_state)
+    emit_ndjson(global_state, args.get("out"))
     emit_improvement_suggestions(global_state)
     log_debug(
         f"[debug] analyzed {len(global_state.function_summaries)} functions, roots={len(global_state.roots)} decisions={len(global_state.decisions)} slots={len(global_state.struct_slots)}"
