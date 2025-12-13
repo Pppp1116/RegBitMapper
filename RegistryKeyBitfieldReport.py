@@ -277,7 +277,8 @@ def parse_args(raw_args: List[str], context_hint: str) -> Dict[str, Any]:
     parsed.setdefault("max_call_depth", 20)
     parsed["enable_string_seeds"] = _parse_bool(parsed.get("enable_string_seeds", "true"))
     parsed["enable_indirect_roots"] = _parse_bool(parsed.get("enable_indirect_roots", "true"))
-    parsed["enable_synthetic_full_root"] = _parse_bool(parsed.get("enable_synthetic_full_root", "true"))
+    parsed["enable_synthetic_roots"] = _parse_bool(parsed.get("enable_synthetic_roots", "false"))
+    parsed["enable_synthetic_full_root"] = _parse_bool(parsed.get("enable_synthetic_full_root", "false"))
     if "out" in parsed:
         parsed["out"] = parsed.get("out")
     return parsed
@@ -331,8 +332,13 @@ else:
     args = {"mode": "taint", "debug": False, "trace": True}
 DEBUG_ENABLED = args.get("debug", False)
 TRACE_ENABLED = args.get("trace", False)
-for _flag in ["enable_string_seeds", "enable_indirect_roots", "enable_synthetic_full_root"]:
-    args.setdefault(_flag, True)
+for _flag, _default in [
+    ("enable_string_seeds", True),
+    ("enable_indirect_roots", True),
+    ("enable_synthetic_roots", False),
+    ("enable_synthetic_full_root", False),
+]:
+    args.setdefault(_flag, _default)
 
 
 DEFAULT_POINTER_BIT_WIDTH = 32
@@ -4705,25 +4711,22 @@ class FunctionAnalyzer:
 
 def seed_fallback_roots(program, global_state: GlobalState, args: Dict[str, Any]) -> None:
     """
-    When no 'real' registry roots were detected, fall back to heuristic roots so that
-    small or heavily optimized binaries still produce something useful.
+    When no 'real' registry roots were detected, optionally fall back to heuristic roots
+    tied to observable callsites. Synthetic roots are only created when explicitly
+    enabled and the evidence is too weak to produce concrete registry roots.
 
     Priority:
       1) Registry-like strings (HKLM\\..., HKCU\\..., etc.).
       2) Imported registry APIs (ADVAPI32::RegOpenKeyExW, NTDLL::NtQueryValueKey, ...).
-
-    These roots are marked as synthetic and do NOT have precise bit usage; they are
-    just anchors so the NDJSON isn't empty.
     """
-    # If we already have roots from real calls, do nothing.
-    if global_state.roots:
+    if global_state.roots or not args.get("enable_synthetic_roots", False):
         return
 
     # ------------------------------------------------------------------
     # 1) Fallback from registry-like strings
     # ------------------------------------------------------------------
     registry_strings = getattr(global_state, "registry_strings", None) or {}
-    if registry_strings:
+    if registry_strings and args.get("enable_string_seeds", True):
         af = program.getAddressFactory()
         fm = program.getFunctionManager()
         ref_mgr = program.getReferenceManager()
@@ -4736,10 +4739,15 @@ def seed_fallback_roots(program, global_state: GlobalState, args: Dict[str, Any]
                 addr = None
 
             entry = None
+            callsite_addr = None
             if addr is not None and ref_mgr is not None and fm is not None:
                 try:
                     refs = ref_mgr.getReferencesTo(addr)
                     for r in refs:
+                        try:
+                            callsite_addr = str(r.getFromAddress())
+                        except Exception:
+                            callsite_addr = None
                         try:
                             f = fm.getFunctionContaining(r.getFromAddress())
                         except Exception:
@@ -4753,7 +4761,7 @@ def seed_fallback_roots(program, global_state: GlobalState, args: Dict[str, Any]
                 except Exception:
                     pass
 
-            root_id = f"string_seed_global_{addr_str}"
+            root_id = f"string_seed_{callsite_addr or addr_str}"
             if root_id in global_state.roots:
                 continue
 
@@ -4761,6 +4769,7 @@ def seed_fallback_roots(program, global_state: GlobalState, args: Dict[str, Any]
                 id=root_id,
                 type="synthetic",
                 entry=entry,
+                callsite={"address": callsite_addr} if callsite_addr else {},
                 hive=meta.get("hive") or meta.get("nt_root"),
                 path=meta.get("path") or meta.get("raw"),
                 value_name=meta.get("value_name"),
@@ -4776,20 +4785,57 @@ def seed_fallback_roots(program, global_state: GlobalState, args: Dict[str, Any]
     # 2) Fallback from imported registry APIs
     # ------------------------------------------------------------------
     # IMPORTED_REGISTRY_API_NAMES / ADDRS are populated in main().
-    global IMPORTED_REGISTRY_API_NAMES
-    names = IMPORTED_REGISTRY_API_NAMES or set()
-    if not names:
+    global IMPORTED_REGISTRY_API_NAMES, IMPORTED_REGISTRY_API_ADDRS
+    addr_map = IMPORTED_REGISTRY_API_ADDRS or {}
+    if not addr_map:
         return
 
+    af = program.getAddressFactory()
+    ref_mgr = program.getReferenceManager()
     created = 0
-    for api_name in sorted(names):
-        root_id = f"import_seed_{api_name}"
-        if root_id in global_state.roots:
+
+    for addr_key, api_name in addr_map.items():
+        if ref_mgr is None:
+            break
+        addr_obj = None
+        try:
+            if isinstance(addr_key, int):
+                default_space = af.getDefaultAddressSpace()
+                addr_obj = default_space.getAddress(addr_key) if default_space else None
+            else:
+                addr_obj = af.getAddress(str(addr_key))
+        except Exception:
+            addr_obj = None
+
+        if addr_obj is None:
             continue
-        synthetic_root = Root(id=root_id, type="synthetic", api_kind=api_name, api_name=api_name)
-        synthetic_root.evidence.add("import_seed")
-        global_state.roots[root_id] = synthetic_root
-        created += 1
+
+        try:
+            refs = ref_mgr.getReferencesTo(addr_obj)
+        except Exception:
+            continue
+
+        for ref in refs:
+            callsite_addr = None
+            try:
+                callsite_addr = str(ref.getFromAddress())
+            except Exception:
+                callsite_addr = None
+
+            root_id = f"import_seed_{api_name}_{callsite_addr or addr_obj}"
+            if root_id in global_state.roots:
+                continue
+
+            synthetic_root = Root(
+                id=root_id,
+                type="synthetic",
+                api_kind=api_name,
+                api_name=api_name,
+                callsite={"address": callsite_addr} if callsite_addr else {},
+            )
+            synthetic_root.evidence.add("import_seed_call")
+            global_state.roots[root_id] = synthetic_root
+            created += 1
 
     if DEBUG_ENABLED:
         log_debug(f"[debug] fallback: created {created} synthetic roots from imported registry APIs")
@@ -4986,11 +5032,12 @@ def main():
 
     # Heuristic fallback: create synthetic roots early so taint can propagate
     # from them during analysis when no concrete registry APIs are discovered.
-    seed_fallback_roots(program, global_state, args)
+    if args.get("enable_synthetic_roots", False):
+        seed_fallback_roots(program, global_state, args)
     analyzer.analyze_all()
 
     # Synthetic root for full mode when no registry APIs are detected
-    if mode == "full" and not global_state.roots and args.get("enable_synthetic_full_root", True):
+    if mode == "full" and not global_state.roots and args.get("enable_synthetic_full_root", False):
         synthetic_id = "synthetic_full_mode_root"
         global_state.roots[synthetic_id] = Root(id=synthetic_id, type="synthetic")
     emit_ndjson(global_state, args.get("out"))
