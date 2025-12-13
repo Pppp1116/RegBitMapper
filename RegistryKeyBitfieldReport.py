@@ -1509,29 +1509,19 @@ def normalize_registry_label(raw: Optional[str]) -> Optional[str]:
         return None
     cleaned = re.sub(r"(?i)^(?:j__|__imp__?|imp_|__imported_|imported_)", "", cleaned)
     cleaned = cleaned.strip("@ !:\\/")
-    # Keep suffixes that look registry-like, handling common separators and
-    # mangled import labels such as ADVAPI32.dll::RegOpenKeyExA@16 or
-    # ADVAPI32.dll_RegQueryValueExW. We also want to gracefully accept
-    # decorations like "__imp__RegOpenKeyExA@16" and thunks that carry module
-    # qualifiers.
-    split_re = r"[.:@!\\/]|::"
-    tokens: List[str] = []
-    for part in re.split(split_re, cleaned):
-        for seg in part.split("_"):
-            seg = seg.strip()
-            if seg:
-                tokens.append(seg)
-    tokens = tokens or [cleaned]
-    # strip leftover decoration like @NN or trailing digits
-    cleaned = re.sub(r"@[0-9]+$", "", cleaned)
-    cleaned = re.sub(r"\$[A-Za-z0-9_]+$", "", cleaned)
-    registry_re = re.compile(r"(?i)(reg|zw|nt|cm|rtl)[a-z0-9_@]*")
-    for tok in reversed(tokens):
-        m = registry_re.search(tok)
+    split_re = r"(?:\:\:|[.:@!\\/])"
+    tokens: List[str] = [t for t in re.split(split_re, cleaned) if t]
+    base_token = tokens[-1] if tokens else cleaned
+    base_token = re.sub(r"@[0-9]+$", "", base_token)
+    base_token = re.sub(r"\$[A-Za-z0-9_]+$", "", base_token)
+
+    registry_re = re.compile(r"(?i)^(reg|zw|nt|cm|rtl)[a-z0-9_@]*$")
+
+    for sub in reversed([s for s in base_token.split("_") if s]):
+        m = registry_re.match(sub)
         if m:
             return m.group(0)
-    m = registry_re.search(cleaned)
-    return m.group(0) if m else None
+    return None
 
 
 def is_registry_api(name: str) -> bool:
@@ -2249,51 +2239,25 @@ class FunctionAnalyzer:
             return
         lowered = label.lower()
 
-        buffer_indices: Set[int] = set()
-
-        # --- FIX 1: Add Index 5 (Size) ---
-        if "queryvalueex" in lowered:
-            # Args: 3=Type, 4=Data, 5=Size
-            buffer_indices.update([3, 4, 5])
-        elif lowered.startswith("regqueryvalue") and "ex" not in lowered:
-            buffer_indices.update([2])
-        elif "rtlqueryregistryvalues" in lowered:
-            buffer_indices.update(range(len(call_args)))
-        elif "queryvaluekey" in lowered:
-            buffer_indices.update([3, 5])
-
-        # Fallback for generic query functions
-        if not buffer_indices and "query" in lowered and "value" in lowered:
-            buffer_indices.update([len(call_args) - 1])
-
-        for idx in sorted(buffer_indices):
+        def _taint_arg(idx: int, taint_memory: bool = True) -> None:
             if idx < 0 or idx >= len(call_args):
-                continue
-            
+                return
+
             arg_vn = call_args[idx]
             arg_val = self._get_val(arg_vn, states)
-            
-            # --- FIX 2: Taint-by-Indirection (Memory Taint) ---
-            # If the argument is a pointer, we must taint the memory locations it points to.
+
             dereference_success = False
-            
-            # Case A: We know the pointer targets (e.g., Stack offsets)
-            if arg_val.pointer_targets:
+            if taint_memory and arg_val.pointer_targets:
                 for target_offset in arg_val.pointer_targets:
-                    # Retrieve the base ID (e.g., the function stack frame)
                     base_id = arg_val.pointer_patterns[0].base_id if arg_val.pointer_patterns else None
-                    
                     if base_id:
-                        # Taint a range of bytes (heuristic: 4 bytes/32-bits)
-                        for i in range(4): 
+                        for i in range(4):
                             mem_key = (base_id, target_offset + i)
-                            
-                            # Create or update the memory slot
                             if mem_key not in states.memory.slots:
                                 states.memory.slots[mem_key] = StructSlot(
-                                    base_id, 
-                                    target_offset + i, 
-                                    value=AbstractValue(bit_width=8, tainted=True, origins={root_id})
+                                    base_id,
+                                    target_offset + i,
+                                    value=AbstractValue(bit_width=8, tainted=True, origins={root_id}),
                                 )
                             else:
                                 slot = states.memory.slots[mem_key]
@@ -2301,15 +2265,55 @@ class FunctionAnalyzer:
                                 slot.value.origins.add(root_id)
                         dereference_success = True
 
-            # Case B: Taint the register itself as a fallback
-            # (Required if the binary checks the pointer value or if dereference failed)
             val = arg_val.clone()
             val.tainted = True
             val.origins.add(root_id)
+            base_id = pointer_base_identifier(func, arg_vn)
+            if base_id:
+                self._record_base_id_metadata(base_id, arg_vn)
             self._set_val(arg_vn, val, states)
-            
+
             if DEBUG_ENABLED and dereference_success:
-                print(f"[debug] Applied memory taint to {len(arg_val.pointer_targets)} targets for root {root_id}")
+                log_debug(
+                    f"[debug] Applied memory taint to {len(arg_val.pointer_targets)} targets for root {root_id} (arg{idx})"
+                )
+
+        buffer_indices: Set[int] = set()
+        size_indices: Set[int] = set()
+        handle_indices: Set[int] = set()
+
+        if "regqueryvalueex" in lowered:
+            buffer_indices.update([4])
+            size_indices.update([5])
+        elif lowered.startswith("regqueryvalue") and "ex" not in lowered:
+            buffer_indices.update([2])
+        elif "reggetvalue" in lowered:
+            buffer_indices.update([5])
+            size_indices.update([6])
+            size_indices.update([4])
+        elif "rtlqueryregistryvalues" in lowered:
+            for idx, arg in enumerate(call_args):
+                try:
+                    val = self._get_val(arg, states)
+                    if val.pointer_targets or val.pointer_patterns or (not vn_is_constant(arg) and arg.getSize() * 8 >= DEFAULT_POINTER_BIT_WIDTH):
+                        buffer_indices.add(idx)
+                except Exception:
+                    continue
+        elif "queryvaluekey" in lowered:
+            buffer_indices.update([3])
+            size_indices.update([5])
+        elif "regopenkeyex" in lowered:
+            handle_indices.update([4])
+
+        if not buffer_indices and "query" in lowered and "value" in lowered:
+            buffer_indices.update([len(call_args) - 1])
+
+        for idx in sorted(buffer_indices):
+            _taint_arg(idx, taint_memory=True)
+        for idx in sorted(size_indices):
+            _taint_arg(idx, taint_memory=True)
+        for idx in sorted(handle_indices):
+            _taint_arg(idx, taint_memory=True)
 
     def _resolve_callee_from_refs(self, inst: Instruction, refs_list) -> Tuple[Optional[str], Optional[Any]]:
         fm = self.program.getFunctionManager()
@@ -3882,20 +3886,26 @@ class FunctionAnalyzer:
             indirect_reason: Optional[str] = None,
             unknown_hkey: bool = False,
         ) -> None:
+            normalized_label = normalize_registry_label(api_label)
             known_hives = {0x80000000, 0x80000001, 0x80000002}
-            pointer_targets: Set[int] = set()
-            for arg in call_args:
-                try:
-                    pointer_targets |= set(self._get_val(arg, states).pointer_targets)
-                except Exception:
-                    continue
-            if pointer_targets and pointer_targets.isdisjoint(known_hives):
-                # Fix for pointer aliasing false positives: only seed when targets resemble registry hives.
+            if normalized_label and normalized_label.lower().startswith("reg") and not call_args:
                 if DEBUG_ENABLED:
                     log_debug(
-                        f"[debug] skipping root {root_id} at {inst.getAddress()} due to non-registry hive targets"
+                        f"[debug] skipping root {root_id} at {inst.getAddress()} because call arguments were unresolved"
                     )
                 return
+            if normalized_label and normalized_label.lower().startswith("reg") and call_args:
+                try:
+                    hkey_val = self._get_val(call_args[0], states)
+                    pointer_targets = set(hkey_val.pointer_targets)
+                except Exception:
+                    pointer_targets = set()
+                if pointer_targets and pointer_targets.isdisjoint(known_hives):
+                    if DEBUG_ENABLED:
+                        log_debug(
+                            f"[debug] skipping root {root_id} at {inst.getAddress()} because hive arg not a known hive"
+                        )
+                    return
             summary.uses_registry = True
             hive, path, value_name, derivation_meta = self._derive_registry_fields(
                 string_args, call_args, detected_hkey_meta
@@ -4441,10 +4451,6 @@ def seed_fallback_roots(program, global_state: GlobalState, args: Dict[str, Any]
         if DEBUG_ENABLED:
             log_debug(f"[debug] fallback: created {created} synthetic roots from registry-like strings")
 
-        # If we managed to create at least one string-based root, we're done.
-        if created > 0:
-            return
-
     # ------------------------------------------------------------------
     # 2) Fallback from imported registry APIs
     # ------------------------------------------------------------------
@@ -4646,11 +4652,12 @@ def main():
         analyzer.max_steps = max(1, int(args.get("max_steps")))
     if args.get("max_function_iterations"):
         analyzer.max_function_iterations = max(1, int(args.get("max_function_iterations")))
+
+    # Heuristic fallback: create synthetic roots early so taint can propagate
+    # from them during analysis when no concrete registry APIs are discovered.
+    seed_fallback_roots(program, global_state, args)
     analyzer.analyze_all()
 
-    # Heuristic fallback: create synthetic roots when taint-mode finds nothing.
-    # This applies to BOTH modes, but only if no real roots exist.
-    seed_fallback_roots(program, global_state, args)
     # Synthetic root for full mode when no registry APIs are detected
     if mode == "full" and not global_state.roots and args.get("enable_synthetic_full_root", True):
         synthetic_id = "synthetic_full_mode_root"
