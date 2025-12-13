@@ -43,7 +43,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import angr
-from multiprocessing import Pool
 
 
 def symbolic_resolve_string(api_call_addr, program, max_paths=10):
@@ -996,6 +995,140 @@ class GlobalState:
 
 def boolify(val: bool) -> bool:
     return bool(val)
+
+
+def _clean_api_name(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+    cleaned = name.strip()
+    cleaned = re.sub(r"(?i)^(__imp__?|imp_|_+)", "", cleaned)
+    return cleaned or None
+
+
+def _follow_thunk_chain(func):
+    seen = set()
+    while func and getattr(func, "isThunk", lambda: False)() and func not in seen:
+        seen.add(func)
+        try:
+            thunked = func.getThunkedFunction(True) or func.getThunkedFunction(False)
+        except Exception:
+            thunked = None
+        if not thunked:
+            break
+        func = thunked
+    return func
+
+
+def _label_for_address(program, addr) -> Optional[str]:
+    try:
+        symtab = program.getSymbolTable()
+        sym = symtab.getPrimarySymbol(addr)
+        if sym and sym.getName():
+            return _clean_api_name(sym.getName())
+    except Exception:
+        pass
+    try:
+        ref_mgr = program.getReferenceManager()
+        refs = list(ref_mgr.getReferencesTo(addr)) if ref_mgr else []
+    except Exception:
+        refs = []
+    for ref in refs:
+        try:
+            if hasattr(ref, "isExternalReference") and ref.isExternalReference():
+                ext_loc = ref.getExternalLocation()
+                if ext_loc:
+                    name = ext_loc.getLabel() or ext_loc.getOriginalImportedName()
+                    if name:
+                        return _clean_api_name(name)
+        except Exception:
+            continue
+    return None
+
+
+def resolve_call_api_name(instr, program) -> Tuple[Optional[str], Optional[Any]]:
+    if instr is None or program is None:
+        return None, None
+    try:
+        flow_type = instr.getFlowType()
+        if flow_type is None or not flow_type.isCall():
+            return None, None
+    except Exception:
+        return None, None
+
+    fm = program.getFunctionManager()
+    # Direct call targets
+    try:
+        flows = list(instr.getFlows())
+    except Exception:
+        flows = []
+    for dest in flows:
+        try:
+            func = fm.getFunctionAt(dest)
+        except Exception:
+            func = None
+        func = _follow_thunk_chain(func)
+        if func:
+            try:
+                name = _clean_api_name(func.getName())
+            except Exception:
+                name = None
+            return name, func
+        label = _label_for_address(program, dest)
+        if label:
+            return label, None
+
+    # Indirect calls: inspect references
+    ref_candidates = []
+    try:
+        ref_candidates.extend(list(instr.getReferencesFrom()))
+    except Exception:
+        pass
+    try:
+        op_count = instr.getNumOperands()
+        for idx in range(op_count):
+            op_refs = instr.getOperandReferences(idx)
+            if op_refs:
+                ref_candidates.extend(op_refs)
+    except Exception:
+        pass
+    try:
+        ref_mgr = program.getReferenceManager()
+        if ref_mgr:
+            ref_candidates.extend(list(ref_mgr.getReferencesFrom(instr.getAddress())))
+    except Exception:
+        pass
+
+    seen = set()
+    for ref in ref_candidates:
+        if ref in seen:
+            continue
+        seen.add(ref)
+        try:
+            if hasattr(ref, "isExternalReference") and ref.isExternalReference():
+                ext_loc = ref.getExternalLocation()
+                if ext_loc:
+                    name = ext_loc.getLabel() or ext_loc.getOriginalImportedName()
+                    if name:
+                        return _clean_api_name(name), None
+            to_addr = ref.getToAddress()
+        except Exception:
+            to_addr = None
+        if to_addr is None:
+            continue
+        try:
+            func = fm.getFunctionAt(to_addr)
+        except Exception:
+            func = None
+        func = _follow_thunk_chain(func)
+        if func:
+            try:
+                return _clean_api_name(func.getName()), func
+            except Exception:
+                return None, func
+        label = _label_for_address(program, to_addr)
+        if label:
+            return label, None
+    return None, None
 
 
 def vn_has_address(vn) -> bool:
@@ -2081,6 +2214,29 @@ class FunctionAnalyzer:
                     detail_meta["inference_reason"] = detail_meta.get("inference_reason") or "hkey_path_join"
         return hive, path, value_name, detail_meta
 
+    def _record_registry_decision(self, inst, summary: FunctionSummary, root_id: str, api_label: Optional[str]) -> None:
+        if not root_id:
+            return
+        root_meta = self.global_state.roots.get(root_id, {})
+        decision = Decision(
+            address=str(inst.getAddress()),
+            mnemonic=inst.getMnemonicString(),
+            disasm=inst.toString(),
+            origins={root_id},
+            used_bits=set(),
+            details={
+                "branch_kind": "call",
+                "api_name": normalize_registry_label(api_label) or api_label,
+                "hive": root_meta.get("hive"),
+                "path": root_meta.get("path"),
+                "value_name": root_meta.get("value_name"),
+            },
+        )
+        summary.add_decision(decision)
+        self.global_state.decisions.append(decision)
+        self.global_state.root_decision_index[root_id].append(decision)
+        summary.registry_decision_roots.add(root_id)
+
     def _taint_registry_outputs(
         self, func, call_args: List["Varnode"], states: AnalysisState, label: Optional[str], root_id: Optional[str]
     ) -> None:
@@ -2503,12 +2659,11 @@ class FunctionAnalyzer:
         fm = self.program.getFunctionManager()
         try:
             func_list = list(fm.getFunctions(True))
-            # Fix for scalability: parallel pre-pass to broaden coverage before fixed-point.
-            with Pool(processes=4) as pool:
-                pool.map(lambda f: self.analyze_func_wrapper(f), func_list)
+            for func in func_list:
+                self.analyze_func_wrapper(func)
         except Exception as exc:
             if DEBUG_ENABLED:
-                log_debug(f"[debug] parallel prepass failed, falling back to sequential analysis: {exc!r}")
+                log_debug(f"[debug] prepass failed during sequential analysis: {exc!r}")
         worklist = deque()
         queued: Set[str] = set()
         for func in fm.getFunctions(True):
@@ -3696,6 +3851,14 @@ class FunctionAnalyzer:
                 unknown_hkey_handle = True
                 break
 
+        callee_name = None
+        callee_func = None
+        resolved_name, resolved_func = resolve_call_api_name(inst, self.program)
+        if resolved_name:
+            callee_name = resolved_name
+        if resolved_func:
+            callee_func = resolved_func
+
         def _pointerish_argument(vn, val: AbstractValue) -> bool:
             try:
                 if vn is None:
@@ -3832,7 +3995,8 @@ class FunctionAnalyzer:
         except Exception:
             refs = []
 
-        callee_name, callee_func = self._resolve_callee_from_refs(inst, refs)
+        if callee_name is None:
+            callee_name, callee_func = self._resolve_callee_from_refs(inst, refs)
         if callee_name is None:
             callee_name = self._resolve_callee_from_external_refs(inst, refs)
         if callee_name is None and inputs:
@@ -3974,6 +4138,7 @@ class FunctionAnalyzer:
                 entry_point = str(callee_func.getEntryPoint()) if callee_func else str(inst.getAddress())
                 _seed_root(root_id, api_label, entry_point, api_kind=api_kind, unknown_hkey=unknown_hkey_handle)
                 self._taint_registry_outputs(func, call_args, states, api_label, root_id)
+                self._record_registry_decision(inst, summary, root_id, api_label)
                 if DEBUG_ENABLED:
                     log_debug(
                         f"[debug] registry root seeded: id={root_id} api={api_label} at={inst.getAddress()} entry={entry_point}"
@@ -3989,6 +4154,7 @@ class FunctionAnalyzer:
                     indirect_reason="registry_wrapper",
                     unknown_hkey=unknown_hkey_handle,
                 )
+                self._record_registry_decision(inst, summary, root_id, api_label)
                 if DEBUG_ENABLED:
                     log_debug(
                         f"[debug] wrapper-based registry root seeded: id={root_id} api={api_label} at={inst.getAddress()}"
