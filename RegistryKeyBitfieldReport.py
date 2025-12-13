@@ -1476,7 +1476,9 @@ HKEY_HANDLE_MAP: Dict[int, Dict[str, str]] = {
     0x80000001: {"hive": "HKCU", "nt_root": "\\Registry\\User"},
     0x80000002: {"hive": "HKLM", "nt_root": "\\Registry\\Machine"},
     0x80000003: {"hive": "HKU", "nt_root": "\\Registry\\User"},
+    0x80000004: {"hive": "HKPD", "nt_root": "\\Registry\\Machine"},
     0x80000005: {"hive": "HKCC", "nt_root": "\\Registry\\Machine"},
+    0x80000006: {"hive": "HKDD", "nt_root": "\\Registry\\Machine"},
 }
 
 REGISTRY_HIVE_ALIASES = {
@@ -1515,13 +1517,23 @@ def normalize_registry_label(raw: Optional[str]) -> Optional[str]:
     base_token = re.sub(r"@[0-9]+$", "", base_token)
     base_token = re.sub(r"\$[A-Za-z0-9_]+$", "", base_token)
 
-    registry_re = re.compile(r"(?i)^(reg|zw|nt|cm|rtl)[a-z0-9_@]*$")
-
-    for sub in reversed([s for s in base_token.split("_") if s]):
-        m = registry_re.match(sub)
-        if m:
-            return m.group(0)
+    lowered = base_token.lower()
+    if lowered.startswith(("reg", "zw", "nt", "cm")):
+        return base_token
+    if lowered in {"rtlqueryregistryvalues", "rtlqueryregistryvaluesex"}:
+        return base_token
     return None
+
+
+_NORMALIZE_SELF_CHECKS = {
+    "EnterCriticalSection": None,
+    "fprintf": None,
+    "ADVAPI32.dll::RegOpenKeyExW": "RegOpenKeyExW",
+}
+
+for _raw_label, _expected in _NORMALIZE_SELF_CHECKS.items():
+    _result = normalize_registry_label(_raw_label)
+    assert _result == _expected, f"normalize_registry_label({_raw_label!r}) -> {_result!r}, expected {_expected!r}"
 
 
 def is_registry_api(name: str) -> bool:
@@ -3846,14 +3858,13 @@ class FunctionAnalyzer:
         uses_registry_strings = self._function_uses_registry_strings(func)
         detected_hkey_meta: Optional[Dict[str, str]] = self._find_hkey_meta(call_args, states)
         unknown_hkey_handle = False
-        for arg in call_args[:2]:
+        if call_args:
             try:
-                val = self._get_val(arg, states)
+                val = self._get_val(call_args[0], states)
             except Exception:
                 val = AbstractValue()
             if getattr(val, "is_top", False):
                 unknown_hkey_handle = True
-                break
 
         callee_name = None
         callee_func = None
@@ -3887,25 +3898,29 @@ class FunctionAnalyzer:
             unknown_hkey: bool = False,
         ) -> None:
             normalized_label = normalize_registry_label(api_label)
-            known_hives = {0x80000000, 0x80000001, 0x80000002}
-            if normalized_label and normalized_label.lower().startswith("reg") and not call_args:
-                if DEBUG_ENABLED:
-                    log_debug(
-                        f"[debug] skipping root {root_id} at {inst.getAddress()} because call arguments were unresolved"
-                    )
-                return
-            if normalized_label and normalized_label.lower().startswith("reg") and call_args:
-                try:
-                    hkey_val = self._get_val(call_args[0], states)
-                    pointer_targets = set(hkey_val.pointer_targets)
-                except Exception:
-                    pointer_targets = set()
-                if pointer_targets and pointer_targets.isdisjoint(known_hives):
+            known_hives = {0x80000000, 0x80000001, 0x80000002, 0x80000003, 0x80000004, 0x80000005, 0x80000006}
+            potential_unknown_root = unknown_hkey
+            if normalized_label and normalized_label.lower().startswith(("reg", "zw", "nt", "cm", "rtlqueryregistryvalues")):
+                if normalized_label.lower().startswith("reg") and not call_args:
                     if DEBUG_ENABLED:
                         log_debug(
-                            f"[debug] skipping root {root_id} at {inst.getAddress()} because hive arg not a known hive"
+                            f"[debug] skipping root {root_id} at {inst.getAddress()} because call arguments were unresolved"
                         )
                     return
+                if call_args:
+                    try:
+                        hkey_val = self._get_val(call_args[0], states)
+                    except Exception:
+                        hkey_val = AbstractValue()
+                    pointer_targets = set(getattr(hkey_val, "pointer_targets", set()))
+                    if getattr(hkey_val, "is_top", False):
+                        potential_unknown_root = True
+                    if pointer_targets:
+                        if pointer_targets.isdisjoint(known_hives):
+                            potential_unknown_root = True
+                    else:
+                        potential_unknown_root = potential_unknown_root or False
+            unknown_hkey = potential_unknown_root
             summary.uses_registry = True
             hive, path, value_name, derivation_meta = self._derive_registry_fields(
                 string_args, call_args, detected_hkey_meta
