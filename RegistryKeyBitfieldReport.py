@@ -914,6 +914,73 @@ class Decision:
 
 
 @dataclass(slots=True)
+class Root:
+    """Concrete schema for registry roots with stable identifiers."""
+
+    id: str
+    api_kind: Optional[str] = None
+    api_name: Optional[str] = None
+    hive: Optional[str] = None
+    hive_confidence: float = 0.0
+    path: Optional[str] = None
+    path_confidence: float = 0.0
+    path_fragments: List[str] = field(default_factory=list)
+    value_name: Optional[str] = None
+    value_confidence: float = 0.0
+    value_fragments: List[str] = field(default_factory=list)
+    callsite: Dict[str, Any] = field(default_factory=dict)
+    return_varnodes: List[str] = field(default_factory=list)
+    out_buffers: List[str] = field(default_factory=list)
+    evidence: Set[str] = field(default_factory=set)
+    analysis_meta: Dict[str, Any] = field(default_factory=dict)
+    type: str = "registry"
+    entry: Optional[str] = None
+    potential_unknown_root: bool = False
+    indirect_reason: Optional[str] = None
+
+    # Compatibility helpers for legacy dict-style access used throughout the script.
+    def get(self, key: str, default=None):
+        if hasattr(self, key):
+            return getattr(self, key)
+        return self.analysis_meta.get(key, default)
+
+    def __getitem__(self, key: str):
+        if hasattr(self, key):
+            return getattr(self, key)
+        return self.analysis_meta[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        if hasattr(self, key):
+            setattr(self, key, value)
+        else:
+            self.analysis_meta[key] = value
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "api_kind": self.api_kind,
+            "api_name": self.api_name,
+            "hive": self.hive,
+            "hive_confidence": self.hive_confidence,
+            "path": self.path,
+            "path_confidence": self.path_confidence,
+            "path_fragments": list(self.path_fragments),
+            "value_name": self.value_name,
+            "value_confidence": self.value_confidence,
+            "value_fragments": list(self.value_fragments),
+            "callsite": self.callsite,
+            "return_varnodes": list(self.return_varnodes),
+            "out_buffers": list(self.out_buffers),
+            "evidence": sorted(self.evidence),
+            "analysis_meta": self.analysis_meta,
+            "type": self.type,
+            "entry": self.entry,
+            "potential_unknown_root": self.potential_unknown_root,
+            "indirect_reason": self.indirect_reason,
+        }
+
+
+@dataclass(slots=True)
 class FunctionSummary:
     name: str
     entry: str
@@ -980,7 +1047,7 @@ class FunctionSummary:
 
 @dataclass(slots=True)
 class GlobalState:
-    roots: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    roots: Dict[str, Root] = field(default_factory=dict)
     struct_slots: Dict[Tuple[str, int], StructSlot] = field(default_factory=dict)
     decisions: List[Decision] = field(default_factory=list)
     function_summaries: Dict[Tuple[str, str], FunctionSummary] = field(default_factory=dict)
@@ -1469,6 +1536,38 @@ CURATED_REGISTRY_APIS = {
     "zwsetvaluekey",
 }
 
+# Parameter prototype map: normalized API name -> roles and argument indices
+REGISTRY_API_PROTOTYPES: Dict[str, Dict[str, Any]] = {
+    "regopenkeyexw": {"path_params": [1], "out_handles": [4], "api_kind": "advapi32_open"},
+    "regopenkeyexa": {"path_params": [1], "out_handles": [4], "api_kind": "advapi32_open"},
+    "regopenkeyw": {"path_params": [1], "out_handles": [2], "api_kind": "advapi32_open"},
+    "regopenkeya": {"path_params": [1], "out_handles": [2], "api_kind": "advapi32_open"},
+    "reggetvaluew": {"path_params": [1], "value_params": [2], "out_buffers": [4], "api_kind": "advapi32_query"},
+    "reggetvaluea": {"path_params": [1], "value_params": [2], "out_buffers": [4], "api_kind": "advapi32_query"},
+    "regqueryvalueexw": {"value_params": [1], "out_buffers": [4], "out_sizes": [5], "api_kind": "advapi32_query"},
+    "regqueryvalueexa": {"value_params": [1], "out_buffers": [4], "out_sizes": [5], "api_kind": "advapi32_query"},
+    "regqueryvaluew": {"value_params": [1], "out_buffers": [3], "api_kind": "advapi32_query"},
+    "regqueryvaluea": {"value_params": [1], "out_buffers": [3], "api_kind": "advapi32_query"},
+    "ntopenkey": {"object_attributes_param": 2, "out_handles": [0], "api_kind": "nt_open"},
+    "ntopenkeyex": {"object_attributes_param": 2, "out_handles": [0], "api_kind": "nt_open"},
+    "zwopenkey": {"object_attributes_param": 2, "out_handles": [0], "api_kind": "nt_open"},
+    "zwopenkeyex": {"object_attributes_param": 2, "out_handles": [0], "api_kind": "nt_open"},
+    "ntqueryvaluekey": {
+        "value_params": [1],
+        "out_buffers": [4],
+        "out_sizes": [5],
+        "api_kind": "nt_query",
+    },
+    "zwqueryvaluekey": {
+        "value_params": [1],
+        "out_buffers": [4],
+        "out_sizes": [5],
+        "api_kind": "nt_query",
+    },
+    "rtlqueryregistryvalues": {"path_params": [1], "api_kind": "rtl_query_table"},
+    "rtlqueryregistryvaluesex": {"path_params": [1], "api_kind": "rtl_query_table"},
+}
+
 # Imported registry APIs gathered from the binary's externals. Filled in at
 # runtime inside main().
 IMPORTED_REGISTRY_API_NAMES: Set[str] = set()
@@ -1559,7 +1658,9 @@ def is_registry_api(name: str) -> bool:
     lowered = normalized.lower()
     matched = False
 
-    if lowered in CURATED_REGISTRY_APIS:
+    if lowered in CURATED_REGISTRY_APIS and (
+        lowered in IMPORTED_REGISTRY_API_NAMES or "::" in name or name in IMPORTED_REGISTRY_API_ADDRS.values()
+    ):
         matched = True
 
     if lowered in IMPORTED_REGISTRY_API_NAMES:
@@ -1568,8 +1669,8 @@ def is_registry_api(name: str) -> bool:
     if not matched:
         likely_external = ("::" in name) or (normalized in IMPORTED_REGISTRY_API_NAMES)
         prefix_hit = any(lowered.startswith(pref.lower()) for pref in REGISTRY_PREFIXES)
-        if lowered.startswith("rtl") and REGISTRY_RTL_REGISTRY_RE.match(lowered):
-            matched = likely_external or True
+        if lowered.startswith("rtl") and REGISTRY_RTL_REGISTRY_RE.match(lowered) and likely_external:
+            matched = True
         elif prefix_hit and likely_external:
             matched = True
 
@@ -1583,6 +1684,9 @@ def classify_registry_api_kind(name: Optional[str]) -> Optional[str]:
     if not name:
         return None
     lowered = (normalize_registry_label(name) or name).lower()
+    proto = REGISTRY_API_PROTOTYPES.get(lowered)
+    if proto and proto.get("api_kind"):
+        return proto.get("api_kind")
     if "querymultiplevalue" in lowered or "queryregistryvalues" in lowered:
         return "rtl_query_table"
     if "queryvalue" in lowered or "getvalue" in lowered:
@@ -1600,6 +1704,13 @@ def classify_registry_api_kind(name: Optional[str]) -> Optional[str]:
     if lowered.startswith("rtl"):
         return "rtl_query_table"
     return None
+
+
+def registry_api_prototype(name: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not name:
+        return None
+    lowered = (normalize_registry_label(name) or name).lower()
+    return REGISTRY_API_PROTOTYPES.get(lowered)
 
 
 def parse_registry_string(raw: str) -> Optional[Dict[str, Any]]:
@@ -2309,7 +2420,12 @@ class FunctionAnalyzer:
         return None
 
     def _derive_registry_fields(
-        self, string_args: List[Dict[str, Any]], call_args: List["Varnode"], detected_hkey_meta: Optional[Dict[str, str]]
+        self,
+        string_args: List[Dict[str, Any]],
+        call_args: List["Varnode"],
+        detected_hkey_meta: Optional[Dict[str, str]],
+        prototype: Optional[Dict[str, Any]] = None,
+        arg_string_map: Optional[Dict[int, Dict[str, Any]]] = None,
     ) -> Tuple[Optional[str], Optional[str], Optional[str], Dict[str, Any]]:
         hive = path = value_name = None
         detail_meta: Dict[str, Any] = {"inferred_hive": False, "inference_reason": None}
@@ -2325,6 +2441,19 @@ class FunctionAnalyzer:
                 value_candidate = string_args[1].get("value_name") or string_args[1].get("raw")
                 if value_candidate:
                     value_name = value_candidate
+        if prototype and arg_string_map:
+            for idx in prototype.get("path_params", []):
+                arg_meta = arg_string_map.get(idx, {})
+                candidate = arg_meta.get("path") or arg_meta.get("raw")
+                if candidate:
+                    path = candidate
+                    detail_meta["inference_reason"] = detail_meta.get("inference_reason") or "prototype_path"
+            for idx in prototype.get("value_params", []):
+                arg_meta = arg_string_map.get(idx, {})
+                candidate = arg_meta.get("value_name") or arg_meta.get("raw")
+                if candidate:
+                    value_name = candidate
+                    detail_meta["inference_reason"] = detail_meta.get("inference_reason") or "prototype_value"
         if hkey_meta and not hive:
             hive = hkey_meta.get("hive")
             if hive:
@@ -2366,7 +2495,13 @@ class FunctionAnalyzer:
         summary.registry_decision_roots.add(root_id)
 
     def _taint_registry_outputs(
-        self, func, call_args: List["Varnode"], states: AnalysisState, label: Optional[str], root_id: Optional[str]
+        self,
+        func,
+        call_args: List["Varnode"],
+        states: AnalysisState,
+        label: Optional[str],
+        root_id: Optional[str],
+        prototype: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         FIXED VERSION:
@@ -2420,28 +2555,34 @@ class FunctionAnalyzer:
         size_indices: Set[int] = set()
         handle_indices: Set[int] = set()
 
-        if "regqueryvalueex" in lowered:
-            buffer_indices.update([4])
-            size_indices.update([5])
-        elif lowered.startswith("regqueryvalue") and "ex" not in lowered:
-            buffer_indices.update([2])
-        elif "reggetvalue" in lowered:
-            buffer_indices.update([5])
-            size_indices.update([6])
-            size_indices.update([4])
-        elif "rtlqueryregistryvalues" in lowered:
-            for idx, arg in enumerate(call_args):
-                try:
-                    val = self._get_val(arg, states)
-                    if val.pointer_targets or val.pointer_patterns or (not vn_is_constant(arg) and arg.getSize() * 8 >= DEFAULT_POINTER_BIT_WIDTH):
-                        buffer_indices.add(idx)
-                except Exception:
-                    continue
-        elif "queryvaluekey" in lowered:
-            buffer_indices.update([3])
-            size_indices.update([5])
-        elif "regopenkeyex" in lowered:
-            handle_indices.update([4])
+        proto = prototype or registry_api_prototype(label)
+        if proto:
+            buffer_indices.update(proto.get("out_buffers", []))
+            size_indices.update(proto.get("out_sizes", []))
+            handle_indices.update(proto.get("out_handles", []))
+        else:
+            if "regqueryvalueex" in lowered:
+                buffer_indices.update([4])
+                size_indices.update([5])
+            elif lowered.startswith("regqueryvalue") and "ex" not in lowered:
+                buffer_indices.update([2])
+            elif "reggetvalue" in lowered:
+                buffer_indices.update([5])
+                size_indices.update([6])
+                size_indices.update([4])
+            elif "rtlqueryregistryvalues" in lowered:
+                for idx, arg in enumerate(call_args):
+                    try:
+                        val = self._get_val(arg, states)
+                        if val.pointer_targets or val.pointer_patterns or (not vn_is_constant(arg) and arg.getSize() * 8 >= DEFAULT_POINTER_BIT_WIDTH):
+                            buffer_indices.add(idx)
+                    except Exception:
+                        continue
+            elif "queryvaluekey" in lowered:
+                buffer_indices.update([3])
+                size_indices.update([5])
+            elif "regopenkeyex" in lowered:
+                handle_indices.update([4])
 
         if not buffer_indices and "query" in lowered and "value" in lowered:
             buffer_indices.update([len(call_args) - 1])
@@ -3981,10 +4122,13 @@ class FunctionAnalyzer:
                 call_args = self._synth_call_args_win64()
 
         string_args: List[Dict[str, Any]] = []
-        for inp in call_args:
+        arg_string_map: Dict[int, Dict[str, Any]] = {}
+        for idx, inp in enumerate(call_args):
             meta = self._resolve_string_from_vn(inp, states)
             if meta:
+                meta.setdefault("arg_index", idx)
                 string_args.append(meta)
+                arg_string_map[idx] = meta
         uses_registry_strings = self._function_uses_registry_strings(func)
         detected_hkey_meta: Optional[Dict[str, str]] = self._find_hkey_meta(call_args, states)
         unknown_hkey_handle = False
@@ -4030,6 +4174,7 @@ class FunctionAnalyzer:
             unknown_hkey: bool = False,
         ) -> None:
             normalized_label = normalize_registry_label(api_label)
+            prototype = registry_api_prototype(api_label)
             known_hives = {0x80000000, 0x80000001, 0x80000002, 0x80000003, 0x80000004, 0x80000005, 0x80000006}
             potential_unknown_root = unknown_hkey
             if normalized_label and normalized_label.lower().startswith(("reg", "zw", "nt", "cm", "rtlqueryregistryvalues")):
@@ -4055,47 +4200,40 @@ class FunctionAnalyzer:
             unknown_hkey = potential_unknown_root
             summary.uses_registry = True
             hive, path, value_name, derivation_meta = self._derive_registry_fields(
-                string_args, call_args, detected_hkey_meta
+                string_args, call_args, detected_hkey_meta, prototype, arg_string_map
             )
             if path is None:
                 path = f"unknown_path_{inst.getAddress()}"
-            root_meta = self.global_state.roots.setdefault(
-                root_id,
-                {
-                    "id": root_id,
-                    "type": "registry",
-                    "api_name": normalize_registry_label(api_label) or api_label,
-                    "api_kind": api_kind,
-                    "address": str(inst.getAddress()),
-                    "entry": entry_point,
-                    "hive": hive,
-                    "path": path,
-                    "value_name": value_name,
-                    "indirect_reason": indirect_reason,
-                },
-            )
-            analysis_meta = root_meta.setdefault("analysis_meta", {})
+            root_meta = self.global_state.roots.get(root_id)
+            if root_meta is None:
+                root_meta = Root(id=root_id)
+                self.global_state.roots[root_id] = root_meta
+            root_meta.api_kind = root_meta.api_kind or api_kind or (prototype.get("api_kind") if prototype else None)
+            root_meta.api_name = root_meta.api_name or (normalize_registry_label(api_label) or api_label)
+            root_meta.path = root_meta.path or path
+            root_meta.path_confidence = root_meta.path_confidence or (1.0 if path else 0.0)
+            root_meta.hive = root_meta.hive or hive
+            root_meta.value_name = root_meta.value_name or value_name
+            root_meta.value_confidence = root_meta.value_confidence or (1.0 if value_name else 0.0)
+            root_meta.indirect_reason = root_meta.indirect_reason or indirect_reason
+            root_meta.entry = root_meta.entry or entry_point
+            root_meta.callsite = root_meta.callsite or {
+                "function": func.getName() if func else None,
+                "address": str(inst.getAddress()),
+                "callee": normalize_registry_label(api_label) or api_label,
+                "resolution": resolution_method,
+            }
             if derivation_meta:
-                analysis_meta.update(derivation_meta)
+                root_meta.analysis_meta.update(derivation_meta)
+            if prototype:
+                root_meta.evidence.add("prototype")
             if indirect_reason:
-                analysis_meta.setdefault("indirect_reason", indirect_reason)
+                root_meta.analysis_meta.setdefault("indirect_reason", indirect_reason)
             if unknown_hkey:
-                root_meta["potential_unknown_root"] = True
-                notes = analysis_meta.setdefault("notes", [])
+                root_meta.potential_unknown_root = True
+                notes = root_meta.analysis_meta.setdefault("notes", [])
                 if "Potential Registry Access (Unknown Root)" not in notes:
                     notes.append("Potential Registry Access (Unknown Root)")
-            if entry_point and not root_meta.get("entry"):
-                root_meta["entry"] = entry_point
-            if hive and not root_meta.get("hive"):
-                root_meta["hive"] = hive
-            if path and not root_meta.get("path"):
-                root_meta["path"] = path
-            if value_name and not root_meta.get("value_name"):
-                root_meta["value_name"] = value_name
-            if api_kind and not root_meta.get("api_kind"):
-                root_meta["api_kind"] = api_kind
-            if indirect_reason and not root_meta.get("indirect_reason"):
-                root_meta["indirect_reason"] = indirect_reason
             
             # If there's an output, taint it
             if op.getOutput() is not None:
@@ -4139,8 +4277,14 @@ class FunctionAnalyzer:
             for ps in potential_strings:
                 if re.match(r"(HKLM|HKCU|HKCR|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER)\\", ps, re.IGNORECASE):
                     root_id = f"symbolic_indirect_{inst.getAddress()}"
-                    _seed_root(root_id, "", str(inst.getAddress()), indirect_reason="symbolic_string", unknown_hkey=unknown_hkey_handle)
-                    self._taint_registry_outputs(func, call_args, states, "", root_id)
+                    _seed_root(
+                        root_id,
+                        "",
+                        str(inst.getAddress()),
+                        indirect_reason="symbolic_string",
+                        unknown_hkey=unknown_hkey_handle,
+                    )
+                    self._taint_registry_outputs(func, call_args, states, "", root_id, prototype=None)
 
         # Be liberal: for imported functions the reference type may not report
         # isCall(), so scan all refs and ask FunctionManager if the target is
@@ -4309,8 +4453,9 @@ class FunctionAnalyzer:
                         pass
                 root_id = f"api_{safe_label}_{inst.getAddress()}"
                 entry_point = str(callee_func.getEntryPoint()) if callee_func else str(inst.getAddress())
+                proto = registry_api_prototype(api_label)
                 _seed_root(root_id, api_label, entry_point, api_kind=api_kind, unknown_hkey=unknown_hkey_handle)
-                self._taint_registry_outputs(func, call_args, states, api_label, root_id)
+                self._taint_registry_outputs(func, call_args, states, api_label, root_id, prototype=proto)
                 self._record_registry_decision(inst, summary, root_id, api_label)
                 if DEBUG_ENABLED:
                     log_debug(
@@ -4349,7 +4494,14 @@ class FunctionAnalyzer:
                         indirect_reason="string_only",
                         unknown_hkey=unknown_hkey_handle,
                     )
-                    self._taint_registry_outputs(func, call_args, states, label_fragment, root_id)
+                    self._taint_registry_outputs(
+                        func,
+                        call_args,
+                        states,
+                        label_fragment,
+                        root_id,
+                        prototype=registry_api_prototype(label_fragment),
+                    )
             if string_args and string_seeds_enabled and indirect_roots_enabled:
                 indirect_reason = None
                 if string_has_registry_prefix:
@@ -4605,15 +4757,16 @@ def seed_fallback_roots(program, global_state: GlobalState, args: Dict[str, Any]
             if root_id in global_state.roots:
                 continue
 
-            global_state.roots[root_id] = {
-                "id": root_id,
-                "type": "synthetic",      # so root_kind=='synthetic' in NDJSON
-                "api_name": None,
-                "entry": entry,
-                "hive": meta.get("hive") or meta.get("nt_root"),
-                "path": meta.get("path") or meta.get("raw"),
-                "value_name": meta.get("value_name"),
-            }
+            synthetic_root = Root(
+                id=root_id,
+                type="synthetic",
+                entry=entry,
+                hive=meta.get("hive") or meta.get("nt_root"),
+                path=meta.get("path") or meta.get("raw"),
+                value_name=meta.get("value_name"),
+            )
+            synthetic_root.evidence.add("string_seed")
+            global_state.roots[root_id] = synthetic_root
             created += 1
 
         if DEBUG_ENABLED:
@@ -4633,15 +4786,9 @@ def seed_fallback_roots(program, global_state: GlobalState, args: Dict[str, Any]
         root_id = f"import_seed_{api_name}"
         if root_id in global_state.roots:
             continue
-        global_state.roots[root_id] = {
-            "id": root_id,
-            "type": "synthetic",
-            "api_name": api_name,
-            "entry": None,
-            "hive": None,
-            "path": None,
-            "value_name": None,
-        }
+        synthetic_root = Root(id=root_id, type="synthetic", api_kind=api_name, api_name=api_name)
+        synthetic_root.evidence.add("import_seed")
+        global_state.roots[root_id] = synthetic_root
         created += 1
 
     if DEBUG_ENABLED:
@@ -4651,6 +4798,7 @@ def seed_fallback_roots(program, global_state: GlobalState, args: Dict[str, Any]
 def build_root_records(global_state: GlobalState) -> List[Dict[str, Any]]:
     records = []
     for root_id, meta in sorted(global_state.roots.items()):
+        meta_dict = meta.to_dict() if isinstance(meta, Root) else dict(meta)
         slot_entries = []
         used_bits: Set[int] = set()
         candidate_bits: Set[int] = set()
@@ -4683,14 +4831,16 @@ def build_root_records(global_state: GlobalState) -> List[Dict[str, Any]]:
         overrides = list(global_state.root_override_index.get(root_id, []))
         record = {
             "id": root_id,
-            "type": meta.get("type", "registry"),
-            "hive": meta.get("hive"),
-            "path": meta.get("path"),
-            "value_name": meta.get("value_name"),
-            "api_name": meta.get("api_name"),
-            "entry": meta.get("entry"),
-            "analysis_meta": meta.get("analysis_meta"),
-            "potential_unknown_root": bool(meta.get("potential_unknown_root")),
+            "type": meta_dict.get("type", "registry"),
+            "hive": meta_dict.get("hive"),
+            "path": meta_dict.get("path"),
+            "value_name": meta_dict.get("value_name"),
+            "api_name": meta_dict.get("api_name") or meta_dict.get("api_kind"),
+            "entry": meta_dict.get("entry"),
+            "analysis_meta": meta_dict.get("analysis_meta"),
+            "callsite": meta_dict.get("callsite"),
+            "evidence": meta_dict.get("evidence"),
+            "potential_unknown_root": bool(meta_dict.get("potential_unknown_root")),
             "struct_slots": slot_entries,
             "bit_usage": {
                 "bit_width": max([DEFAULT_POINTER_BIT_WIDTH] + slot_bit_widths),
@@ -4707,7 +4857,7 @@ def build_root_records(global_state: GlobalState) -> List[Dict[str, Any]]:
                 else "indirect"
                 if str(root_id).startswith("indirect_") or str(root_id).startswith("string_seed_")
                 else "synthetic"
-                if str(root_id) == "synthetic_full_mode_root" or meta.get("type") == "synthetic"
+                if str(root_id) == "synthetic_full_mode_root" or meta_dict.get("type") == "synthetic"
                 else "unknown"
             ),
         }
@@ -4842,16 +4992,7 @@ def main():
     # Synthetic root for full mode when no registry APIs are detected
     if mode == "full" and not global_state.roots and args.get("enable_synthetic_full_root", True):
         synthetic_id = "synthetic_full_mode_root"
-        global_state.roots[synthetic_id] = {
-            "id": synthetic_id,
-            "type": "synthetic",
-            "api_name": None,
-            "address": None,
-            "entry": None,
-            "hive": None,
-            "path": None,
-            "value_name": None,
-        }
+        global_state.roots[synthetic_id] = Root(id=synthetic_id, type="synthetic")
     emit_ndjson(global_state, args.get("out"))
     emit_improvement_suggestions(global_state)
     log_debug(
