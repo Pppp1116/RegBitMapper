@@ -4378,6 +4378,17 @@ class FunctionAnalyzer:
         normalized_api_label = normalize_registry_label(callee_name) if callee_name else None
         label_fragment = normalized_api_label or callee_name or "<indirect>"
         safe_label = re.sub(r"[^A-Za-z0-9_]+", "_", label_fragment)
+        verified_getprocaddress_string = False
+        imported_registry_api = False
+        if normalized_api_label:
+            imported_registry_api = normalized_api_label.lower() in IMPORTED_REGISTRY_API_NAMES
+            if normalized_api_label == "getprocaddress":
+                for meta in string_args:
+                    candidate = normalize_registry_label(meta.get("raw") or meta.get("path") or "")
+                    if candidate and candidate.lower() in CURATED_REGISTRY_APIS:
+                        verified_getprocaddress_string = True
+                        break
+        string_root_guard = string_seeds_enabled and (imported_registry_api or verified_getprocaddress_string)
         if normalized_api_label == "getprocaddress" and op.getOutput() is not None:
             try:
                 out_val = self._get_val(op.getOutput(), states)
@@ -4482,8 +4493,9 @@ class FunctionAnalyzer:
                     log_debug(
                         f"[debug] wrapper-based registry root seeded: id={root_id} api={api_label} at={inst.getAddress()}"
                     )
-            if not callee_is_registry and string_seeds_enabled:
-                if string_args or uses_registry_strings or detected_hkey_meta:
+            if string_root_guard:
+                string_seed_allowed = string_args or uses_registry_strings or detected_hkey_meta
+                if not callee_is_registry and string_seed_allowed:
                     root_id = f"string_seed_{inst.getAddress()}_{safe_label}"
                     entry_point = str(callee_func.getEntryPoint()) if callee_func else str(inst.getAddress())
                     _seed_root(
@@ -4502,24 +4514,50 @@ class FunctionAnalyzer:
                         root_id,
                         prototype=registry_api_prototype(label_fragment),
                     )
-            if string_args and string_seeds_enabled and indirect_roots_enabled:
-                indirect_reason = None
-                if string_has_registry_prefix:
-                    indirect_reason = "string_prefix"
-                elif hkey_handle_present:
-                    indirect_reason = "hkey_handle"
-                elif registry_like:
-                    indirect_reason = "registry_wrapper"
-                elif self._pointer_args_from_registry(pointer_like_args, states):
-                    indirect_reason = "registry_string_in_function"
-                if indirect_reason:
+                if string_args and indirect_roots_enabled:
+                    indirect_reason = None
+                    if string_has_registry_prefix:
+                        indirect_reason = "string_prefix"
+                    elif hkey_handle_present:
+                        indirect_reason = "hkey_handle"
+                    elif registry_like:
+                        indirect_reason = "registry_wrapper"
+                    elif self._pointer_args_from_registry(pointer_like_args, states):
+                        indirect_reason = "registry_string_in_function"
+                    if indirect_reason:
+                        root_id = f"indirect_{inst.getAddress()}"
+                        entry_point = str(callee_func.getEntryPoint()) if callee_func else str(inst.getAddress())
+                        _seed_root(
+                            root_id,
+                            api_label or "<indirect>",
+                            entry_point,
+                            api_kind=api_kind,
+                            indirect_reason=indirect_reason,
+                            unknown_hkey=unknown_hkey_handle,
+                        )
+                        if DEBUG_ENABLED:
+                            log_debug(
+                                f"[debug] string-based root seeded: id={root_id} hive={self.global_state.roots[root_id].get('hive')} "
+                                f"path={self.global_state.roots[root_id].get('path')} value={self.global_state.roots[root_id].get('value_name')} "
+                                f"at={inst.getAddress()} reason={indirect_reason}"
+                            )
+        else:
+            if string_root_guard:
+                string_seed_allowed = (
+                    string_has_registry_prefix
+                    or self._function_has_registry_calls(func)
+                    or self._pointer_args_from_registry(pointer_like_args, states)
+                    or hkey_handle_present
+                )
+                if string_args and indirect_roots_enabled and string_seed_allowed:
+                    indirect_reason = "string_prefix" if string_has_registry_prefix else "registry_string_in_function"
+                    if hkey_handle_present and indirect_reason != "string_prefix":
+                        indirect_reason = "hkey_handle"
                     root_id = f"indirect_{inst.getAddress()}"
-                    entry_point = str(callee_func.getEntryPoint()) if callee_func else str(inst.getAddress())
                     _seed_root(
                         root_id,
-                        api_label or "<indirect>",
-                        entry_point,
-                        api_kind=api_kind,
+                        "<indirect>",
+                        str(inst.getAddress()),
                         indirect_reason=indirect_reason,
                         unknown_hkey=unknown_hkey_handle,
                     )
@@ -4529,55 +4567,29 @@ class FunctionAnalyzer:
                             f"path={self.global_state.roots[root_id].get('path')} value={self.global_state.roots[root_id].get('value_name')} "
                             f"at={inst.getAddress()} reason={indirect_reason}"
                         )
-        else:
-            string_seed_allowed = string_seeds_enabled and (
-                string_has_registry_prefix
-                or self._function_has_registry_calls(func)
-                or self._pointer_args_from_registry(pointer_like_args, states)
-                or hkey_handle_present
-            )
-            if string_args and indirect_roots_enabled and string_seed_allowed:
-                indirect_reason = "string_prefix" if string_has_registry_prefix else "registry_string_in_function"
-                if hkey_handle_present and indirect_reason != "string_prefix":
-                    indirect_reason = "hkey_handle"
-                root_id = f"indirect_{inst.getAddress()}"
-                _seed_root(
-                    root_id,
-                    "<indirect>",
-                    str(inst.getAddress()),
-                    indirect_reason=indirect_reason,
-                    unknown_hkey=unknown_hkey_handle,
-                )
-                if DEBUG_ENABLED:
-                    log_debug(
-                        f"[debug] string-based root seeded: id={root_id} hive={self.global_state.roots[root_id].get('hive')} "
-                        f"path={self.global_state.roots[root_id].get('path')} value={self.global_state.roots[root_id].get('value_name')} "
-                        f"at={inst.getAddress()} reason={indirect_reason}"
+                elif (
+                    indirect_roots_enabled
+                    and uses_registry_strings
+                    and pointer_like_args
+                    and string_seed_allowed
+                ):
+                    caller_name = func.getName() if func else "<unknown>"
+                    api_label = f"<string_seed:{caller_name}>"
+                    root_id = f"string_seed_{inst.getAddress()}"
+                    _seed_root(
+                        root_id,
+                        api_label,
+                        str(inst.getAddress()),
+                        api_kind="open_key",
+                        indirect_reason="registry_string_in_function",
+                        unknown_hkey=unknown_hkey_handle,
                     )
-            elif (
-                string_seeds_enabled
-                and indirect_roots_enabled
-                and uses_registry_strings
-                and pointer_like_args
-                and string_seed_allowed
-            ):
-                caller_name = func.getName() if func else "<unknown>"
-                api_label = f"<string_seed:{caller_name}>"
-                root_id = f"string_seed_{inst.getAddress()}"
-                _seed_root(
-                    root_id,
-                    api_label,
-                    str(inst.getAddress()),
-                    api_kind="open_key",
-                    indirect_reason="registry_string_in_function",
-                    unknown_hkey=unknown_hkey_handle,
-                )
-                if DEBUG_ENABLED:
-                    log_debug(
-                        f"[debug] string-based root seeded: id={root_id} hive={self.global_state.roots[root_id].get('hive')} "
-                        f"path={self.global_state.roots[root_id].get('path')} value={self.global_state.roots[root_id].get('value_name')} "
-                        f"at={inst.getAddress()} reason=registry_string_in_function"
-                    )
+                    if DEBUG_ENABLED:
+                        log_debug(
+                            f"[debug] string-based root seeded: id={root_id} hive={self.global_state.roots[root_id].get('hive')} "
+                            f"path={self.global_state.roots[root_id].get('path')} value={self.global_state.roots[root_id].get('value_name')} "
+                            f"at={inst.getAddress()} reason=registry_string_in_function"
+                        )
             if op.getOutput() is not None:
                 out_val = self._get_val(op.getOutput(), states).clone()
                 out_val.bit_width = op.getOutput().getSize() * 8
