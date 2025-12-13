@@ -46,22 +46,6 @@ try:
     import angr  # type: ignore
 except Exception:
     angr = None  # type: ignore
-def symbolic_resolve_string(api_call_addr, program, max_paths=10):
-    """Best-effort symbolic string recovery for indirect registry accesses."""
-    if angr is None:
-        return []
-    proj = angr.Project(program.getExecutablePath(), load_options={'auto_load_libs': False})
-    state = proj.factory.blank_state(addr=api_call_addr)
-    simgr = proj.factory.simulation_manager(state)
-    simgr.explore(find=api_call_addr + 0x10)
-    resolved = []
-    for found in simgr.found[:max_paths]:
-        try:
-            arg = found.solver.eval(found.regs.esp + 4, cast_to=bytes)
-            resolved.append(arg.decode('utf-8', errors='ignore'))
-        except Exception:
-            continue
-    return resolved
 
 
 @dataclass(frozen=True, slots=True)
@@ -4266,25 +4250,6 @@ class FunctionAnalyzer:
             REGISTRY_STRING_PREFIX_RE.search(meta.get("raw") or meta.get("path") or "") for meta in string_args
         )
         hkey_handle_present = detected_hkey_meta is not None
-
-        if indirect_roots_enabled and pointer_like_args and not string_args:
-            # Fix for indirect registry access: Added symbolic resolution of pointer-like calls.
-            potential_strings = symbolic_resolve_string(inst.getAddress().getOffset(), currentProgram)
-            if DEBUG_ENABLED:
-                log_debug(
-                    f"[debug] symbolic strings resolved: {len(potential_strings)} at {inst.getAddress()}"
-                )
-            for ps in potential_strings:
-                if re.match(r"(HKLM|HKCU|HKCR|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER)\\", ps, re.IGNORECASE):
-                    root_id = f"symbolic_indirect_{inst.getAddress()}"
-                    _seed_root(
-                        root_id,
-                        "",
-                        str(inst.getAddress()),
-                        indirect_reason="symbolic_string",
-                        unknown_hkey=unknown_hkey_handle,
-                    )
-                    self._taint_registry_outputs(func, call_args, states, "", root_id, prototype=None)
 
         # Be liberal: for imported functions the reference type may not report
         # isCall(), so scan all refs and ask FunctionManager if the target is
