@@ -42,12 +42,14 @@ from collections import defaultdict, deque
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
-
-import angr
-
-
+try:
+    import angr  # type: ignore
+except Exception:
+    angr = None  # type: ignore
 def symbolic_resolve_string(api_call_addr, program, max_paths=10):
     """Best-effort symbolic string recovery for indirect registry accesses."""
+    if angr is None:
+        return []
     proj = angr.Project(program.getExecutablePath(), load_options={'auto_load_libs': False})
     state = proj.factory.blank_state(addr=api_call_addr)
     simgr = proj.factory.simulation_manager(state)
@@ -1896,6 +1898,83 @@ class FunctionAnalyzer:
         self._functions_with_registry_calls: Set[str] = set()
         self._definition_cache: Dict[Tuple[Any, int], List[Tuple[Any, Optional[PcodeOp]]]] = {}
         self.dispatch_table: Dict[str, Callable[[Any, Any, Any, Any, List[Any], AnalysisState, FunctionSummary], None]] = self._build_dispatch_table()
+
+
+    def _try_make_reg_varnode(self, reg_name: str):
+        """Best-effort creation of a register Varnode for the current program.
+
+        Used when CALLIND/BRANCHIND P-code does not expose explicit arguments.
+        """
+        try:
+            reg = None
+            # Program may expose getRegister(name)
+            if hasattr(self.program, "getRegister"):
+                try:
+                    reg = self.program.getRegister(reg_name)
+                except Exception:
+                    reg = None
+            if reg is None:
+                try:
+                    lang = self.program.getLanguage()
+                    if lang and hasattr(lang, "getRegister"):
+                        reg = lang.getRegister(reg_name)
+                except Exception:
+                    reg = None
+            if reg is None:
+                for alt in (reg_name.upper(), reg_name.lower()):
+                    if alt == reg_name:
+                        continue
+                    try:
+                        if hasattr(self.program, "getRegister"):
+                            reg = self.program.getRegister(alt)
+                        if reg is None:
+                            lang = self.program.getLanguage()
+                            reg = lang.getRegister(alt) if lang else None
+                        if reg is not None:
+                            break
+                    except Exception:
+                        reg = None
+            if reg is None:
+                return None
+
+            # Determine register size in bytes
+            size = None
+            for attr in ("getMinimumByteSize", "getNumBytes"):
+                try:
+                    size = int(getattr(reg, attr)())
+                    break
+                except Exception:
+                    size = None
+            if not size:
+                try:
+                    size = int(reg.getBitLength() // 8)
+                except Exception:
+                    size = None
+            if not size:
+                try:
+                    size = int(self.program.getDefaultPointerSize())
+                except Exception:
+                    size = 8
+
+            addr = reg.getAddress()
+            try:
+                return Varnode(addr, size)
+            except Exception:
+                try:
+                    return Varnode(addr, size, False)
+                except Exception:
+                    return None
+        except Exception:
+            return None
+
+    def _synth_call_args_win64(self) -> List[Any]:
+        """Return RCX,RDX,R8,R9 varnodes when explicit CALL args are missing."""
+        args: List[Any] = []
+        for rn in ("RCX", "RDX", "R8", "R9"):
+            vn = self._try_make_reg_varnode(rn)
+            if vn is not None:
+                args.append(vn)
+        return args
 
     def _build_dispatch_table(self) -> Dict[str, Callable[[Any, Any, Any, Any, List[Any], AnalysisState, FunctionSummary], None]]:
         return {
@@ -3886,16 +3965,20 @@ class FunctionAnalyzer:
         string_seeds_enabled = args.get("enable_string_seeds", True)
         indirect_roots_enabled = args.get("enable_indirect_roots", True)
         
-        # Determine arguments based on opcode
-        is_branch_ind = (op.getOpcode() == PcodeOp.BRANCHIND)
+                # Determine arguments based on opcode
+        opcode = op.getOpcode()
+        is_branch_ind = (opcode == PcodeOp.BRANCHIND)
+        is_call_ind = (opcode == PcodeOp.CALLIND)
         call_args = []
-        if is_branch_ind:
-            # BRANCHIND usually doesn't have explicit arguments in P-code like CALL
-            # but we treat it as a potential tail-call.
-            # We assume standard calling convention registers are already set if this is a tail call.
-            pass
+        if is_branch_ind or is_call_ind:
+            # Optimized binaries often emit CALLIND/BRANCHIND without explicit argument varnodes.
+            # Fall back to Win64 register calling convention (RCX,RDX,R8,R9) when available.
+            call_args = self._synth_call_args_win64()
         else:
             call_args = inputs[1:] if inputs else []
+            if not call_args and opcode == PcodeOp.CALL:
+                # Rare case: CALL with missing args in P-code. Also fall back.
+                call_args = self._synth_call_args_win64()
 
         string_args: List[Dict[str, Any]] = []
         for inp in call_args:
